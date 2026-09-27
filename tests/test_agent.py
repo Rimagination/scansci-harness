@@ -1,6 +1,8 @@
 from pathlib import Path
 import sqlite3
 
+import pytest
+
 from scansci_html.evidence_store import index_evidence_library
 from scansci_html.qa import agent
 from scansci_html.qa.agent import (
@@ -111,7 +113,12 @@ def test_generic_followup_cannot_drop_all_cross_language_entities():
     assert _followup_preserves_query_identity("Mars ocean evidence", model_queries) is True
 
 
-def test_answer_question_falls_back_to_local_evidence_when_model_is_rate_limited(monkeypatch):
+@pytest.mark.parametrize(
+    "error",
+    [RuntimeError("HTTP 429"), TimeoutError("Pi Agent exceeded the request timeout")],
+    ids=["rate-limit", "pi-timeout"],
+)
+def test_answer_question_falls_back_to_local_evidence_when_model_fails(monkeypatch, error):
     def fake_search_evidence_store(
         db_path,
         query,
@@ -143,7 +150,7 @@ def test_answer_question_falls_back_to_local_evidence_when_model_is_rate_limited
     monkeypatch.setattr(
         agent,
         "synthesize_answer_with_llm",
-        lambda *args, **kwargs: (_ for _ in ()).throw(RuntimeError("HTTP 429")),
+        lambda *args, **kwargs: (_ for _ in ()).throw(error),
     )
 
     result = answer_question(
@@ -158,7 +165,7 @@ def test_answer_question_falls_back_to_local_evidence_when_model_is_rate_limited
     assert result["reader_answer"]["citation_count"] == 1
     assert result["citation_verification"]["passed"] is True
     assert result["answer_generation"]["fallback"] is True
-    assert "HTTP 429" in result["answer_generation"]["reason"]
+    assert str(error) in result["answer_generation"]["reason"]
 
 
 def test_plan_query_adds_methods_filter_for_explicit_method_questions():

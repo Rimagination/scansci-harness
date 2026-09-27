@@ -3601,9 +3601,15 @@ class ResearchAgentRuntime:
         except (TypeError, ValueError) as error:
             raise ValueError("evidence retrieval controls must be integers") from error
         settings = load_settings(self.workspace)
+        quality_profile = self._retrieval_quality(payload, default="balanced")
+        # Do not let the first evidence question synchronously load local
+        # embedding/reranker weights on the conversation worker. The existing
+        # preparation path keeps retrieval responsive with its lexical fallback
+        # while the neural stack warms in the background.
+        self.prepare_local_evidence(evidence_db, quality_profile=quality_profile)
         local_evidence = self._local_evidence_stack(
             evidence_db,
-            quality_profile=self._retrieval_quality(payload, default="balanced"),
+            quality_profile=quality_profile,
         )
         active = dict(settings.get("active_model", {}) or {})
         provider = next(
@@ -3969,8 +3975,10 @@ class ResearchAgentRuntime:
                 )
                 answer_options = {
                     "answer_provider": "llm",
-                    "verification_provider": "llm",
-                    "query_rewrite_provider": "llm",
+                    # Retrieval already expands queries locally, and citation
+                    # verification is deterministic; keep model use to one synthesis call.
+                    "verification_provider": "local",
+                    "query_rewrite_provider": "local",
                     "chat_client": rag_client,
                 }
                 agent_harness = "pi-fixed-workflow"

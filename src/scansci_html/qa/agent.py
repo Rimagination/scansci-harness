@@ -62,7 +62,7 @@ def answer_question(
         query_rewrite_generation = {"provider": "llm", "fallback": False, "reason": ""}
         try:
             model_retrieval_queries = _model_retrieval_queries(question, chat_client=chat_client)
-        except (RuntimeError, ValueError) as error:
+        except (RuntimeError, TimeoutError, ValueError) as error:
             query_rewrite_generation = {
                 "provider": "local",
                 "fallback": True,
@@ -279,7 +279,7 @@ def answer_question(
                 chat_client=chat_client,
                 query_plan=query_plan,
             )
-        except (RuntimeError, ValueError) as error:
+        except (RuntimeError, TimeoutError, ValueError) as error:
             # A compatible provider may ignore response_format or emit prose
             # without stable quote IDs.  Never discard an otherwise valid
             # evidence task: synthesize directly from the already validated
@@ -296,7 +296,7 @@ def answer_question(
             verification_generation = {"provider": "llm", "fallback": False, "reason": ""}
             try:
                 verified_answer = verify_answer_claims_with_llm(answer, evidence_table, chat_client=chat_client)
-            except (RuntimeError, ValueError) as error:
+            except (RuntimeError, TimeoutError, ValueError) as error:
                 verified_answer = verify_answer_claims(answer, evidence_table)
                 verification_generation = {
                     "provider": "local-evidence",

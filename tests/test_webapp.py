@@ -546,7 +546,7 @@ def test_preview_assets_are_cache_busted(tmp_path: Path) -> None:
     app, _workspace, _evidence = _build_app(tmp_path)
     page = app.dispatch("GET", "/").body.decode("utf-8")
 
-    assert 'href="/styles.css?v=26"' in page
+    assert 'href="/styles.css?v=31"' in page
     assert 'src="/app.js?v=26"' in page
 
 
@@ -3219,7 +3219,7 @@ def test_fixed_verified_workflow_uses_pi_for_model_json_and_an_empty_nested_leas
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
-    app, workspace, _evidence = _build_app(tmp_path)
+    app, workspace, evidence = _build_app(tmp_path)
     settings = load_settings(workspace)
     settings["active_model"] = {"provider_id": "fixture-provider", "model_id": "fixture-model"}
     settings["providers"] = [{
@@ -3246,7 +3246,15 @@ def test_fixed_verified_workflow_uses_pi_for_model_json_and_an_empty_nested_leas
         yield {"type": "delta", "content": '{"answer":"verified"}'}
         yield {"type": "done", "stats": {"tokens": {"total_tokens": 7}}}
 
+    answer_options: dict[str, object] = {}
+    preparation_calls: list[tuple[Path, dict[str, object]]] = []
+
+    def fake_prepare_local_evidence(evidence_db, **kwargs):
+        preparation_calls.append((Path(evidence_db).resolve(), dict(kwargs)))
+        return {"state": "preparing", "phase": "loading_models"}
+
     def fake_answer_question(_db, _question, **options):
+        answer_options.update(options)
         generated = options["chat_client"].complete_json(
             [
                 {"role": "system", "content": "Return a JSON answer."},
@@ -3266,6 +3274,7 @@ def test_fixed_verified_workflow_uses_pi_for_model_json_and_an_empty_nested_leas
     monkeypatch.setattr("scansci_html.research_agent.build_chat_json_client", forbidden_direct_client)
     monkeypatch.setattr(PiAgentClient, "stream_chat", fake_pi_stream)
     monkeypatch.setattr("scansci_html.research_agent.answer_question", fake_answer_question)
+    monkeypatch.setattr(app.research_agent, "prepare_local_evidence", fake_prepare_local_evidence)
 
     result = app.research_agent.answer_sync({
         "question": "What does the selected evidence show?",
@@ -3284,6 +3293,10 @@ def test_fixed_verified_workflow_uses_pi_for_model_json_and_an_empty_nested_leas
     assert nested["task_contract"]["allowed_tools"] == []
     assert nested["task_contract"]["initial_tools"] == []
     assert nested["task_contract"]["allowed_mcp_servers"] == []
+    assert answer_options["answer_provider"] == "llm"
+    assert answer_options["query_rewrite_provider"] == "local"
+    assert answer_options["verification_provider"] == "local"
+    assert preparation_calls == [(evidence.resolve(), {"quality_profile": "balanced"})]
     assert result["pi_agent"]["harness"] == "pi-fixed-workflow"
 
 

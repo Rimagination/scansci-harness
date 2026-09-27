@@ -2569,7 +2569,7 @@ html[data-theme="dark"] .settings-local { color: #858b89; }
 .task-status.failed::before { background: var(--danger); }
 .task-status.paused::before, .task-status.cancelled::before { background: #a68b62; }
 
-.run-shell { width: min(100%, 760px); padding-bottom: 42px; animation: run-enter .2s ease both; }
+.run-shell { width: min(100%, 760px); align-self: flex-start; animation: run-enter .2s ease both; }
 @keyframes run-enter { from { opacity: 0; transform: translateY(4px); } }
 .run-execution-log { margin: 4px 0 0; border: 1px solid #e1e2e5; border-radius: 14px; background: #fff; box-shadow: 0 5px 18px rgba(35, 36, 41, .035); }
 .run-execution-log > summary { display: grid; min-height: 54px; grid-template-columns: 28px minmax(0, 1fr) 18px; align-items: center; gap: 10px; padding: 0 16px; color: #66686e; cursor: pointer; list-style: none; }
@@ -2646,6 +2646,7 @@ html[data-theme="dark"] .settings-local { color: #858b89; }
 .run-result { margin-top: 25px; }
 .artifact-answer { padding: 0 2px; }
 .run-live { display: flex; align-items: center; gap: 11px; padding: 14px 15px; border: 1px solid #e1e1e4; border-radius: 11px; background: #fafafb; }
+.conversation-main:has(#answerArea > .run-shell) > .conversation-composer-dock { padding-top: 20px; }
 .run-live > span { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; background: #4f7c5d; box-shadow: 0 0 0 4px rgba(79, 124, 93, .09); animation: run-pulse 1.2s ease-in-out infinite; }
 .run-live div { display: grid; gap: 2px; }
 .run-live strong { color: #505157; font-size: 13px; font-weight: 500; line-height: 18px; }
