@@ -546,8 +546,10 @@ def test_preview_assets_are_cache_busted(tmp_path: Path) -> None:
     app, _workspace, _evidence = _build_app(tmp_path)
     page = app.dispatch("GET", "/").body.decode("utf-8")
 
-    assert 'href="/styles.css?v=31"' in page
+    assert 'href="/styles.css?v=32"' in page
     assert 'src="/app.js?v=26"' in page
+    styles = Path(__file__).parents[1] / "src" / "scansci_html" / "web" / "styles.css"
+    assert ".conversation-main:has(#answerArea > .run-shell) > :is(.chat-composer, .conversation-composer-dock) { margin-top: 20px; }" in styles.read_text(encoding="utf-8")
 
 
 def test_settings_layout_groups_navigation_and_separates_runtime_page(tmp_path: Path) -> None:

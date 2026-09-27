@@ -2646,7 +2646,7 @@ html[data-theme="dark"] .settings-local { color: #858b89; }
 .run-result { margin-top: 25px; }
 .artifact-answer { padding: 0 2px; }
 .run-live { display: flex; align-items: center; gap: 11px; padding: 14px 15px; border: 1px solid #e1e1e4; border-radius: 11px; background: #fafafb; }
-.conversation-main:has(#answerArea > .run-shell) > .conversation-composer-dock { padding-top: 20px; }
+.conversation-main:has(#answerArea > .run-shell) > :is(.chat-composer, .conversation-composer-dock) { margin-top: 20px; }
 .run-live > span { width: 8px; height: 8px; flex: 0 0 auto; border-radius: 50%; background: #4f7c5d; box-shadow: 0 0 0 4px rgba(79, 124, 93, .09); animation: run-pulse 1.2s ease-in-out infinite; }
 .run-live div { display: grid; gap: 2px; }
 .run-live strong { color: #505157; font-size: 13px; font-weight: 500; line-height: 18px; }
