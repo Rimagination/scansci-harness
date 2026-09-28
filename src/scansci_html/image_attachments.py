@@ -43,19 +43,32 @@ def persist_image_attachments(workspace: str | Path, images: object) -> list[dic
     if len(images) > _MAX_IMAGES:
         raise ValueError(f"一次最多可发送 {_MAX_IMAGES} 张图片")
 
-    validated: list[tuple[str, bytes, str]] = []
+    # A retry loaded from durable history contains only the attachment
+    # metadata.  Reuse the already-persisted local asset instead of requiring
+    # the browser to retain the original data URL.
+    validated: list[tuple[str, bytes, str, str]] = []
     total = 0
     for index, item in enumerate(images, start=1):
         if not isinstance(item, dict):
             raise ValueError("图片附件格式无效")
-        mime_type, raw = _decode_data_url(str(item.get("data_url", "")))
+        attachment_id = str(item.get("id", "")).strip()
+        if attachment_id and not str(item.get("data_url", "")).strip():
+            path, mime_type = attachment_asset(workspace, attachment_id)
+            if path.stat().st_size > _MAX_IMAGE_BYTES:
+                raise ValueError("单张图片不能超过 4 MB")
+            raw = path.read_bytes()
+            _validate_image_bytes(mime_type, raw)
+            reused_id = attachment_id
+        else:
+            mime_type, raw = _decode_data_url(str(item.get("data_url", "")))
+            reused_id = ""
         if len(raw) > _MAX_IMAGE_BYTES:
             raise ValueError("单张图片不能超过 4 MB")
         total += len(raw)
         if total > _MAX_TOTAL_BYTES:
             raise ValueError("本次图片总大小不能超过 10 MB")
         name = _display_name(str(item.get("name", "")), index, _IMAGE_TYPES[mime_type])
-        validated.append((mime_type, raw, name))
+        validated.append((mime_type, raw, name, reused_id))
 
     if not validated:
         return []
@@ -67,8 +80,19 @@ def persist_image_attachments(workspace: str | Path, images: object) -> list[dic
     staged: list[tuple[Path, Path]] = []
     committed: list[Path] = []
     try:
-        for mime_type, raw, name in validated:
-            attachment_id = f"image-{uuid.uuid4().hex}"
+        for mime_type, raw, name, reused_id in validated:
+            attachment_id = reused_id or f"image-{uuid.uuid4().hex}"
+            if reused_id:
+                records.append(
+                    {
+                        "id": attachment_id,
+                        "name": name,
+                        "mime_type": mime_type,
+                        "size": len(raw),
+                        "preview_url": f"/api/attachments/{attachment_id}",
+                    }
+                )
+                continue
             target = root / f"{attachment_id}{_IMAGE_TYPES[mime_type]}"
             staging = root / f".{attachment_id}.{uuid.uuid4().hex}.tmp"
             staged.append((staging, target))

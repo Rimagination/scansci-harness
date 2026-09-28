@@ -49,6 +49,7 @@ def test_model_health_separates_configured_remote_from_ready_local_models():
     assert health["providers"]["local-huggingface"]["status"] == "ready"
     assert health["models"][model_health_key("local-huggingface", "Qwen/chat")]["status"] == "ready"
     assert health["providers"]["local-runtime-chat"]["status"] == "ready"
+    assert health["models"][model_health_key("local-runtime-chat", "local-chat")]["status"] == "ready"
 
 
 def test_model_health_marks_missing_and_incompatible_local_models_unavailable():
@@ -60,7 +61,12 @@ def test_model_health_marks_missing_and_incompatible_local_models_unavailable():
                 "enabled": True,
                 "models": [
                     {"id": "missing", "capabilities": ["reasoning"]},
-                    {"id": "broken", "capabilities": ["vision"]},
+                    {
+                        "id": "broken",
+                        "capabilities": ["vision"],
+                        "available": False,
+                        "unavailable_reason": "GPU 显存不足，当前显存约 8.0 GB。",
+                    },
                 ],
             }
         ],
@@ -75,3 +81,4 @@ def test_model_health_marks_missing_and_incompatible_local_models_unavailable():
     assert health["providers"]["local-huggingface"]["status"] == "unavailable"
     assert health["models"][model_health_key("local-huggingface", "missing")]["status"] == "not_installed"
     assert health["models"][model_health_key("local-huggingface", "broken")]["status"] == "incompatible"
+    assert "显存不足" in health["models"][model_health_key("local-huggingface", "broken")]["detail"]

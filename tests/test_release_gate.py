@@ -1,17 +1,27 @@
 from __future__ import annotations
 
+import base64
 import importlib.util
 import json
 from pathlib import Path
+import re
 import subprocess
 import sys
 import time
 from zipfile import ZipFile
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from scansci_html.update_blockmap import build_blockmap
-from scripts.verify_scansci_agent import _numbered_section_bullet_counts, _numbered_section_count
+from scripts.verify_scansci_agent import (
+    _mostly_chinese,
+    _mostly_english,
+    _numbered_section_bullet_counts,
+    _numbered_section_count,
+    verify_model,
+)
 
 
 SCRIPT = Path(__file__).parents[1] / "scripts" / "release_gate.py"
@@ -24,6 +34,26 @@ SPEC.loader.exec_module(release_gate)
 def _write_json(path: Path, payload: dict) -> Path:
     path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
     return path
+
+
+def _release_signing_material(tmp_path: Path) -> tuple[Path, str]:
+    private = Ed25519PrivateKey.generate()
+    private_path = tmp_path / "release-manifest.key"
+    private_path.write_text(
+        base64.b64encode(
+            private.private_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PrivateFormat.Raw,
+                encryption_algorithm=serialization.NoEncryption(),
+            )
+        ).decode("ascii"),
+        encoding="utf-8",
+    )
+    public = private.public_key().public_bytes(
+        encoding=serialization.Encoding.Raw,
+        format=serialization.PublicFormat.Raw,
+    )
+    return private_path, base64.b64encode(public).decode("ascii")
 
 
 def _scope() -> dict:
@@ -77,7 +107,7 @@ def _valid_pi_report(tmp_path: Path, *, source_sha256: str, bundle_path: Path) -
         })
     node_ids = [
         *[
-            f"tests.test_pi_capability_matrix::test_every_bilingual_model_turn_is_pi_reachable_with_full_read_inventory[case-{index}]"
+            f"tests.test_pi_capability_matrix::test_bilingual_turns_use_pi_only_when_the_task_profile_requires_it[case-{index}]"
             for index in range(40)
         ],
         *[
@@ -190,7 +220,7 @@ def _valid_pi_report(tmp_path: Path, *, source_sha256: str, bundle_path: Path) -
         "mode": "deterministic",
         "status": "passed",
         "protocol_version": 7,
-        "sdk_version": "0.80.10",
+        "sdk_version": "0.84.3",
         "source_sha256": source_sha256,
         "bundle": {"path": str(bundle_path), "sha256": release_gate._sha256(bundle_path), "bytes": bundle_path.stat().st_size},
         "matrix": {
@@ -364,11 +394,56 @@ def test_agent_release_check_accepts_six_numbered_sections_without_an_arbitrary_
     assert _numbered_section_bullet_counts(text) == [3, 3, 3, 3, 3, 3]
 
 
+def test_agent_release_check_detects_the_user_language() -> None:
+    assert _mostly_chinese("你好，我可以帮助你梳理科研证据。")
+    assert not _mostly_chinese("Hello, I can help with research evidence.")
+    assert _mostly_english("Hello, I can help a researcher compare evidence and draft a clear answer.")
+    assert not _mostly_english("你好，我可以帮助你梳理科研证据。")
+
+
+def test_agent_release_check_exercises_language_and_real_multi_turn_history(tmp_path: Path) -> None:
+    class Runtime:
+        def chat_stream(self, payload: dict):
+            messages = list(payload.get("messages", []))
+            prompt = str(messages[-1]["content"])
+            trace = []
+            if prompt.startswith("你好，请记住校验码"):
+                answer = "你好，我已经记住这个校验码。"
+            elif "刚才让你记住" in prompt:
+                answer = re.search(r"SCN-[A-F0-9]+", str(messages[0]["content"])).group(0)
+            elif prompt.startswith("Hello"):
+                answer = "I can help a researcher compare evidence and draft a clear answer."
+            elif prompt.startswith("你是谁"):
+                answer = "我是 ScanSci，当前模型 glm-4.7-flash，并可加载 good-question Skill。"
+                trace = [{"title": "运行时身份", "detail": "fixture"}]
+            elif "六个编号部分" in prompt:
+                answer = "\n".join(
+                    f"### {index}. 检查部分\n- 检查一\n- 检查二\n- 检查三"
+                    for index in range(1, 7)
+                ) + "\n【回答完毕】"
+            else:
+                answer = "核心研究问题：在合理假设下比较植被与微气候响应。"
+            yield {"type": "RUN_STARTED"}
+            yield {"type": "TEXT_MESSAGE_CONTENT", "content": answer}
+            yield {
+                "type": "RUN_FINISHED",
+                "result": {"message": {"role": "assistant", "content": answer, "trace": trace}},
+            }
+
+    result = verify_model(Runtime(), tmp_path / "workspace.sqlite", "glm-4.7-flash")
+
+    assert result["passed"] is True
+    assert result["checks"]["chinese_prompt_gets_chinese_answer"] is True
+    assert result["checks"]["multi_turn_history_is_recalled"] is True
+    assert result["checks"]["english_prompt_gets_english_answer"] is True
+
+
 def test_real_release_contract_defaults_to_a_lightweight_core_package() -> None:
     contract = json.loads((Path(__file__).parents[1] / "config" / "release-gate.json").read_text(encoding="utf-8"))
 
     assert contract["package"]["profile"] == "core"
     assert contract["package"]["exclude_runtimes"] is True
+    assert contract["package"]["signature_required"] is True
     assert int(contract["package"]["max_package_bytes"]) <= 450_000_000
     assert "{version}" in contract["package"]["update_package_url"]
 
@@ -425,6 +500,7 @@ def test_release_gate_probes_external_runtime_manifests_and_assets(tmp_path: Pat
         {
             "profile": "core",
             "exclude_runtimes": True,
+            "runtime_manifest_url": "https://downloads.example.com/local-transformers.json",
             "node_component_manifest_url": "https://downloads.example.com/node.json",
             "tectonic_component_manifest_url": "https://downloads.example.com/tectonic.json",
         }
@@ -463,7 +539,13 @@ def test_release_gate_probes_external_runtime_manifests_and_assets(tmp_path: Pat
         requested.append((method, url))
         if method == "HEAD":
             return _Response()
-        component_id = "node" if url.endswith("node.json") else "tectonic"
+        component_id = (
+            "node"
+            if url.endswith("node.json")
+            else "local-transformers"
+            if url.endswith("local-transformers.json")
+            else "tectonic"
+        )
         payload = {
             "id": component_id,
             "version": "1.0.0",
@@ -479,13 +561,17 @@ def test_release_gate_probes_external_runtime_manifests_and_assets(tmp_path: Pat
 
     result = gate.verify_runtime_component_channels()
 
-    assert set(result["components"]) == {"node", "tectonic"}
+    assert set(result["components"]) == {"node", "tectonic", "local-transformers"}
     assert requested == [
         ("GET", "https://downloads.example.com/node.json"),
         ("HEAD", "https://downloads.example.com/node.zip"),
         ("GET", "https://downloads.example.com/tectonic.json"),
         ("HEAD", "https://downloads.example.com/tectonic.zip"),
+        ("GET", "https://downloads.example.com/local-transformers.json"),
+        ("HEAD", "https://downloads.example.com/local-transformers.zip"),
     ]
+    snapshot = Path(result["components"]["local-transformers"]["snapshot"])
+    assert json.loads(snapshot.read_text(encoding="utf-8"))["id"] == "local-transformers"
 
 
 def test_release_gate_rejects_a_missing_external_runtime_manifest(tmp_path: Path, monkeypatch) -> None:
@@ -494,6 +580,7 @@ def test_release_gate_rejects_a_missing_external_runtime_manifest(tmp_path: Path
         {
             "profile": "core",
             "exclude_runtimes": True,
+            "runtime_manifest_url": "https://downloads.example.com/local-transformers.json",
             "node_component_manifest_url": "https://downloads.example.com/node.json",
             "tectonic_component_manifest_url": "https://downloads.example.com/tectonic.json",
         }
@@ -526,6 +613,32 @@ def test_release_gate_requires_an_overall_checksum_for_multipart_components() ->
                             "size": 42,
                         }
                     ]
+                },
+            },
+        )
+
+
+def test_release_gate_rejects_multipart_sizes_that_do_not_match_package() -> None:
+    with pytest.raises(release_gate.GateFailure, match="part sizes do not match"):
+        release_gate.ReleaseGate._validate_component_asset(
+            "node",
+            {
+                "version": "22.14.0",
+                "windows": {
+                    "sha256": "a" * 64,
+                    "size": 1,
+                    "parts": [
+                        {
+                            "url": "https://downloads.example.com/node.zip.part001",
+                            "sha256": "b" * 64,
+                            "size": 8,
+                        },
+                        {
+                            "url": "https://downloads.example.com/node.zip.part002",
+                            "sha256": "c" * 64,
+                            "size": 8,
+                        },
+                    ],
                 },
             },
         )
@@ -793,6 +906,33 @@ def test_release_package_is_bound_to_the_source_fingerprint_that_passed_the_gate
         gate.verify_package()
 
 
+def test_release_package_rejects_executable_changed_after_signing(tmp_path: Path) -> None:
+    gate = release_gate.ReleaseGate(
+        contract_path=_write_json(tmp_path / "contract.json", _contract()),
+        scope_path=_write_json(tmp_path / "scope.json", _scope()),
+        profile="release",
+        knowledge_source=tmp_path,
+        output_root=tmp_path / "reports",
+        build_id="signed-package-binding",
+    )
+    internal = gate.package_dir / "_internal" / "scansci_html"
+    internal.mkdir(parents=True)
+    gate.executable.write_bytes(b"signed-executable")
+    gate.report["artifacts"]["signed_executable_sha256"] = release_gate._sha256(gate.executable)
+    gate.executable.write_bytes(b"changed-after-signing")
+    _write_json(
+        internal / "build-info.json",
+        {
+            "build_id": gate.build_id,
+            "package_profile": "core",
+            "release_source_sha256": gate.source_sha256,
+        },
+    )
+
+    with pytest.raises(release_gate.GateFailure, match="changed after Authenticode signing"):
+        gate.verify_package()
+
+
 @pytest.mark.parametrize(
     "forbidden_relative_path",
     [
@@ -887,6 +1027,10 @@ def test_packaged_diagnostics_requires_a_completed_pi_tool_loop(tmp_path: Path, 
 
 def test_release_build_keeps_long_pyinstaller_output_in_its_artifact_log(tmp_path: Path, monkeypatch) -> None:
     contract = _contract()
+    _private_path, public_key = _release_signing_material(tmp_path)
+    contract["package"]["release_public_key"] = public_key
+    contract["package"]["update_manifest_url"] = "https://downloads.example.com/stable.json"
+    contract["package"]["update_package_url"] = "https://downloads.example.com/ScanSci-{version}.zip"
     contract["package"]["runtime_manifest_url"] = "https://downloads.example.com/runtime.json"
     contract_path = _write_json(tmp_path / "contract.json", contract)
     scope_path = _write_json(tmp_path / "scope.json", _scope())
@@ -913,6 +1057,10 @@ def test_release_build_keeps_long_pyinstaller_output_in_its_artifact_log(tmp_pat
     command = list(captured["command"])
     output_dir_index = command.index("-OutputDir") + 1
     assert Path(command[output_dir_index]) == gate.package_staging_root
+    update_manifest_index = command.index("-UpdateManifestUrl") + 1
+    assert command[update_manifest_index] == "https://downloads.example.com/stable.json"
+    release_public_key_index = command.index("-ReleasePublicKey") + 1
+    assert command[release_public_key_index] == public_key
     runtime_manifest_index = command.index("-RuntimeManifestUrl") + 1
     assert command[runtime_manifest_index] == "https://downloads.example.com/runtime.json"
     assert "-ExcludeRuntimes" not in command
@@ -922,14 +1070,43 @@ def test_release_build_keeps_long_pyinstaller_output_in_its_artifact_log(tmp_pat
 
 def test_windows_installer_build_script_supports_standard_and_per_user_inno_locations() -> None:
     installer_script = (Path(__file__).parents[1] / "scripts" / "build_windows_installer.ps1").read_text(encoding="utf-8")
+    signer_script = (Path(__file__).parents[1] / "scripts" / "sign_windows_executable.ps1").read_text(encoding="utf-8")
 
     assert "Inno Setup 6\\ISCC.exe" in installer_script
     assert "$env:LOCALAPPDATA\\Programs\\Inno Setup 6\\ISCC.exe" in installer_script
     assert "Get-AuthenticodeSignature" in installer_script
-    assert "SCANSCI_SIGNING_CERT_THUMBPRINT" in installer_script
-    assert "SCANSCI_TIMESTAMP_URL" in installer_script
-    assert "Sign-Artifact -Artifact $exe -Signing $signing" in installer_script
-    assert "Sign-Artifact -Artifact $installer -Signing $signing" in installer_script
+    assert "Assert-ScanSciArtifactSignature -Artifact $exe" in installer_script
+    assert "Invoke-ScanSciArtifactSigning -Artifact $installer" in installer_script
+    assert "Invoke-ScanSciArtifactSigning -Artifact $exe" not in installer_script
+    assert "Invoke-ScanSciArtifactSigning -Artifact $resolvedArtifact" in signer_script
+
+
+def test_formal_release_signs_the_executable_before_package_identity(tmp_path: Path, monkeypatch) -> None:
+    gate = release_gate.ReleaseGate(
+        contract_path=_write_json(tmp_path / "contract.json", _contract()),
+        scope_path=_write_json(tmp_path / "scope.json", _scope()),
+        profile="release",
+        knowledge_source=tmp_path,
+        output_root=tmp_path / "reports",
+        build_id="sign-before-package",
+    )
+    gate.executable.parent.mkdir(parents=True)
+    gate.executable.write_bytes(b"unsigned")
+    captured: dict[str, object] = {}
+
+    def fake_command_step(**kwargs):
+        captured.update(kwargs)
+        gate.executable.write_bytes(b"signed")
+        return {"status": "passed", "result_sha256": release_gate._sha256(gate.executable)}
+
+    monkeypatch.setattr(gate, "command_step", fake_command_step)
+    monkeypatch.setattr(release_gate.shutil, "which", lambda _name: "powershell.exe")
+
+    details = gate.sign_desktop_executable()
+
+    assert captured["step_id"] == "sign-desktop-executable"
+    assert Path(str(captured["required_result"])) == gate.executable
+    assert details["signed_executable_sha256"] == release_gate._sha256(gate.executable)
 
 
 def test_formal_release_requests_a_signed_installer(tmp_path: Path, monkeypatch) -> None:
@@ -958,6 +1135,37 @@ def test_formal_release_requests_a_signed_installer(tmp_path: Path, monkeypatch)
     assert "-RequireSignature" in captured["command"]
 
 
+def test_formal_release_cannot_disable_signing_through_contract_configuration(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    contract = _contract()
+    contract["package"]["signature_required"] = False
+    contract_path = _write_json(tmp_path / "contract.json", contract)
+    scope_path = _write_json(tmp_path / "scope.json", _scope())
+    gate = release_gate.ReleaseGate(
+        contract_path=contract_path,
+        scope_path=scope_path,
+        profile="release",
+        knowledge_source=tmp_path,
+        output_root=tmp_path / "reports",
+        build_id="mandatory-signing",
+    )
+    captured: dict[str, object] = {}
+
+    def fake_command_step(**kwargs):
+        captured.update(kwargs)
+        return {"status": "passed"}
+
+    monkeypatch.setattr(gate, "command_step", fake_command_step)
+    monkeypatch.setattr(release_gate.shutil, "which", lambda _name: "powershell.exe")
+
+    gate.build_installer()
+
+    assert gate.signature_required is True
+    assert "-RequireSignature" in captured["command"]
+
+
 def test_formal_release_signing_preflight_rejects_missing_configuration(tmp_path: Path, monkeypatch) -> None:
     contract = _contract()
     contract["package"]["signature_required"] = True
@@ -981,6 +1189,8 @@ def test_formal_release_signing_preflight_rejects_missing_configuration(tmp_path
 def test_formal_release_signing_preflight_records_a_configured_release_machine(tmp_path: Path, monkeypatch) -> None:
     contract = _contract()
     contract["package"]["signature_required"] = True
+    private_path, public_key = _release_signing_material(tmp_path)
+    contract["package"]["release_public_key"] = public_key
     contract_path = _write_json(tmp_path / "contract.json", contract)
     scope_path = _write_json(tmp_path / "scope.json", _scope())
     gate = release_gate.ReleaseGate(
@@ -993,6 +1203,7 @@ def test_formal_release_signing_preflight_records_a_configured_release_machine(t
     )
     monkeypatch.setenv("SCANSCI_SIGNING_CERT_THUMBPRINT", "A" * 40)
     monkeypatch.setenv("SCANSCI_TIMESTAMP_URL", "https://timestamp.example.test/rfc3161")
+    monkeypatch.setenv("SCANSCI_RELEASE_MANIFEST_PRIVATE_KEY_FILE", str(private_path))
     monkeypatch.setattr(release_gate, "_find_sign_tool", lambda: tmp_path / "signtool.exe")
 
     assert gate.signing_environment() == {
@@ -1001,6 +1212,8 @@ def test_formal_release_signing_preflight_records_a_configured_release_machine(t
         "timestamp_endpoint_present": True,
         "sign_tool_available": True,
         "private_key_validation": "deferred_to_build_script",
+        "manifest_private_key_present": True,
+        "manifest_public_key_matches": True,
     }
 
 
@@ -1029,6 +1242,7 @@ def test_formal_release_installer_verification_requires_an_installed_signature(t
     gate.verify_installer_installation()
 
     assert "--require-signature" in captured["command"]
+    assert captured["command"][captured["command"].index("--expected-version") + 1] == contract["version"]
 
 
 def test_formal_release_rejects_an_unsigned_installer_manifest(tmp_path: Path) -> None:
@@ -1453,6 +1667,45 @@ def test_release_plan_requires_a_built_and_exercised_windows_installer(tmp_path:
     assert "build-update-bundle" in plan["planned_steps"]
     assert "update-bundle-integrity" in plan["planned_steps"]
     assert "signing-environment" in plan["planned_steps"]
+    assert plan["planned_steps"].index("build-desktop") < plan["planned_steps"].index("sign-desktop-executable")
+    assert plan["planned_steps"].index("sign-desktop-executable") < plan["planned_steps"].index("package-integrity")
+    assert plan["planned_steps"].index("package-integrity") < plan["planned_steps"].index("build-update-bundle")
+
+
+def test_release_update_bundle_receives_the_offline_manifest_key(tmp_path: Path, monkeypatch) -> None:
+    contract = _contract()
+    private_path, public_key = _release_signing_material(tmp_path)
+    contract["package"].update(
+        {
+            "release_public_key": public_key,
+            "release_key_id": "release-test",
+            "update_manifest_url": "https://downloads.example.com/stable.json",
+            "update_package_url": "https://downloads.example.com/ScanSci-{version}.zip",
+        }
+    )
+    gate = release_gate.ReleaseGate(
+        contract_path=_write_json(tmp_path / "contract.json", contract),
+        scope_path=_write_json(tmp_path / "scope.json", _scope()),
+        profile="release",
+        knowledge_source=tmp_path,
+        output_root=tmp_path / "reports",
+        build_id="signed-update-command",
+    )
+    captured: dict[str, object] = {}
+
+    monkeypatch.setenv("SCANSCI_RELEASE_MANIFEST_PRIVATE_KEY_FILE", str(private_path))
+    monkeypatch.setattr(release_gate.shutil, "which", lambda _name: "powershell.exe")
+    monkeypatch.setattr(
+        gate,
+        "command_step",
+        lambda **kwargs: captured.update(kwargs) or {"status": "passed"},
+    )
+
+    gate.build_update_bundle()
+
+    command = list(captured["command"])
+    assert command[command.index("-ManifestPrivateKey") + 1] == str(private_path.resolve())
+    assert command[command.index("-ManifestKeyId") + 1] == "release-test"
 
 
 def test_release_gate_binds_update_assets_to_the_verified_package_identity(tmp_path: Path) -> None:
@@ -1460,8 +1713,12 @@ def test_release_gate_binds_update_assets_to_the_verified_package_identity(tmp_p
     contract["package"].update(
         {
             "profile": "core",
+            "exclude_runtimes": True,
             "update_manifest_url": "https://downloads.example.com/stable.json",
             "update_package_url": "https://downloads.example.com/v{version}/ScanSci-{version}-windows-x64.zip",
+            "runtime_manifest_url": "https://downloads.example.com/local-transformers.json",
+            "node_component_manifest_url": "https://downloads.example.com/node.json",
+            "tectonic_component_manifest_url": "https://downloads.example.com/tectonic.json",
         }
     )
     gate = release_gate.ReleaseGate(
@@ -1486,9 +1743,20 @@ def test_release_gate_binds_update_assets_to_the_verified_package_identity(tmp_p
         zipped.writestr("_internal/scansci_html/build-info.json", json.dumps(identity))
     blockmap_path = archive.with_suffix(archive.suffix + ".blockmap")
     _write_json(blockmap_path, build_blockmap(archive))
+    runtime_component = {
+        "id": "local-transformers",
+        "version": "1.0.4",
+        "windows": {
+            "url": "https://downloads.example.com/local-transformers.zip",
+            "sha256": "a" * 64,
+            "size": 42,
+        },
+    }
+    _write_json(gate.diagnostics_dir / "runtime-component-local-transformers.json", runtime_component)
     _write_json(
         gate.update_manifest,
         {
+            "schema_version": 1,
             "version": contract["version"],
             "channel": "stable",
             "windows": {
@@ -1502,6 +1770,12 @@ def test_release_gate_binds_update_assets_to_the_verified_package_identity(tmp_p
                     "block_size": 65536,
                 },
             },
+            "components": {
+                "local-transformers": {
+                    "version": runtime_component["version"],
+                    "windows": runtime_component["windows"],
+                }
+            },
         },
     )
 
@@ -1509,6 +1783,29 @@ def test_release_gate_binds_update_assets_to_the_verified_package_identity(tmp_p
 
     assert details["update_archive_sha256"] == release_gate._sha256(archive)
     assert details["update_package_url"].endswith(f"/ScanSci-{contract['version']}-windows-x64.zip")
+    assert details["runtime_component_version"] == "1.0.4"
+
+
+def test_release_gate_rejects_unsigned_update_manifest_when_public_key_is_configured(tmp_path: Path) -> None:
+    contract = _contract()
+    _private_path, public_key = _release_signing_material(tmp_path)
+    contract["package"]["release_public_key"] = public_key
+    gate = release_gate.ReleaseGate(
+        contract_path=_write_json(tmp_path / "contract.json", contract),
+        scope_path=_write_json(tmp_path / "scope.json", _scope()),
+        profile="release",
+        knowledge_source=tmp_path,
+        output_root=tmp_path / "reports",
+        build_id="unsigned-update-manifest",
+    )
+    gate.update_bundle_dir.mkdir(parents=True)
+    _write_json(
+        gate.update_manifest,
+        {"schema_version": 1, "version": contract["version"], "channel": "stable"},
+    )
+
+    with pytest.raises(release_gate.GateFailure, match="signature is invalid"):
+        gate.verify_update_bundle()
 
 
 def test_beta_plan_builds_and_exercises_an_unsigned_installer_without_formal_signing(tmp_path: Path) -> None:

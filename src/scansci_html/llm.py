@@ -6,16 +6,20 @@ import os
 import re
 import time
 from threading import Lock
-from typing import Any, Iterator, Protocol
+from typing import Any, Iterator, Mapping, Protocol
+from urllib.parse import urlparse
 
 from pydantic import ValidationError
 import requests
 
 from .model_transport import (
+    ANTHROPIC_MESSAGES,
     CHAT_COMPLETIONS,
     RESPONSES,
     ModelRequest,
     complete_model,
+    merge_request_headers,
+    provider_request_headers,
     select_api_surface,
     stream_model_events,
 )
@@ -46,6 +50,14 @@ _STREAM_COOLDOWN_GUARD = Lock()
 
 def _stream_rate_key(provider: str, base_url: str) -> str:
     return f"{str(provider or '').strip().lower()}::{str(base_url or '').rstrip('/').lower()}"
+
+
+def _is_loopback_endpoint(base_url: str) -> bool:
+    try:
+        hostname = urlparse(str(base_url or "")).hostname
+    except ValueError:
+        return False
+    return hostname in {"127.0.0.1", "localhost", "::1"}
 
 
 def _stream_request_gate(rate_key: str) -> Lock:
@@ -497,7 +509,7 @@ class OpenAICompatibleChatJsonClient:
                 except requests.RequestException as error:
                     status = getattr(getattr(error, "response", None), "status_code", None)
                     if status not in {429, 502, 503, 504} or requests_used >= self.logical_request_limit:
-                        raise RuntimeError(_public_model_error(error, prefix="模型结构化响应暂时不可用")) from error
+                        raise _model_transport_exception(error, prefix="模型结构化响应暂时不可用") from error
                     headers = dict(getattr(getattr(error, "response", None), "headers", {}) or {})
                     try:
                         requested_delay = float(headers.get("Retry-After", headers.get("retry-after", 0)) or 0)
@@ -506,7 +518,7 @@ class OpenAICompatibleChatJsonClient:
                     if status == 429:
                         self._rate_limited_until = time.monotonic() + min(120.0, max(30.0, requested_delay))
                         if requested_delay > 8:
-                            raise RuntimeError(_public_model_error(error, prefix="模型结构化响应暂时不可用")) from error
+                            raise _model_transport_exception(error, prefix="模型结构化响应暂时不可用") from error
                         delay = min(8.0, max(requested_delay, 2.0))
                     else:
                         delay = min(12.0, max(requested_delay, float(2 ** requests_used)))
@@ -772,6 +784,14 @@ def build_chat_json_client(
                 session=session,
                 thinking_mode=thinking_mode,
             )
+        if selected_surface == ANTHROPIC_MESSAGES:
+            return AnthropicCompatibleChatJsonClient(
+                base_url=resolved_base_url,
+                api_key=resolved_api_key,
+                model=resolved_model,
+                timeout=timeout,
+                session=session,
+            )
         return OpenAICompatibleChatJsonClient(
             base_url=resolved_base_url,
             api_key=resolved_api_key,
@@ -815,6 +835,7 @@ def complete_chat_text(
     responses_enabled: bool = False,
     previous_response_id: str | None = None,
     response_format: dict[str, Any] | None = None,
+    provider_session_id: str = "",
 ) -> str | tuple[str, dict[str, int]]:
     """Return a plain conversational response without requiring a research library."""
 
@@ -826,6 +847,10 @@ def complete_chat_text(
         raise ValueError("model is required for chat")
     if not messages:
         raise ValueError("messages are required")
+    provider_headers = provider_request_headers(
+        provider_id,
+        provider_session_id or f"request-{os.urandom(8).hex()}",
+    )
     selected_surface = select_api_surface(
         api_surface,
         provider_kind=provider,
@@ -852,6 +877,7 @@ def complete_chat_text(
                 response_format=response_format,
                 max_requests=max_requests,
                 session=session,
+                provider_session_id=provider_session_id,
             )
         )
         return (result.text, result.usage) if include_usage else result.text
@@ -859,7 +885,7 @@ def complete_chat_text(
     request_limit = max(1, min(_MAX_LOGICAL_REQUESTS, int(max_requests)))
 
     name = (provider or "").strip().lower()
-    if use_litellm and session is None and _litellm_enabled() and name in {"openai-compatible", "openai", "local", "anthropic-compatible", "anthropic"}:
+    if use_litellm and not provider_headers and session is None and _litellm_enabled() and name in {"openai-compatible", "openai", "local", "anthropic-compatible", "anthropic"}:
         return _litellm_complete_chat(
             name,
             base_url=base_url,
@@ -891,7 +917,10 @@ def complete_chat_text(
                 try:
                     response = client.post(
                         f"{base_url.rstrip('/')}/chat/completions",
-                        headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                        headers=merge_request_headers(
+                            {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                            provider_headers,
+                        ),
                         json=request_body,
                         timeout=timeout,
                     )
@@ -920,11 +949,14 @@ def complete_chat_text(
             conversation = [item for item in messages if item.get("role") in {"user", "assistant"}]
             response = client.post(
                 f"{base_url.rstrip('/')}/messages",
-                headers={
-                    "x-api-key": api_key,
-                    "anthropic-version": "2023-06-01",
-                    "Content-Type": "application/json",
-                },
+                headers=merge_request_headers(
+                    {
+                        "x-api-key": api_key,
+                        "anthropic-version": "2023-06-01",
+                        "Content-Type": "application/json",
+                    },
+                    provider_headers,
+                ),
                 json={"model": model, "max_tokens": max(64, int(max_tokens)), "system": system, "messages": conversation},
                 timeout=timeout,
             )
@@ -938,9 +970,21 @@ def complete_chat_text(
     except requests.RequestException as error:
         status = getattr(getattr(error, "response", None), "status_code", None)
         if status == 503:
-            raise RuntimeError("内置模型服务尚未启用；请由 ScanSci 管理员保存服务密钥后重试。") from error
-        detail = f"（HTTP {status}）" if status else ""
-        raise RuntimeError(f"模型服务暂时不可用{detail}，请稍后重试。") from error
+            message = "内置模型服务尚未启用；请由 ScanSci 管理员保存服务密钥后重试。"
+            wrapped = RuntimeError(message)
+            wrapped.failure = {  # type: ignore[attr-defined]
+                "code": "model_service_not_configured",
+                "message": message,
+                "detail": message,
+                "retryable": False,
+                "actions": [
+                    {"id": "open_settings", "label": "检查模型服务", "kind": "settings"},
+                    {"id": "branch", "label": "切换模型", "kind": "branch"},
+                ],
+            }
+            wrapped.status_code = status  # type: ignore[attr-defined]
+            raise wrapped from error
+        raise _model_transport_exception(error, prefix="模型服务暂时不可用") from error
 
     if not text:
         raise RuntimeError("The model returned an empty response")
@@ -969,6 +1013,7 @@ def stream_chat_text(
     responses_enabled: bool = False,
     previous_response_id: str | None = None,
     response_format: dict[str, Any] | None = None,
+    provider_session_id: str = "",
 ) -> Iterator[dict[str, Any]]:
     """Yield OpenAI-compatible text deltas and a final usage event.
 
@@ -985,6 +1030,10 @@ def stream_chat_text(
         raise ValueError("model is required for chat")
     if not messages:
         raise ValueError("messages are required")
+    provider_headers = provider_request_headers(
+        provider_id,
+        provider_session_id or f"request-{os.urandom(8).hex()}",
+    )
     selected_surface = select_api_surface(
         api_surface,
         provider_kind=provider,
@@ -1012,6 +1061,7 @@ def stream_chat_text(
                 response_format=response_format,
                 max_requests=max_requests,
                 session=session,
+                provider_session_id=provider_session_id,
             )
         ):
             event_type = str(event.get("type", ""))
@@ -1036,9 +1086,26 @@ def stream_chat_text(
         return
     _ensure_provider_input_budget(messages, max_input_tokens=max_input_tokens)
     request_limit = max(1, min(_STREAM_LOGICAL_REQUESTS, int(max_requests)))
+    local_endpoint = _is_loopback_endpoint(base_url)
+    managed_endpoint = (
+        str(provider_id or "").strip().casefold() == "scansci-managed"
+        or "scansci-glm-gateway.932196440.workers.dev" in str(base_url or "").casefold()
+    )
+    # A local runtime can briefly answer with HTTP 500 while its worker is
+    # starting or releasing a previous generation.  Keep the caller's logical
+    # request budget intact, while allowing one transport retry for that case.
+    if local_endpoint:
+        transport_request_limit = max(request_limit, 2)
+    elif managed_endpoint:
+        # The managed gateway has its own minute limiter.  Keep one original
+        # request and at most one provider retry for a direct compatibility
+        # turn, even when callers use the historical default of four.
+        transport_request_limit = min(request_limit, 2)
+    else:
+        transport_request_limit = request_limit
 
     name = (provider or "").strip().lower()
-    if session is None and _litellm_enabled() and name in {"openai-compatible", "openai", "local", "anthropic-compatible", "anthropic"}:
+    if not provider_headers and session is None and _litellm_enabled() and name in {"openai-compatible", "openai", "local", "anthropic-compatible", "anthropic"}:
         yield from _litellm_stream_chat(
             name,
             base_url=base_url,
@@ -1068,6 +1135,9 @@ def stream_chat_text(
             temperature=temperature,
             max_input_tokens=max_input_tokens,
             max_requests=request_limit,
+            provider_id=provider_id,
+            responses_enabled=responses_enabled,
+            provider_session_id=provider_session_id,
         )
         text, usage = completed if isinstance(completed, tuple) else (completed, {})
         yield {"type": "delta", "content": text}
@@ -1106,7 +1176,7 @@ def stream_chat_text(
         attempt_usage: dict[str, int] = {}
         finish_reason = ""
         try:
-            for retry_index in range(request_limit):
+            for retry_index in range(transport_request_limit):
                 queued_delay = _stream_cooldown_remaining(rate_key)
                 if queued_delay > 0:
                     yield {
@@ -1131,7 +1201,10 @@ def stream_chat_text(
                             _stream_clear_cooldown(rate_key)
                         response = client.post(
                             f"{base_url.rstrip('/')}/chat/completions",
-                            headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                            headers=merge_request_headers(
+                                {"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                                provider_headers,
+                            ),
                             json=request_body,
                             timeout=timeout,
                             stream=True,
@@ -1145,7 +1218,11 @@ def stream_chat_text(
                     # safe to retry once because no model text was received;
                     # do not make users manually recover from a stale desktop
                     # keep-alive connection.
-                    retryable = status is None or status in {429, 502, 503, 504}
+                    retryable = (
+                        status is None
+                        or status in {429, 502, 503, 504}
+                        or (local_endpoint and status == 500)
+                    )
                     headers = dict(getattr(getattr(error, "response", None), "headers", {}) or {})
                     try:
                         requested_delay = float(headers.get("Retry-After", headers.get("retry-after", 0)) or 0)
@@ -1155,13 +1232,13 @@ def stream_chat_text(
                     delay = min(45.0, max(requested_delay, float(base_delay)))
                     if status == 429:
                         _stream_set_cooldown(rate_key, delay)
-                    if not retryable or retry_index >= request_limit - 1:
+                    if not retryable or retry_index >= transport_request_limit - 1:
                         # Release the failed streaming connection before
                         # raising so the socket is not leaked to the caller.
                         if response is not None:
                             response.close()
                             response = None
-                        raise RuntimeError(_public_model_error(error, prefix="模型流式响应暂时不可用")) from error
+                        raise _model_transport_exception(error, prefix="模型流式响应暂时不可用") from error
                     if response is not None:
                         response.close()
                         response = None
@@ -1276,7 +1353,7 @@ def stream_chat_text(
                     max_requests=1,
                 )
                 return
-            raise RuntimeError(_public_model_error(error, prefix="模型流式响应暂时不可用")) from error
+            raise _model_transport_exception(error, prefix="模型流式响应暂时不可用") from error
         finally:
             if response is not None:
                 response.close()
@@ -1453,7 +1530,7 @@ def _litellm_complete_chat(
             )
         )
     except Exception as error:  # LiteLLM normalizes provider-specific failures
-        raise RuntimeError(_public_model_error(error, prefix="模型服务暂时不可用")) from error
+        raise _model_transport_exception(error, prefix="模型服务暂时不可用") from error
     payload = _litellm_payload(response)
     choices = list(payload.get("choices", []) or [])
     message = dict(choices[0].get("message", {}) or {}) if choices and isinstance(choices[0], dict) else {}
@@ -1551,7 +1628,7 @@ def _litellm_stream_chat(
                 },
             ]
     except Exception as error:
-        raise RuntimeError(_public_model_error(error, prefix="模型流式响应暂时不可用")) from error
+        raise _model_transport_exception(error, prefix="模型流式响应暂时不可用") from error
     yield {
         "type": "done",
         "usage": usage,
@@ -1654,6 +1731,68 @@ def _public_model_error(error: BaseException, *, prefix: str) -> str:
     if provider_code == "upstream_connection_failed":
         return "暂时无法连接托管模型服务。请检查网络后重试。" + support_reference
     return f"{prefix}（HTTP {status}），请稍后重试。" if status else f"{prefix}，请稍后重试。"
+
+
+def _model_transport_exception(error: BaseException, *, prefix: str) -> RuntimeError:
+    """Keep transient transport failures recoverable across the harness boundary."""
+
+    response = getattr(error, "response", None)
+    status = getattr(error, "status_code", None)
+    if status is None:
+        status = getattr(response, "status_code", None)
+    provider_code = _provider_error_code(error)
+    normalized = str(error or "").lower()
+    retryable_statuses = {408, 425, 429, 500, 502, 503, 504}
+    retryable_codes = {
+        "rate_limit_exceeded",
+        "upstream_rate_limited",
+        "upstream_timeout",
+        "upstream_connection_failed",
+    }
+    retryable = bool(
+        status in retryable_statuses
+        or provider_code in retryable_codes
+        or isinstance(error, (requests.ConnectionError, requests.Timeout))
+        or any(
+            marker in normalized
+            for marker in ("temporarily unavailable", "timed out", "timeout", "connection")
+        )
+    )
+    if status == 429 or provider_code in {"rate_limit_exceeded", "upstream_rate_limited"}:
+        failure_code = provider_code or "provider_rate_limited"
+    elif provider_code:
+        failure_code = provider_code
+    elif status in retryable_statuses or retryable:
+        failure_code = "model_transport_unavailable"
+    else:
+        failure_code = "model_transport_error"
+    message = _public_model_error(error, prefix=prefix)
+    headers = dict(getattr(response, "headers", {}) or {})
+    try:
+        retry_after = max(
+            0.0,
+            min(120.0, float(headers.get("Retry-After", headers.get("retry-after", 0)) or 0)),
+        )
+    except (TypeError, ValueError):
+        retry_after = 0.0
+    actions = [
+        {"id": "retry", "label": "自动重试", "kind": "retry"},
+        {"id": "branch", "label": "保留现场并分支", "kind": "branch"},
+    ]
+    failure: dict[str, Any] = {
+        "code": failure_code,
+        "message": message,
+        "detail": message,
+        "retryable": retryable,
+        "actions": actions,
+        "recovery_actions": actions,
+    }
+    if retry_after:
+        failure["retry_after_seconds"] = retry_after
+    wrapped = RuntimeError(message)
+    wrapped.failure = failure  # type: ignore[attr-defined]
+    wrapped.status_code = status  # type: ignore[attr-defined]
+    return wrapped
 
 
 def _provider_error_code(error: BaseException) -> str:

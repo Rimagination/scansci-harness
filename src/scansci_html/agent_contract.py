@@ -53,6 +53,7 @@ _REVERSIBLE_LOCAL_TOOLS = {
     "create_pdf",
     "create_spreadsheet",
     "create_presentation",
+    "generate_image",
     "compile_latex",
     "edit_section",
     "edit_slide",
@@ -127,6 +128,7 @@ _MODE_TOOLS = {
         "self_assess",
     },
     "verified-answer": {"build_verified_answer"},
+    "image": {"generate_image", "self_assess"},
     "slides": {
         "inspect_workspace",
         "build_presentation_outline",
@@ -153,6 +155,7 @@ _MODE_INITIAL_TOOLS = {
     "knowledge": {"inspect_available_tools"},
     "research": {"discover_papers"},
     "verified-answer": {"build_verified_answer"},
+    "image": {"generate_image"},
     "slides": {"build_presentation_outline"},
 }
 _WORKFLOW_REVERSIBLE = {
@@ -211,6 +214,7 @@ class TaskProfile:
     """
 
     route: str
+    capability_profile: str
     cognitive_complexity: str
     execution_complexity: str
     evidence_policy: str
@@ -262,6 +266,7 @@ class TaskContract:
         payload["required_tool_groups"] = [list(group) for group in self.required_tool_groups]
         payload["success_criteria"] = list(self.success_criteria)
         payload["task_profile"] = self.task_profile.to_dict()
+        payload["capability_profile"] = self.task_profile.capability_profile
         payload["unavailable_tools"] = list(self.unavailable_tools)
         payload["allowed_mcp_servers"] = list(self.allowed_mcp_servers)
         payload["capability_lease"] = dict(self.capability_lease or {})
@@ -337,7 +342,7 @@ def classify_task_profile(
     social_turn = bool(_GREETING_PATTERN.fullmatch(normalized_text))
     high_risk = bool(_HIGH_RISK_PATTERN.search(normalized_text))
     reversible = bool(
-        parts & {"research", "slides"}
+        parts & {"research", "slides", "image"}
         or normalized_workflow in _WORKFLOW_REVERSIBLE
     )
     if social_turn and not required:
@@ -359,10 +364,9 @@ def classify_task_profile(
     }:
         risk_level = "read_only"
     else:
-        # Every non-social model turn is mediated by Pi.  Its baseline
-        # authority is therefore a read-only inventory even when no tool is
-        # mandatory.  Regex classification may guide initial activation, but
-        # it must not hide a safe capability from the model.
+        # A plain direct_chat turn stays on the Host fast lane.  Capability-
+        # bearing profiles still receive the read-only baseline so Pi can
+        # discover an allowed capability even when no single tool is mandatory.
         risk_level = "read_only"
 
     bulk = bool(_BULK_PATTERN.search(normalized_text))
@@ -435,6 +439,13 @@ def classify_task_profile(
     else:
         route = "direct_chat"
 
+    capability_profile = {
+        "direct_chat": "minimal",
+        "tool_agent": "focused",
+        "resumable_workflow": "workflow",
+        "approval_gate": "approval",
+    }[route]
+
     reasons: list[str] = []
     if social_turn:
         reasons.append("greeting")
@@ -460,6 +471,7 @@ def classify_task_profile(
         confidence = 0.9
     return TaskProfile(
         route=route,
+        capability_profile=capability_profile,
         cognitive_complexity=cognitive_complexity,
         execution_complexity=execution_complexity,
         evidence_policy=evidence_policy,

@@ -47,6 +47,7 @@ _TASK_CONTRACT_AUDIT_FIELDS = frozenset({
     "max_model_token_budget",
     "allow_external_write",
     "task_profile",
+    "capability_profile",
     "unavailable_tools",
     "allowed_mcp_servers",
     "capability_lease",

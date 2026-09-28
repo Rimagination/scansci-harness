@@ -72,15 +72,6 @@ def review_research_run(run: dict[str, Any]) -> dict[str, Any]:
         for item in list(run.get("tool_calls", []) or [])
         if isinstance(item, dict) and str(item.get("status", "")) == "completed"
     }
-    # Background UI runs persist the evidence pipeline as one durable host
-    # call (for example ``scansci.evidence.ask``/``scansci.review.write``),
-    # while the interactive path exposes the internal trace tools
-    # ``search_local_evidence`` and ``build_verified_answer``.  Once the
-    # artifact itself contains verified, navigable evidence links, treat those
-    # internal stages as completed too.  Without this projection every
-    # successful background evidence task is incorrectly labelled
-    # ``needs_review`` even though its artifact passed citation verification.
-    completed_tools.update(_artifact_completed_tools(artifact))
     findings: list[dict[str, str]] = []
     if str(run.get("status", "")) != "completed":
         findings.append({"code": "run_not_completed", "severity": "high", "message": "任务未处于已完成状态。"})
@@ -88,7 +79,7 @@ def review_research_run(run: dict[str, Any]) -> dict[str, Any]:
         findings.append({"code": "output_missing", "severity": "high", "message": "任务没有可追溯的最终产物。"})
     required_groups = [list(group) for group in list(contract.get("required_tool_groups", []) or []) if group]
     for group in required_groups:
-        if not any(str(name) in completed_tools for name in group):
+        if not any(_tool_requirement_met(str(name), completed_tools, artifact) for name in group):
             findings.append(
                 {
                     "code": "required_tool_group_missing",
@@ -126,24 +117,40 @@ def review_research_run(run: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-def _artifact_completed_tools(artifact: dict[str, Any]) -> set[str]:
-    """Project durable evidence artifacts onto their contract tool stages."""
+def _tool_requirement_met(
+    name: str, completed_tools: set[str], artifact: dict[str, Any]
+) -> bool:
+    """Match contract semantics to actual completed calls, including Host calls."""
+
+    if name in completed_tools:
+        return True
+    # The background academic search performs paper discovery and persists
+    # its result under the Host tool name. It proves only that capability;
+    # it does not prove browser access, evidence verification or Pi routing.
+    if name == "discover_papers":
+        return "scansci.academic.search" in completed_tools
+    if name not in {"search_local_evidence", "build_verified_answer"}:
+        return False
+    # Background evidence pipelines persist one Host call. Require both the
+    # completed call and navigable evidence before accepting its internal stages.
+    if not completed_tools.intersection({"scansci.evidence.ask", "scansci.review.write"}):
+        return False
 
     artifact_type = str(artifact.get("artifact_type", "")).strip().casefold()
     if artifact_type not in {"evidence_answer", "literature_review", "review"}:
-        return set()
+        return False
     evidence_links = [
         item for item in list(artifact.get("evidence_links", []) or []) if isinstance(item, dict)
     ]
     if not evidence_links:
-        return set()
+        return False
     payload = dict(artifact.get("payload", {}) or {})
     verification = dict(payload.get("citation_verification", {}) or {})
     # A non-empty link list is already the persisted source-navigation gate;
     # honour an explicit failed verification and leave the contract unmet.
     if verification and verification.get("passed") is False:
-        return set()
-    return {"search_local_evidence", "build_verified_answer"}
+        return False
+    return True
 
 
 def _stage_ratio(run: dict[str, Any]) -> float:

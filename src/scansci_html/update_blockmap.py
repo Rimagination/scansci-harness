@@ -2,13 +2,16 @@
 
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 import hashlib
 import json
 import os
 from pathlib import Path
 from typing import Any
-from urllib.request import Request, urlopen
+from urllib.parse import urlparse
+from urllib.request import Request
+
+from .release_transport import open_release_url
 
 
 DEFAULT_BLOCK_SIZE = 64 * 1024
@@ -97,6 +100,8 @@ def download_differential(
     new_url: str,
     new_blockmap: dict[str, Any],
     destination: str | Path,
+    *,
+    opener: Callable[..., Any] | None = None,
 ) -> dict[str, Any]:
     """Reconstruct a new file by copying old blocks and fetching changed ranges."""
 
@@ -118,7 +123,7 @@ def download_differential(
                     if len(data) != length:
                         raise DifferentialDownloadUnavailable("cached base package ended before a copied range")
                 else:
-                    data = _download_range(new_url, start, end)
+                    data = _download_range(new_url, start, end, opener=opener)
                     bytes_downloaded += len(data)
                 output.write(data)
             output.flush()
@@ -198,9 +203,24 @@ def _validate_blockmap(payload: Any) -> None:
         raise ValueError("blockmap sha256 must be a SHA256 string")
 
 
-def _download_range(url: str, start: int, end: int) -> bytes:
+def _download_range(
+    url: str,
+    start: int,
+    end: int,
+    *,
+    opener: Callable[..., Any] | None = None,
+) -> bytes:
     request = Request(url, headers={"Accept": "*/*", "Range": f"bytes={start}-{end - 1}"})
-    with urlopen(request, timeout=90) as response:  # noqa: S310 - caller supplies a release URL
+    response = (
+        open_release_url(
+            request,
+            timeout=90,
+            allow_file=urlparse(url).scheme.casefold() == "file",
+        )
+        if opener is None
+        else opener(request, timeout=90)
+    )
+    with response:
         status = int(getattr(response, "status", response.getcode()))
         if status != 206:
             raise DifferentialDownloadUnavailable("release server does not support HTTP Range")

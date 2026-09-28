@@ -28,7 +28,14 @@ from uuid import uuid4
 from zipfile import BadZipFile, ZipFile
 
 from .build_info import current_build_info
-from .local_runtime_contract import COMPONENT_ID, COMPONENT_VERSION, EXECUTABLE_NAME
+from .manifest_trust import verify_manifest_signature
+from .release_transport import open_release_url, validate_release_url
+from .local_runtime_contract import (
+    COMPONENT_ID,
+    COMPONENT_VERSION,
+    EXECUTABLE_NAME,
+    MINIMUM_COMPONENT_VERSION,
+)
 
 
 RUNTIME_MANIFEST_ENV = "SCANSCI_LOCAL_RUNTIME_MANIFEST_URL"
@@ -36,9 +43,17 @@ RUNTIME_MANIFEST_FALLBACKS_ENV = "SCANSCI_LOCAL_RUNTIME_MANIFEST_FALLBACKS"
 RUNTIME_EXECUTABLE_ENV = "SCANSCI_LOCAL_RUNTIME_EXECUTABLE"
 RUNTIME_ROOT_ENV = "SCANSCI_LOCAL_RUNTIME_ROOT"
 UPDATE_MANIFEST_ENV = "SCANSCI_UPDATE_MANIFEST_URL"
+RELEASE_PUBLIC_KEY_ENV = "SCANSCI_RELEASE_PUBLIC_KEY"
 DEFAULT_RUNTIME_MANIFEST_URL = "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.0/local-transformers.json"
 DEFAULT_RUNTIME_RELEASE_URL = "https://github.com/Rimagination/scansci-portal/releases/tag/local-runtime-v1.0.0"
+DEFAULT_RUNTIME_MANIFEST_FALLBACK_URLS = (
+    "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.0/local-transformers.json",
+)
 _RUNTIME_RETRY_DELAYS_SECONDS = (0.0, 1.0, 3.0, 8.0)
+_MAX_RUNTIME_ARCHIVE_FILES = 200_000
+_MAX_UNPACKED_RUNTIME_BYTES = 16 * 1024**3
+_MAX_MANIFEST_BYTES = 1_000_000
+_MAX_RUNTIME_DOWNLOAD_BYTES = 16 * 1024**3
 # Loading a downloaded vision/audio model can take longer than the old fixed
 # 45-second window, especially on the first CUDA initialization.  Do not kill
 # a healthy component merely because the model needs time to load.
@@ -82,6 +97,7 @@ class LocalRuntimeComponent:
         component_id: str = COMPONENT_ID,
         executable_name: str = EXECUTABLE_NAME,
         component_version: str = COMPONENT_VERSION,
+        minimum_component_version: str | None = None,
         default_manifest_url: str = DEFAULT_RUNTIME_MANIFEST_URL,
         default_release_url: str = DEFAULT_RUNTIME_RELEASE_URL,
         manifest_env: str = RUNTIME_MANIFEST_ENV,
@@ -93,10 +109,15 @@ class LocalRuntimeComponent:
         system_executable_names: tuple[str, ...] = (),
         embedded_profiles: frozenset[str] = frozenset({"full"}),
         source_dependency_modules: tuple[str, ...] = ("torch", "transformers", "sentence_transformers"),
+        release_public_key: str | None = None,
     ) -> None:
         self.component_id = str(component_id or COMPONENT_ID)
         self.executable_name = str(executable_name or EXECUTABLE_NAME)
         self.component_version = str(component_version or COMPONENT_VERSION)
+        self.minimum_component_version = str(
+            minimum_component_version
+            or (MINIMUM_COMPONENT_VERSION if self.component_id == COMPONENT_ID else self.component_version)
+        )
         self.default_manifest_url = str(default_manifest_url or DEFAULT_RUNTIME_MANIFEST_URL)
         self.default_release_url = str(default_release_url or DEFAULT_RUNTIME_RELEASE_URL)
         self.executable_env = str(executable_env or RUNTIME_EXECUTABLE_ENV)
@@ -113,6 +134,9 @@ class LocalRuntimeComponent:
         configured_root = os.getenv(RUNTIME_ROOT_ENV, "").strip()
         self.root = Path(root or configured_root or Path(local_app_data) / "ScanSci" / "runtimes" / self.component_id).resolve()
         build = current_build_info()
+        if release_public_key is None:
+            release_public_key = os.getenv(RELEASE_PUBLIC_KEY_ENV, "") or build.get("release_public_key", "")
+        self.release_public_key = str(release_public_key or "").strip()
         packaged_core_fallback = (
             self.default_manifest_url
             if bool(build.get("frozen")) and str(build.get("package_profile", "")) == "core"
@@ -131,6 +155,8 @@ class LocalRuntimeComponent:
                 fallback_manifest_url,
                 os.getenv(UPDATE_MANIFEST_ENV),
             ]
+            if self.component_id == COMPONENT_ID:
+                configured_urls.extend(DEFAULT_RUNTIME_MANIFEST_FALLBACK_URLS)
             configured_urls.extend(
                 value
                 for value in re.split(r"[;\r\n]+", os.getenv(fallbacks_env, ""))
@@ -223,7 +249,7 @@ class LocalRuntimeComponent:
             health = self._health_snapshot(base_url)
             health_model = self._health_model_from_payload(health)
             if health_model == wanted:
-                if self._health_needs_probe(health, wanted):
+                if self._health_needs_probe(health, wanted) or self._compatibility_probe_needed(wanted):
                     self._probe_generation(base_url, wanted)
                     self._process_model_id = wanted
                     self._process_base_url = base_url
@@ -399,6 +425,22 @@ class LocalRuntimeComponent:
         return str(payload.get("model", "")).strip() if isinstance(payload, dict) else ""
 
     @staticmethod
+    def _compatibility_probe_needed(wanted: str) -> bool:
+        """Retry a previously failed probe when the runtime is healthy again."""
+
+        try:
+            from .local_model_market import installed_models
+
+            return any(
+                str(item.get("id", "")).strip() == wanted
+                and str(item.get("runtime_probe_state", "")).strip().lower() == "failed"
+                for item in installed_models()
+                if isinstance(item, dict)
+            )
+        except (OSError, ValueError):
+            return False
+
+    @staticmethod
     def _health_readiness(payload: dict[str, Any] | None) -> str:
         if not isinstance(payload, dict) or payload.get("_legacy_health"):
             return "ready" if isinstance(payload, dict) else "unknown"
@@ -431,8 +473,8 @@ class LocalRuntimeComponent:
         lowered = normalized.casefold()
         if "1455" in lowered or "页面文件太小" in normalized or "page file" in lowered:
             return (
-                f"{normalized}。请在 Windows 系统设置中增大虚拟内存（页面文件），"
-                "关闭占用显存的程序后重试；也可以改用云端视觉模型或 OCR，图片问答不会因此中断。"
+                f"{normalized}。请在 Windows 系统设置中增大虚拟内存（页面文件）或释放系统内存后重试；"
+                "也可改用云端视觉模型或 OCR。"
             )
         if "out of memory" in lowered or "显存不足" in normalized or "cuda" in lowered and "memory" in lowered:
             return (
@@ -472,8 +514,10 @@ class LocalRuntimeComponent:
         try:
             with urlopen(request, timeout=min(_RUNTIME_START_TIMEOUT_SECONDS, 180.0)) as response:  # noqa: S310 - loopback only
                 payload = json.loads(response.read(256_000).decode("utf-8"))
-            if not isinstance(payload, dict) or not payload.get("choices"):
+            generated_text = self._probe_response_text(payload)
+            if not isinstance(payload, dict) or not payload.get("choices") or not generated_text:
                 raise RuntimeError("最小生成没有返回有效文本")
+            self._record_probe_success(wanted, generated_text)
         except Exception as error:  # noqa: BLE001 - normalize sidecar errors for the UI
             message = str(error).strip()
             if hasattr(error, "read"):
@@ -488,6 +532,52 @@ class LocalRuntimeComponent:
             message = self._actionable_runtime_message(message[:500])
             self._record_probe_failure(wanted, message)
             raise RuntimeError(f"本地模型 {wanted} 无法完成最小生成：{message}") from error
+
+    @staticmethod
+    def _probe_response_text(payload: Any) -> str:
+        if not isinstance(payload, dict):
+            return ""
+        choices = payload.get("choices")
+        if not isinstance(choices, list) or not choices or not isinstance(choices[0], dict):
+            return ""
+        choice = choices[0]
+        message = choice.get("message") if isinstance(choice.get("message"), dict) else {}
+        content = message.get("content", choice.get("text", ""))
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            parts: list[str] = []
+            for item in content:
+                if isinstance(item, dict):
+                    parts.append(str(item.get("text", item.get("content", "")) or ""))
+                elif item is not None:
+                    parts.append(str(item))
+            return "".join(parts).strip()
+        return str(content or "").strip()
+
+    def _record_probe_success(self, wanted: str, generated_text: str) -> None:
+        """Replace a stale failure after a later isolated probe succeeds."""
+
+        try:
+            from .local_model_market import installed_models
+            from .local_runtime_compatibility import ModelCompatibilityStore
+
+            record = next(
+                (item for item in installed_models() if str(item.get("id", "")) == wanted),
+                None,
+            )
+            if not isinstance(record, dict) or not str(record.get("path", "")).strip():
+                return
+            ModelCompatibilityStore(self.root / "state" / "model-compatibility.json").record_success(
+                record,
+                component_version=self.component_version,
+                runtime_versions={},
+                generated_text=generated_text,
+            )
+        except (OSError, ValueError):
+            # Runtime availability must remain authoritative even if a diagnostic
+            # state file cannot be updated on a locked-down machine.
+            return
 
     def _record_probe_failure(self, wanted: str, message: str) -> None:
         """Persist a model-specific failure so routing stops retrying it blindly."""
@@ -601,17 +691,24 @@ class LocalRuntimeComponent:
             if source_dependencies_ready
             else "missing"
         )
-        update_required = bool(
+        update_available = bool(
             managed_component
             and version
             and _semantic_version_less(version, self.component_version)
+        )
+        update_required = bool(
+            managed_component
+            and version
+            and _semantic_version_less(version, self.minimum_component_version)
         )
         return {
             "id": self.component_id,
             "name": self.display_name,
             "version": version or (self.component_version if source_runtime or embedded_runtime else ""),
-            "required_version": self.component_version,
-            "update_available": bool(update_required and self.manifest_urls),
+            "required_version": self.minimum_component_version,
+            "recommended_version": self.component_version,
+            "minimum_version": self.minimum_component_version,
+            "update_available": bool(update_available and self.manifest_urls),
             "update_required": update_required,
             "installed": bool(installed or source_dependencies_ready or embedded_runtime),
             "mode": mode,
@@ -957,7 +1054,8 @@ class LocalRuntimeComponent:
             if status.get("update_required"):
                 raise RuntimeError(
                     f"{self.display_name} {status.get('version') or '旧版本'} 需要更新到 "
-                    f"{status.get('required_version') or self.component_version}；已下载的模型文件会继续复用。"
+                    f"{status.get('minimum_version') or self.minimum_component_version} 或更高版本；"
+                    "已下载的模型文件会继续复用。"
                     "请前往设置 → 本地模型更新本地运行组件。"
                 )
             return executable
@@ -995,19 +1093,68 @@ class LocalRuntimeComponent:
 
     def _install_component(self, progress_callback=None) -> dict[str, Any]:
         self._emit_progress(progress_callback, "manifest", 0.02, "读取官方组件清单（自动切换下载通道）")
-        manifest, component, source, failures = self._read_component_manifest()
-        self._last_manifest_source = source
-        self._last_manifest_failures = failures
-        package = component.get("windows", {})
-        if not isinstance(package, dict):
-            raise RuntimeError(f"{self.display_name}清单缺少 Windows 包")
-        return self._install_component_package(
-            component,
-            dict(package),
-            progress_callback=progress_callback,
-            manifest_source=source,
-            manifest_failures=failures,
-        )
+        failures: list[dict[str, str]] = []
+        for index, source in enumerate(self.manifest_urls):
+            component: dict[str, Any] | None = None
+            try:
+                manifest = self._read_json(source)
+                component = self._component_record(manifest)
+                package = component.get("windows", {})
+                if not isinstance(package, dict):
+                    raise RuntimeError(f"{self.display_name}清单缺少 Windows 包")
+                self._validate_component_package(
+                    package,
+                    allow_file=urlparse(source).scheme.casefold() == "file",
+                    require_metadata=bool(self.release_public_key) and urlparse(source).scheme.casefold() != "file",
+                )
+                result = self._install_component_package(
+                    component,
+                    dict(package),
+                    progress_callback=progress_callback,
+                    manifest_source=source,
+                    manifest_failures=failures,
+                )
+            except (LocalRuntimeInstallPaused, LocalRuntimeInstallCancelled):
+                raise
+            except Exception as error:
+                if component is not None:
+                    self._quarantine_failed_inactive_version(component)
+                failures.append(
+                    {
+                        "url": source,
+                        "label": self._manifest_channel_label(source, index),
+                        "error": str(error)[:500],
+                    }
+                )
+                self._last_manifest_source = ""
+                self._last_manifest_failures = list(failures)
+                continue
+            self._last_manifest_source = source
+            self._last_manifest_failures = list(failures)
+            return result
+        detail = "；".join(f"{item['label']}：{item['error']}" for item in failures)
+        raise RuntimeError(f"{self.display_name}的所有自动下载通道均不可用。{detail}")
+
+    def _quarantine_failed_inactive_version(self, component: dict[str, Any]) -> None:
+        """Keep a failed candidate from poisoning a same-version fallback source."""
+
+        version = str(component.get("version", "")).strip()
+        if not version:
+            return
+        try:
+            active = json.loads(self.active_path.read_text(encoding="utf-8"))
+        except (OSError, json.JSONDecodeError):
+            active = {}
+        if isinstance(active, dict) and str(active.get("version", "")).strip() == version:
+            return
+        target = self.root / "versions" / self._safe_segment(version)
+        if not target.exists():
+            return
+        quarantine = target.with_name(f"{target.name}.invalid-{uuid4().hex[:8]}")
+        try:
+            target.replace(quarantine)
+        except OSError:
+            return
 
     def _install_component_package(
         self,
@@ -1028,7 +1175,7 @@ class LocalRuntimeComponent:
         self.root.mkdir(parents=True, exist_ok=True)
         downloads = self.root / "downloads"
         downloads.mkdir(parents=True, exist_ok=True)
-        archive = downloads / f"{self.component_id}-{version}.zip"
+        archive = downloads / f"{self._safe_segment(self.component_id)}-{self._safe_segment(version)}.zip"
         if not archive.is_file() or self._sha256(archive) != expected:
             archive.unlink(missing_ok=True)
             self._acquire_package(package, archive, expected, progress_callback=progress_callback)
@@ -1038,34 +1185,51 @@ class LocalRuntimeComponent:
         versions = self.root / "versions"
         versions.mkdir(parents=True, exist_ok=True)
         target = versions / self._safe_segment(version)
-        if not (target / self.executable_name).is_file():
-            self._emit_progress(progress_callback, "extract", 0.86, "解压本地运行能力")
-            staging = Path(tempfile.mkdtemp(prefix="install-", dir=self.root)).resolve()
-            try:
-                matches = self._extract_verified(archive, staging)
-                if len(matches) != 1:
-                    raise RuntimeError(f"{self.display_name}包必须只包含一个 {self.executable_name}。")
-                payload = matches[0].parent
-                if target.exists():
-                    invalid = versions / f"{target.name}.invalid-{uuid4().hex[:8]}"
-                    target.replace(invalid)
-                shutil.move(str(payload), str(target))
-            finally:
-                self._remove_private_tree(staging)
+        self._emit_progress(progress_callback, "extract", 0.86, "解压本地运行能力")
+        staging = Path(tempfile.mkdtemp(prefix="install-", dir=self.root)).resolve()
+        previous_target: Path | None = None
+        failed_target: Path | None = None
+        candidate_activated = False
+        try:
+            matches = self._extract_verified(archive, staging)
+            if len(matches) != 1:
+                raise RuntimeError(f"{self.display_name}包必须只包含一个 {self.executable_name}。")
+            payload = matches[0].parent
+            diagnostics = package.get("diagnostics")
+            self._emit_progress(progress_callback, "diagnostics", 0.95, "验证运行依赖")
+            diagnostic_result = self._run_diagnostics(payload / self.executable_name, diagnostics)
 
-        diagnostics = package.get("diagnostics")
-        self._emit_progress(progress_callback, "diagnostics", 0.95, "验证运行依赖")
-        diagnostic_result = self._run_diagnostics(target / self.executable_name, diagnostics)
-        active_payload = {
-            "id": self.component_id,
-            "version": version,
-            "executable": str((target / self.executable_name).relative_to(self.root)),
-            "sha256": expected,
-            "diagnostics": diagnostic_result,
-        }
-        temporary = self.active_path.with_suffix(".json.tmp")
-        temporary.write_text(json.dumps(active_payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        temporary.replace(self.active_path)
+            # A same-version reinstall is a repair operation. Validate the
+            # staged tree first, then swap it in so a corrupt dependency is
+            # restored without sacrificing the currently active runtime.
+            if target.exists():
+                previous_target = versions / f"{target.name}.previous-{uuid4().hex[:8]}"
+                target.replace(previous_target)
+            shutil.move(str(payload), str(target))
+            candidate_activated = True
+            active_payload = {
+                "id": self.component_id,
+                "version": version,
+                "executable": str((target / self.executable_name).relative_to(self.root)),
+                "sha256": expected,
+                "diagnostics": diagnostic_result,
+            }
+            temporary = self.active_path.with_suffix(".json.tmp")
+            temporary.write_text(json.dumps(active_payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            temporary.replace(self.active_path)
+        except Exception:
+            if candidate_activated and target.exists():
+                failed_target = versions / f"{target.name}.failed-{uuid4().hex[:8]}"
+                target.replace(failed_target)
+            if previous_target is not None and previous_target.exists():
+                previous_target.replace(target)
+            raise
+        finally:
+            self._remove_private_tree(staging)
+            if failed_target is not None:
+                shutil.rmtree(self._extended_windows_path(failed_target), ignore_errors=True)
+        if previous_target is not None:
+            shutil.rmtree(self._extended_windows_path(previous_target), ignore_errors=True)
         self._emit_progress(progress_callback, "ready", 1.0, f"{self.display_name}已就绪")
         result = {**self.status(), "installed": True, "source": manifest_source or "manual"}
         if manifest_failures:
@@ -1130,26 +1294,6 @@ class LocalRuntimeComponent:
         if "stable.json" in url:
             return "应用更新清单备用"
         return "首选清单" if index == 0 else f"备用清单 {index}"
-
-    def _read_component_manifest(self) -> tuple[dict[str, Any], dict[str, Any], str, list[dict[str, str]]]:
-        failures: list[dict[str, str]] = []
-        for index, url in enumerate(self.manifest_urls):
-            try:
-                manifest = self._read_json(url)
-                component = self._component_record(manifest)
-                return manifest, component, url, failures
-            except Exception as error:
-                failures.append(
-                    {
-                        "url": url,
-                        "label": self._manifest_channel_label(url, index),
-                        "error": str(error)[:500],
-                    }
-                )
-        detail = "；".join(f"{item['label']}：{item['error']}" for item in failures)
-        if not failures:
-            raise RuntimeError(f"当前发行渠道没有配置{self.display_name}下载清单。")
-        raise RuntimeError(f"{self.display_name}清单的所有自动通道均不可用。{detail}")
 
     @classmethod
     def _normalize_manual_paths(cls, paths: list[str] | tuple[str, ...]) -> list[Path]:
@@ -1251,10 +1395,9 @@ class LocalRuntimeComponent:
     ) -> None:
         parts = package.get("parts")
         if isinstance(parts, list) and parts:
-            if len(parts) > 128:
-                raise RuntimeError("本地 AI 组件分片数量异常。")
+            total_bytes = self._validated_multipart_size(package)
+            assert total_bytes is not None
             downloaded: list[Path] = []
-            total_bytes = sum(max(0, int(dict(record).get("size", 0) or 0)) for record in parts if isinstance(record, dict))
             completed_bytes = 0
             for index, record in enumerate(parts, start=1):
                 if not isinstance(record, dict):
@@ -1379,17 +1522,16 @@ class LocalRuntimeComponent:
         raise RuntimeError(f"发行清单中没有 {self.component_id} 组件。")
 
     @staticmethod
-    def _validate_url(url: str) -> None:
-        if urlparse(url).scheme.lower() not in {"https", "file"}:
-            raise ValueError("组件地址必须使用 HTTPS。")
+    def _validate_url(url: str, *, allow_file: bool = False) -> None:
+        validate_release_url(url, allow_file=allow_file)
 
-    @classmethod
-    def _read_json(cls, url: str) -> dict[str, Any]:
-        cls._validate_url(url)
+    def _read_json(self, url: str) -> dict[str, Any]:
+        allow_file = urlparse(url).scheme.casefold() == "file"
+        self._validate_url(url, allow_file=allow_file)
         req = Request(url, headers={"Accept": "application/json", "User-Agent": "ScanSci local runtime"})
-        with urlopen(req, timeout=12) as response:  # noqa: S310 - scheme validated above
-            payload = response.read(1_000_001)
-        if len(payload) > 1_000_000:
+        with open_release_url(req, timeout=12, allow_file=allow_file, opener=urlopen) as response:
+            payload = response.read(_MAX_MANIFEST_BYTES + 1)
+        if len(payload) > _MAX_MANIFEST_BYTES:
             raise ValueError("组件清单过大。")
         # GitHub's JSON assets may include a UTF-8 BOM (notably the stable
         # update manifest used as a compatibility fallback).  Accept both
@@ -1397,7 +1539,80 @@ class LocalRuntimeComponent:
         result = json.loads(payload.decode("utf-8-sig"))
         if not isinstance(result, dict):
             raise ValueError("组件清单必须是 JSON 对象。")
+        schema_version = result.get("schema_version")
+        signature_required = bool(self.release_public_key) and not allow_file
+        if schema_version is not None and schema_version != 1:
+            raise ValueError("组件清单 schema_version 必须为 1。")
+        if signature_required and schema_version != 1:
+            raise ValueError("已签名组件清单 schema_version 必须为 1。")
+        verify_manifest_signature(result, self.release_public_key, required=signature_required)
         return result
+
+    def _validate_component_package(
+        self,
+        package: dict[str, Any],
+        *,
+        allow_file: bool,
+        require_metadata: bool,
+    ) -> None:
+        records = package.get("parts")
+        downloads = records if isinstance(records, list) and records else [package]
+        if not all(isinstance(record, dict) for record in downloads):
+            raise ValueError("组件清单分片格式无效。")
+        self._validated_multipart_size(package)
+        for record in downloads:
+            url = str(record.get("url", "")).strip()
+            if not url:
+                raise ValueError("组件清单缺少下载地址。")
+            self._validate_url(url, allow_file=allow_file)
+            if require_metadata:
+                checksum = str(record.get("sha256", "")).strip().casefold()
+                size = record.get("size")
+                if (
+                    not self._is_sha256(checksum)
+                    or isinstance(size, bool)
+                    or not isinstance(size, int)
+                    or size <= 0
+                    or size > _MAX_RUNTIME_DOWNLOAD_BYTES
+                ):
+                    raise ValueError("已签名组件清单缺少有效的下载大小或 SHA256。")
+        declared_size = package.get("size")
+        if require_metadata and (
+            isinstance(declared_size, bool)
+            or not isinstance(declared_size, int)
+            or declared_size <= 0
+            or declared_size > _MAX_RUNTIME_DOWNLOAD_BYTES
+        ):
+            raise ValueError("已签名组件清单缺少有效的组件总大小。")
+
+    @staticmethod
+    def _validated_multipart_size(package: dict[str, Any]) -> int | None:
+        records = package.get("parts")
+        if not isinstance(records, list) or not records:
+            return None
+        if len(records) > 128 or not all(isinstance(record, dict) for record in records):
+            raise ValueError("本地 AI 组件分片数量或格式异常。")
+        declared_size = package.get("size")
+        if (
+            isinstance(declared_size, bool)
+            or not isinstance(declared_size, int)
+            or declared_size <= 0
+            or declared_size > _MAX_RUNTIME_DOWNLOAD_BYTES
+        ):
+            raise ValueError("组件清单缺少有效的组件总大小。")
+        sizes = [record.get("size") for record in records]
+        if any(
+            isinstance(size, bool)
+            or not isinstance(size, int)
+            or size <= 0
+            or size > _MAX_RUNTIME_DOWNLOAD_BYTES
+            for size in sizes
+        ):
+            raise ValueError("组件清单分片大小无效。")
+        total_size = sum(sizes)
+        if total_size != declared_size or total_size > _MAX_RUNTIME_DOWNLOAD_BYTES:
+            raise ValueError("组件分片总大小与清单声明不一致或超出允许范围。")
+        return total_size
 
     @classmethod
     def _download(
@@ -1416,7 +1631,14 @@ class LocalRuntimeComponent:
         instead of being accidentally concatenated with a second full response.
         """
 
-        cls._validate_url(url)
+        allow_file = urlparse(url).scheme.casefold() == "file"
+        cls._validate_url(url, allow_file=allow_file)
+        if expected_size is not None and (
+            isinstance(expected_size, bool)
+            or expected_size <= 0
+            or expected_size > _MAX_RUNTIME_DOWNLOAD_BYTES
+        ):
+            raise ValueError("组件下载大小超出允许范围。")
         temporary = Path(f"{destination}.download")
         last_error: Exception | None = None
         for delay in _RUNTIME_RETRY_DELAYS_SECONDS:
@@ -1436,7 +1658,7 @@ class LocalRuntimeComponent:
                 if resumed:
                     headers["Range"] = f"bytes={resumed}-"
                 req = Request(url, headers=headers)
-                with urlopen(req, timeout=300) as response:  # noqa: S310 - scheme validated above
+                with open_release_url(req, timeout=300, allow_file=allow_file, opener=urlopen) as response:
                     content_range = str(response.headers.get("Content-Range", "") or "")
                     accepted_range = resumed > 0 and content_range.lower().startswith(f"bytes {resumed}-")
                     if resumed and not accepted_range:
@@ -1463,6 +1685,8 @@ class LocalRuntimeComponent:
                         )
                     if expected_size:
                         total = expected_size
+                    if total > _MAX_RUNTIME_DOWNLOAD_BYTES:
+                        raise ValueError("组件下载大小超出允许范围。")
                     received = resumed
                     mode = "ab" if accepted_range else "wb"
                     with temporary.open(mode) as output:
@@ -1471,6 +1695,8 @@ class LocalRuntimeComponent:
                         while chunk := response.read(1024 * 1024):
                             output.write(chunk)
                             received += len(chunk)
+                            if received > _MAX_RUNTIME_DOWNLOAD_BYTES:
+                                raise ValueError("组件下载大小超出允许范围。")
                             if progress_callback is not None:
                                 progress_callback(received, total)
                 if expected_size and received != expected_size:
@@ -1483,6 +1709,9 @@ class LocalRuntimeComponent:
             except (OSError, TimeoutError, _RetryableRuntimeDownloadError) as error:
                 last_error = error
                 continue
+            except Exception:
+                temporary.unlink(missing_ok=True)
+                raise
         detail = str(last_error or "未知网络错误").strip()
         raise RuntimeError(f"本地 AI 组件下载失败；已自动重试并保留断点：{detail}") from last_error
 
@@ -1529,17 +1758,28 @@ class LocalRuntimeComponent:
 
     def _extract_verified(self, archive_path: Path, destination: Path) -> list[Path]:
         executable_paths: list[Path] = []
+        destination = destination.resolve()
         try:
             with ZipFile(archive_path) as archive:
-                for info in archive.infolist():
-                    name = PurePosixPath(info.filename.replace("\\", "/"))
-                    if name.is_absolute() or ".." in name.parts:
-                        raise RuntimeError("本地 AI 组件包包含不安全路径。")
-                    if not name.parts:
-                        continue
+                infos = archive.infolist()
+                if len(infos) > _MAX_RUNTIME_ARCHIVE_FILES:
+                    raise RuntimeError("本地 AI 组件包文件数量过多。")
+                if sum(info.file_size for info in infos) > _MAX_UNPACKED_RUNTIME_BYTES:
+                    raise RuntimeError("本地 AI 组件解压后体积过大。")
+                seen: set[str] = set()
+                for info in infos:
+                    name = _safe_component_path(info.filename)
+                    normal = name.as_posix().casefold()
+                    if normal in seen:
+                        raise RuntimeError("本地 AI 组件包包含重复路径。")
+                    seen.add(normal)
                     unix_mode = info.external_attr >> 16
-                    if unix_mode and stat.S_ISLNK(unix_mode):
-                        raise RuntimeError("本地 AI 组件包不能包含符号链接。")
+                    if (unix_mode and stat.S_ISLNK(unix_mode)) or info.flag_bits & 0x1:
+                        raise RuntimeError("本地 AI 组件包不能包含符号链接或加密文件。")
+                    # ``destination`` is a fresh private staging directory and
+                    # every member already passed the lexical path guard above.
+                    # Resolving a not-yet-created deep path breaks before the
+                    # extended Windows path prefix can take effect.
                     target = destination.joinpath(*name.parts)
                     if info.is_dir():
                         os.makedirs(self._extended_windows_path(target), exist_ok=True)
@@ -1547,6 +1787,8 @@ class LocalRuntimeComponent:
                     os.makedirs(self._extended_windows_path(target.parent), exist_ok=True)
                     with archive.open(info, "r") as source, open(self._extended_windows_path(target), "wb") as output:
                         shutil.copyfileobj(source, output, length=1024 * 1024)
+                    if os.path.getsize(self._extended_windows_path(target)) != info.file_size:
+                        raise RuntimeError("本地 AI 组件文件解压不完整。")
                     if name.name == self.executable_name:
                         executable_paths.append(target)
         except BadZipFile as exc:
@@ -1625,7 +1867,35 @@ class LocalRuntimeComponent:
     @staticmethod
     def _safe_segment(value: str) -> str:
         clean = "".join(ch for ch in value if ch.isalnum() or ch in ".-_").strip(".-")
+        clean = re.sub(r"\.{2,}", ".", clean)
         return clean or uuid4().hex
+
+
+def _safe_component_path(value: str) -> PurePosixPath:
+    raw = str(value or "").replace("\\", "/").rstrip("/")
+    path = PurePosixPath(raw)
+    reserved = {
+        "con",
+        "prn",
+        "aux",
+        "nul",
+        *(f"com{index}" for index in range(1, 10)),
+        *(f"lpt{index}" for index in range(1, 10)),
+    }
+    if (
+        not raw
+        or "\x00" in raw
+        or path.is_absolute()
+        or any(
+            part in {"", ".", ".."}
+            or ":" in part
+            or part.rstrip(" .") != part
+            or part.split(".", 1)[0].casefold() in reserved
+            for part in path.parts
+        )
+    ):
+        raise RuntimeError("本地 AI 组件包包含不安全路径。")
+    return path
 
 
 _DEFAULT_RUNTIME_COMPONENT: LocalRuntimeComponent | None = None

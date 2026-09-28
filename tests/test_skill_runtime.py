@@ -171,6 +171,32 @@ def test_inferred_skill_is_only_a_progressive_hint_not_full_prompt(
     assert "content_hash" not in selected[0]
 
 
+def test_general_chat_defers_unselected_skill_catalog_to_search_tools(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import scansci_html.agent_context as agent_context
+
+    records = [
+        _skill_record(tmp_path, f"skill-{index:02d}", text="# safe\n")
+        for index in range(20)
+    ]
+    monkeypatch.setattr(agent_context, "installed_skills", lambda _workspace: records)
+
+    system, selected = build_agent_system_context(
+        tmp_path / "workspace.sqlite",
+        model_id="fixture",
+        provider_name="fixture",
+        chat_mode="general",
+        selected_ids=[],
+    )
+
+    assert selected == []
+    assert "普通对话不预载完整目录" in system
+    assert "skill-00" not in system
+    assert "<skill_catalog>[]</skill_catalog>" in system
+
+
 def test_skill_catalog_is_bounded_and_excludes_disabled_or_uncleared_packages(
     tmp_path: Path,
 ) -> None:

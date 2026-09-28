@@ -23,6 +23,7 @@ def _probe(
     tmp_path: Path,
     *,
     allow_write: bool,
+    allow_reversible: bool = False,
     deferred: bool = False,
     server_id: str = "fixture",
     fixture_name: str = "fake_mcp_server.mjs",
@@ -42,6 +43,7 @@ def _probe(
                 "command": str(node),
                 "args_list": [str(fixture)],
                 "allow_write": allow_write,
+                "allow_reversible": allow_reversible,
                 "tool_effects": dict(tool_effects or {}),
                 "tool_policies": list(tool_policies or []),
             },
@@ -80,6 +82,7 @@ def _probe(
                             "command": str(node),
                             "args_list": [str(fixture)],
                             "allow_write": allow_write,
+                            "allow_reversible": allow_reversible,
                             "tool_effects": dict(tool_effects or {}),
                             "tool_policies": list(tool_policies or []),
                             "deferred": deferred,
@@ -122,6 +125,20 @@ def test_pi_mcp_bridge_exposes_write_tools_after_explicit_authorization(tmp_path
         "mcp__fixture__search_library",
         "mcp__fixture__create_note",
         "mcp__fixture__notes_put",
+    }
+
+
+def test_pi_mcp_bridge_exposes_reversible_literature_tools_without_general_write_authority(tmp_path: Path) -> None:
+    result = _probe(
+        tmp_path,
+        allow_write=False,
+        allow_reversible=True,
+        tool_effects={"search_library": "read", "create_note": "reversible"},
+    )
+
+    assert {tool["name"] for tool in result["tools"]} == {
+        "mcp__fixture__search_library",
+        "mcp__fixture__create_note",
     }
 
 
@@ -447,7 +464,7 @@ def test_deferred_mcp_registers_and_calls_native_remote_schema_after_search(tmp_
     assert marker.read_text(encoding="utf-8").splitlines() == [
         "connected",
         "called",
-        "client:scansci-pi@0.4.1",
+        "client:scansci-harness@0.4.2",
     ]
     assert _DeferredNativeSchemaHandler.marker_states[:2] == [[], []]
     assert _DeferredNativeSchemaHandler.marker_states[2] == ["connected"]
@@ -549,7 +566,7 @@ def test_deferred_streamable_http_stays_disconnected_until_search_then_calls_nat
     assert _DeferredNativeSchemaHandler.marker_states[:2] == [[], []]
     methods = marker.read_text(encoding="utf-8").splitlines()
     assert methods.count("initialize") == 1
-    assert methods.count("client:scansci-pi@0.4.1") == 1
+    assert methods.count("client:scansci-harness@0.4.2") == 1
     assert methods.count("tools/list") == 1
     assert methods.count("tools/call") == 1
     assert methods.count("called") == 1

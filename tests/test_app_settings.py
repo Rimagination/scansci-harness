@@ -2,10 +2,14 @@ import os
 import pytest
 import json
 from pathlib import Path
+import sys
 
 from scansci_html import app_settings
 from scansci_html.app_settings import (
+    SettingsError,
     configure_managed_glm_4_7_flash,
+    get_provider_api_key,
+    get_notion_api_token,
     load_settings,
     local_model_presets,
     managed_fallback_model_ids,
@@ -13,9 +17,26 @@ from scansci_html.app_settings import (
     managed_probe_model_ids,
     provider_presets,
     save_settings,
+    set_notion_api_token,
+    set_provider_api_key,
     settings_path,
+    with_discovered_local_runtime_models,
 )
 from scansci_html.model_metadata import descriptor_from_settings
+
+
+class FakeProviderKeyring:
+    def __init__(self) -> None:
+        self.store: dict[tuple[str, str], str] = {}
+
+    def get_password(self, service_name: str, username: str) -> str | None:
+        return self.store.get((service_name, username))
+
+    def set_password(self, service_name: str, username: str, password: str) -> None:
+        self.store[(service_name, username)] = password
+
+    def delete_password(self, service_name: str, username: str) -> None:
+        self.store.pop((service_name, username), None)
 
 
 def test_default_settings_use_the_managed_glm_service_without_a_local_key(tmp_path: Path):
@@ -34,6 +55,7 @@ def test_default_settings_use_the_managed_glm_service_without_a_local_key(tmp_pa
     assert offline_provider["name"] == "离线基础检索（非模型）"
     assert offline_provider["models"][0]["name"] == "关键词检索与词法重排（非模型）"
     assert settings["model_roles"]["retrieval"] == "local:builtin-evidence"
+    assert settings["model_roles"]["image"] == "auto"
     assert settings["document_processing"]["ocr"]["provider"] == "tesseract"
     assert settings["document_processing"]["mineru"]["base_url"] == "https://mineru.net"
     assert settings["document_processing"]["mineru"]["api_key_configured"] is False
@@ -46,10 +68,144 @@ def test_default_settings_use_the_managed_glm_service_without_a_local_key(tmp_pa
     assert not settings_path(tmp_path / "workspace.sqlite").exists()
 
 
+def test_notion_token_availability_is_redacted_and_scoped_to_workspace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    backend = FakeProviderKeyring()
+    monkeypatch.setitem(sys.modules, "keyring", backend)
+    workspace = tmp_path / "desktop" / "workspace.sqlite"
+    preview_workspace = tmp_path / "preview" / "workspace.sqlite"
+
+    set_notion_api_token(workspace, "notion-test-secret")
+
+    settings = load_settings(workspace)
+    assert settings["notion_api_token_configured"] is True
+    assert get_notion_api_token(workspace) == "notion-test-secret"
+    assert load_settings(preview_workspace)["notion_api_token_configured"] is False
+    assert "notion-test-secret" not in json.dumps(settings)
+
+
+def test_workspace_profile_distinguishes_temporary_preview_from_persistent_store(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    temporary_root = tmp_path / "system-temp"
+    temporary_root.mkdir()
+    monkeypatch.setattr(app_settings.tempfile, "gettempdir", lambda: str(temporary_root))
+
+    assert app_settings._workspace_profile(temporary_root / "preview.sqlite") == "temporary"
+    assert app_settings._workspace_profile(tmp_path / "desktop.sqlite") == "persistent"
+
+
+def test_model_provider_credentials_prefer_environment_and_report_redacted_source(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    backend = FakeProviderKeyring()
+    monkeypatch.setitem(sys.modules, "keyring", backend)
+    workspace = tmp_path / "workspace.sqlite"
+
+    set_provider_api_key(workspace, "deepseek", "keyring-secret")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "environment-secret")
+
+    assert get_provider_api_key(workspace, "deepseek") == "environment-secret"
+    provider = next(item for item in load_settings(workspace)["providers"] if item["id"] == "deepseek")
+    assert provider["api_key_configured"] is True
+    assert provider["api_key_source"] == "environment"
+    assert provider["api_key_env"] == "DEEPSEEK_API_KEY"
+
+    monkeypatch.delenv("DEEPSEEK_API_KEY")
+    assert get_provider_api_key(workspace, "deepseek") == "keyring-secret"
+    provider = next(item for item in load_settings(workspace)["providers"] if item["id"] == "deepseek")
+    assert provider["api_key_source"] == "keyring"
+
+
+def test_environment_provider_key_is_read_only_for_settings_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    backend = FakeProviderKeyring()
+    monkeypatch.setitem(sys.modules, "keyring", backend)
+    workspace = tmp_path / "workspace.sqlite"
+    set_provider_api_key(workspace, "deepseek", "stored-secret")
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "environment-secret")
+
+    with pytest.raises(SettingsError, match="DEEPSEEK_API_KEY"):
+        set_provider_api_key(workspace, "deepseek", "replacement-secret")
+    with pytest.raises(SettingsError, match="DEEPSEEK_API_KEY"):
+        set_provider_api_key(workspace, "deepseek", "")
+
+    assert backend.store
+    assert get_provider_api_key(workspace, "deepseek") == "environment-secret"
+
+
+def test_custom_provider_uses_a_stable_environment_reference(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setitem(sys.modules, "keyring", FakeProviderKeyring())
+    workspace = tmp_path / "workspace.sqlite"
+    save_settings(
+        workspace,
+        {
+            "providers": [
+                {
+                    "id": "research-gateway",
+                    "name": "Research gateway",
+                    "kind": "openai-compatible",
+                    "base_url": "https://example.invalid/v1",
+                    "models": [{"id": "small", "name": "Small"}],
+                }
+            ],
+            "active_model": {"provider_id": "research-gateway", "model_id": "small"},
+        },
+    )
+    monkeypatch.setenv("RESEARCH_GATEWAY_API_KEY", "environment-secret")
+
+    assert get_provider_api_key(workspace, "research-gateway") == "environment-secret"
+    provider = next(item for item in load_settings(workspace)["providers"] if item["id"] == "research-gateway")
+    assert provider["api_key_source"] == "environment"
+    assert provider["api_key_env"] == "RESEARCH_GATEWAY_API_KEY"
+
+
 def test_managed_model_catalog_separates_routes_from_approved_fallbacks():
     assert managed_model_ids() == ("glm-4.7-flash",)
     assert managed_probe_model_ids() == ("glm-4.7-flash",)
     assert managed_fallback_model_ids("glm-4.7-flash") == ()
+
+
+def test_runtime_inventory_adds_new_models_and_deduplicates_latest_alias():
+    settings = {
+        "providers": [{"id": "cloud", "models": []}],
+        "local_models": [
+            {
+                "id": "ollama-qwen",
+                "name": "Qwen3.5 4B",
+                "runtime": "ollama",
+                "base_url": "http://127.0.0.1:11434/v1",
+                "model_id": "qwen3.5:4b",
+                "enabled": True,
+                "capabilities": ["reasoning", "tool"],
+            }
+        ],
+    }
+
+    catalog = with_discovered_local_runtime_models(
+        settings,
+        {
+            "ollama-qwen": [
+                {"name": "qwen3.5:4b"},
+                {"name": "qwen3.8-4b-distill:latest"},
+            ]
+        },
+    )
+
+    assert [item["model_id"] for item in catalog["local_models"]] == [
+        "qwen3.5:4b",
+        "qwen3.8-4b-distill:latest",
+    ]
+    discovered = next(item for item in catalog["local_models"] if item["model_id"].startswith("qwen3.8"))
+    assert discovered["capabilities"] == ["reasoning"]
+    provider = next(item for item in catalog["providers"] if item.get("local_model_id") == discovered["id"])
+    assert provider["models"][0]["id"] == "qwen3.8-4b-distill:latest"
 
 
 @pytest.mark.skip(reason="Qwen removed; WIP")
@@ -120,11 +276,35 @@ def test_existing_workspaces_migrate_zotero_from_skill_to_plugin(tmp_path: Path)
 def test_default_settings_include_disabled_common_provider_catalog(tmp_path: Path):
     settings = load_settings(tmp_path / "workspace.sqlite")
     providers = {item["id"]: item for item in settings["providers"]}
+    visible_provider_ids = [item["id"] for item in settings["providers"] if item["id"] != "local-evidence"]
 
-    assert {"scansci-managed", "openai", "anthropic", "gemini", "deepseek", "dashscope", "zai", "moonshot", "minimax", "openrouter", "siliconflow"} <= set(providers)
+    assert {"scansci-managed", "openai", "anthropic", "gemini", "deepseek", "dashscope", "zai", "moonshot", "minimax", "openrouter", "opencode-go", "siliconflow"} <= set(providers)
     assert providers["scansci-managed"]["enabled"] is True
+    assert visible_provider_ids[:2] == ["scansci-managed", "jev"]
+    assert providers["jev"]["logo"] == "typesafe"
+    assert providers["jev"]["enabled"] is False
+    assert providers["jev"]["model_listing"] is False
+    assert providers["jev"]["base_url"] == "https://api.typesafe.ai/v1/systemone"
+    assert providers["jev"]["api_surface"] == "jev_systemone"
+    assert providers["jev"]["api_key_env"] == "TYPESAFE_API_KEY"
     assert providers["openai"]["enabled"] is False
     assert providers["zai"]["base_url"] == "https://api.z.ai/api/paas/v4"
+    assert providers["opencode-go"]["enabled"] is False
+    assert providers["opencode-go"]["base_url"] == "https://opencode.ai/zen/go/v1"
+    assert providers["opencode-go"]["api_surface"] == "auto"
+    assert len(providers["opencode-go"]["models"]) == 26
+    assert "vision" in next(model for model in providers["opencode-go"]["models"] if model["id"] == "deepseek-v4-flash-vision-exp")["capabilities"]
+
+
+def test_jev_is_kept_out_of_the_conversation_model_route(tmp_path: Path):
+    workspace = tmp_path / "workspace.sqlite"
+    settings = load_settings(workspace)
+    settings["active_model"] = {"provider_id": "jev", "model_id": "jev-decision-layer"}
+
+    save_settings(workspace, settings)
+    restored = load_settings(workspace)
+
+    assert restored["active_model"] == {"provider_id": "scansci-managed", "model_id": "glm-4.7-flash"}
 
 
 def test_saved_settings_keep_models_and_never_write_api_key(tmp_path: Path):
@@ -154,6 +334,8 @@ def test_saved_settings_keep_models_and_never_write_api_key(tmp_path: Path):
     assert settings["providers"][0]["api_key_configured"] is False
     assert persisted["providers"][0]["base_url"] == "https://example.invalid/v1"
     assert "api_key" not in persisted["providers"][0]
+    assert "api_key_source" not in persisted["providers"][0]
+    assert "api_key_env" not in persisted["providers"][0]
     assert persisted["mcp_servers"][0]["command"] == "node server.mjs"
     assert persisted["mcp_servers"][0]["deferred"] is True
 
@@ -288,6 +470,7 @@ def test_general_preferences_are_persisted_and_normalized(tmp_path: Path):
                     "local_runtime": r"D:\ScanSci\runtime",
                     "vector_index": r"D:\ScanSci\vectors",
                 },
+                "updates": {"auto_check": False},
             }
         },
     )
@@ -306,6 +489,7 @@ def test_general_preferences_are_persisted_and_normalized(tmp_path: Path):
             "local_runtime": r"D:\ScanSci\runtime",
             "vector_index": r"D:\ScanSci\vectors",
         },
+        "updates": {"auto_check": False},
     }
     persisted = json.loads(settings_path(workspace).read_text(encoding="utf-8"))
     assert persisted["general"] == settings["general"]
@@ -333,6 +517,7 @@ def test_general_preferences_are_persisted_and_normalized(tmp_path: Path):
             "local_runtime": "",
             "vector_index": "",
         },
+        "updates": {"auto_check": True},
     }
 
 
@@ -364,7 +549,7 @@ def test_provider_and_local_runtime_presets_are_credential_free():
     providers = provider_presets()
     runtimes = local_model_presets()
 
-    assert {item["id"] for item in providers} >= {"openai", "anthropic", "gemini", "deepseek", "dashscope", "openrouter", "zai", "moonshot", "minimax", "siliconflow"}
+    assert {item["id"] for item in providers} >= {"openai", "anthropic", "gemini", "deepseek", "dashscope", "openrouter", "zai", "moonshot", "minimax", "siliconflow", "paratera"}
     assert all("api_key" not in item for item in providers)
     assert {item["runtime"] for item in runtimes} == {"ollama", "lm-studio", "llama.cpp", "local-huggingface"}
 
@@ -443,6 +628,62 @@ def test_zhipu_catalog_includes_glm_4_7_flash():
     assert model["name"] == "GLM-4.7 Flash（免费）"
     assert model["context_window"] == "200K"
     assert model["capabilities"] == ["reasoning", "tool", "coding"]
+    assert providers["zhipu"]["standard_base_url"] == "https://open.bigmodel.cn/api/paas/v4"
+    assert providers["zhipu"]["coding_plan_base_url"] == "https://open.bigmodel.cn/api/coding/paas/v4"
+
+
+def test_zhipu_coding_plan_endpoint_switch_round_trips(tmp_path: Path):
+    workspace = tmp_path / "workspace.sqlite"
+    settings = load_settings(workspace)
+    provider = next(item for item in settings["providers"] if item["id"] == "zhipu")
+    provider.update(
+        {
+            "standard_base_url": "https://example.invalid/standard",
+            "coding_plan_base_url": "https://example.invalid/coding",
+            "coding_plan_enabled": True,
+            "base_url": "https://example.invalid/coding",
+        }
+    )
+
+    save_settings(workspace, settings)
+    restored = load_settings(workspace)
+    provider = next(item for item in restored["providers"] if item["id"] == "zhipu")
+
+    assert provider["coding_plan_enabled"] is True
+    assert provider["standard_base_url"] == "https://example.invalid/standard"
+    assert provider["coding_plan_base_url"] == "https://example.invalid/coding"
+    assert provider["base_url"] == "https://example.invalid/coding"
+
+
+def test_paratera_catalog_exposes_cogview_as_image_only():
+    provider = next(item for item in provider_presets() if item["id"] == "paratera")
+    model = provider["models"][0]
+
+    assert provider["base_url"] == "https://llmapi.paratera.com/v1"
+    assert provider["model_listing"] is False
+    assert model["id"] == "GLM-CogView3-Flash"
+    assert model["capabilities"] == ["image"]
+
+
+def test_paratera_catalog_adds_wanx_without_overwriting_user_choices(tmp_path):
+    workspace = tmp_path / "workspace.sqlite"
+    settings = load_settings(workspace)
+    provider = next(item for item in settings["providers"] if item["id"] == "paratera")
+    wanx = next(item for item in provider["models"] if item["id"] == "WanX2.1-T2I-Plus")
+    assert wanx["capabilities"] == ["image"] and wanx["group"] == "通义万相"
+    provider["base_url"] = "https://example.org/v1"
+    provider["enabled"] = False
+    provider["models"] = [{"id": "custom-model", "name": "用户模型", "capabilities": ["image"]},
+                          {"id": "GLM-CogView3-Flash", "name": "旧模型", "capabilities": ["image"]}]
+    original_active = settings["active_model"].copy()
+    original_roles = settings["model_roles"].copy()
+    save_settings(workspace, settings)
+    restored = load_settings(workspace)
+    provider = next(item for item in restored["providers"] if item["id"] == "paratera")
+    assert provider["base_url"] == "https://example.org/v1" and provider["enabled"] is False
+    assert {m["id"] for m in provider["models"]} == {"custom-model", "GLM-CogView3-Flash", "WanX2.1-T2I-Plus"}
+    assert next(m for m in provider["models"] if m["id"] == "GLM-CogView3-Flash")["name"] == "旧模型"
+    assert restored["active_model"] == original_active and restored["model_roles"] == original_roles
 
 
 @pytest.mark.skip(reason="Qwen removed; WIP")

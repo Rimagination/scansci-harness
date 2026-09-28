@@ -1,4 +1,5 @@
 const sidebarCollapsedPreference = window.localStorage.getItem("scansci.sidebar.collapsed");
+const compactShellDefault = sidebarCollapsedPreference === null;
 
 const state = {
   workspace: null,
@@ -7,7 +8,7 @@ const state = {
   systemOcrStatus: { loading: false, requestedKey: "", provider: "tesseract", checkedAt: "", available: false, message: "尚未检测 OCR" },
   presets: { providers: [], local_models: [] },
   modelHealth: { checked_at: "", providers: {}, models: {}, loading: false },
-  localModelMarket: { installed: [], catalog: [], source: "", query: "", loading: false },
+  localModelMarket: { installed: [], catalog: [], source: "", query: "", loading: false, loaded: false },
   localModelInstall: { jobs: [], active: null },
   localRuntime: { installed: false, install_available: false, manual_install_available: true, mode: "missing", channels: null },
   runtimeComponents: {
@@ -39,6 +40,7 @@ const state = {
   composerTranscribing: { home: false, chat: false },
   composerSources: { home: [], chat: [] },
   composerSkills: { home: [], chat: [] },
+  composerImageModel: window.localStorage.getItem("scansci.composer.image-model") || "",
   selectedProviderId: "",
   providerQuery: "",
   modelQuery: "",
@@ -152,9 +154,10 @@ const state = {
   inlineSlidePreviewPage: "",
   slideTemplateQuery: "",
   lastRunRenderKey: "",
-  sidebarCollapsed: sidebarCollapsedPreference === "true"
-    || (sidebarCollapsedPreference === null && window.innerWidth <= 900),
-  sidebarWidth: Math.max(260, Math.min(520, Number(window.localStorage.getItem("scansci.sidebar.width")) || 352)),
+  runExecutionDetailsOpen: false,
+  runExecutionDetailsRunId: "",
+  sidebarCollapsed: sidebarCollapsedPreference === "true" || compactShellDefault,
+  sidebarWidth: Math.max(260, Math.min(520, Number(window.localStorage.getItem("scansci.sidebar.width")) || 268)),
   thinkingLevel: ["auto", "low", "medium", "high", "xhigh", "max"].includes(window.localStorage.getItem("scansci.thinking.level"))
     ? window.localStorage.getItem("scansci.thinking.level")
     : "auto",
@@ -181,13 +184,14 @@ const state = {
   },
   updateCardOpen: false,
   updateNative: false,
-  autoCheckUpdates: window.localStorage.getItem("scansci.update.auto-check") !== "false",
+  autoCheckUpdates: true,
 };
 
 const byId = (id) => document.getElementById(id);
 const sourceList = byId("sourceList");
 let directConversationRenderFrame = 0;
 const pendingDirectConversationRenders = new Set();
+let navigationRequestGeneration = 0;
 // A direct chat run belongs to its conversation, not to the whole window.
 // Keeping these jobs separate lets users move to another conversation and
 // start work there while the first one continues in the background.
@@ -196,10 +200,15 @@ let activeDirectChatController = null;
 let composerSubmissionInFlight = false;
 let confirmDialogResolve = null;
 let confirmDialogPreviousFocus = null;
+let onboardingReturnFocus = null;
 let localModelInstallPollTimer = 0;
 let localRuntimeInstallPollTimer = 0;
 const runtimeComponentInstallPollTimers = new Map();
 let notionWizardResolve = null;
+let notionWizardScopeRestore = null;
+let directQueueDrag = { conversationId: "", queueId: "", targetId: "", position: "" };
+let directQueueEdit = null;
+let directMessageEdit = null;
 
 const applicationCopy = Object.freeze({
   "zh-CN": {
@@ -215,7 +224,7 @@ const applicationCopy = Object.freeze({
     defaultCapabilities: "默认能力",
     resources: "本地模型",
     modelServices: "模型服务",
-    localModels: "本地模型",
+    localModels: "模型市场",
     documentProcessing: "文档处理",
     softwareUpdate: "软件更新",
     settingsLocal: "配置仅保存在此电脑",
@@ -309,7 +318,7 @@ const applicationCopy = Object.freeze({
     defaultCapabilities: "Default capabilities",
     resources: "Resources",
     modelServices: "Model services",
-    localModels: "Local models",
+    localModels: "Model market",
     documentProcessing: "Documents",
     softwareUpdate: "Software update",
     settingsLocal: "Preferences stay on this computer",
@@ -470,6 +479,9 @@ function collectGeneralSettingsForm() {
       local_runtime: readDirectory("directory-local-runtime", current.directories.local_runtime),
       vector_index: readDirectory("directory-vector-index", current.directories.vector_index),
     },
+    updates: {
+      auto_check: current.updates.auto_check,
+    },
   };
   return state.settings.general;
 }
@@ -528,6 +540,7 @@ async function streamChat(payload, onEvent, { signal } = {}) {
       const failure = new Error(event.message || "The streaming response could not be completed.");
       failure.code = event.code || "chat_failed";
       failure.failure = event.failure || null;
+      failure.userImages = Array.isArray(event.user_images) ? event.user_images : [];
       throw failure;
     }
     onEvent(eventType, event);
@@ -573,14 +586,28 @@ function waitForStreamRetry(delaySeconds, signal) {
 }
 
 async function streamChatWithRecovery(payload, onEvent, { signal, onRetry, maxAttempts = 2 } = {}) {
-  const attempts = Math.max(1, Number(maxAttempts) || 1);
+  const attempts = payload.image_model ? 1 : Math.max(1, Number(maxAttempts) || 1);
+  let generatedImageReceived = false;
   for (let attempt = 1; attempt <= attempts; attempt += 1) {
     try {
-      return await streamChat(payload, onEvent, { signal });
+      return await streamChat(payload, (eventType, event) => {
+        if (eventType === "CUSTOM" && event.name === "generated_image") generatedImageReceived = true;
+        onEvent(eventType, event);
+      }, { signal });
     } catch (error) {
       const failure = error?.failure && typeof error.failure === "object" ? error.failure : null;
+      const providerRateLimited = ["provider_rate_limited", "rate_limit_exceeded", "upstream_rate_limited"]
+        .includes(String(failure?.code || ""));
+      const providerTransportUnavailable = [
+        "model_transport_unavailable",
+        "upstream_timeout",
+        "upstream_connection_failed",
+      ].includes(String(failure?.code || ""));
       const retryable = error?.name !== "AbortError"
+        && !generatedImageReceived
         && failure?.retryable !== false
+        && !providerRateLimited
+        && !providerTransportUnavailable
         && (failure || error?.code === "chat_failed" || !error?.code);
       if (!retryable || attempt >= attempts) throw error;
       const requested = Number(failure?.retry_after_seconds || failure?.retry_after || 0);
@@ -1458,7 +1485,18 @@ function sourceTitle(record = {}) {
 }
 
 function evidenceMeta(record = {}) {
-  return [record.section, record.doi, record.evidence_id].filter(Boolean).map(String).join(" · ");
+  return String(record.section || "").trim();
+}
+
+function evidenceDetailsMarkup(record = {}) {
+  const rows = [
+    ["DOI", record.doi],
+    ["证据 ID", record.evidence_id],
+  ]
+    .map(([label, value]) => [String(label), String(value || "").trim()])
+    .filter(([, value]) => value);
+  if (!rows.length) return "";
+  return `<details class="evidence-source-details"><summary>来源详情${uiIcon("chevron-right", "evidence-source-details-chevron")}</summary><dl>${rows.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("")}</dl></details>`;
 }
 
 function clearCitationPreviewTimer() {
@@ -1479,18 +1517,31 @@ function deferCitationPreviewHide() {
   state.citationPreviewTimer = window.setTimeout(hideCitationPreview, 130);
 }
 
+function citationContextMarkup(citation = {}, maxChars = 680) {
+  const rows = [
+    { label: "上一句", value: citation.context_before, className: "is-before" },
+    { label: "命中片段", value: citation.matched_text || citation.exact_quote, className: "is-match" },
+    { label: "下一句", value: citation.context_after, className: "is-after" },
+  ]
+    .map((row) => ({ ...row, value: compact(row.value || "", maxChars) }))
+    .filter((row) => row.value);
+  if (!rows.length) return "";
+  return `<div class="citation-context" aria-label="原文上下文">${rows.map((row) => `<div class="citation-context-row ${row.className}"><span>${row.label}</span><p>${escapeHtml(row.value)}</p></div>`).join("")}</div>`;
+}
+
 function showCitationPreview(citation, marker) {
   const preview = byId("citationPreview");
   if (!preview || !citation || !marker) return;
   clearCitationPreviewTimer();
   const quote = compact(citation.exact_quote || "当前引用未保存原文摘录。", 460);
   const meta = evidenceMeta(citation);
+  const context = citationContextMarkup(citation, 460);
   const hint = safeReaderUrl(citation)
     ? "点击脚标可在本应用中查看全文与高亮原文。"
     : citationPublicSourceUrl(citation)
       ? "点击脚标可展开证据，并跳转公开原文。"
       : "点击脚标可展开本次任务保存的证据摘录。";
-  preview.innerHTML = `<div class="citation-preview-kicker">证据 ${escapeHtml(citation.citation_id || "")}</div><h3>${escapeHtml(sourceTitle(citation))}</h3>${meta ? `<p class="citation-preview-meta">${escapeHtml(meta)}</p>` : ""}<blockquote>${escapeHtml(quote)}</blockquote><p class="citation-preview-hint">${escapeHtml(hint)}</p>`;
+  preview.innerHTML = `<div class="citation-preview-kicker">证据 ${escapeHtml(citation.citation_id || "")}</div><h3>${escapeHtml(sourceTitle(citation))}</h3>${meta ? `<p class="citation-preview-meta">${escapeHtml(meta)}</p>` : ""}${context || `<blockquote>${escapeHtml(quote)}</blockquote>`}<p class="citation-preview-hint">${escapeHtml(hint)}</p>`;
   preview.classList.add("is-visible");
   preview.setAttribute("aria-hidden", "false");
   const rect = marker.getBoundingClientRect();
@@ -1532,7 +1583,7 @@ function showEvidenceReader(citation, options = {}) {
   const anchorNote = citation.html_anchor ? "已定位至该回答使用的原文片段" : "正在显示来源全文";
   const original = String(citation.original_url || "");
   const tabs = original ? `<div class="evidence-reader-tabs"><button type="button" class="is-active" data-action="show-evidence-blocks">证据定位</button><button type="button" data-action="show-evidence-original" data-original-url="${escapeHtml(original)}">原始文件</button></div>` : "";
-  target.innerHTML = `<header class="evidence-reader-head"><button type="button" class="evidence-reader-back" data-action="close-evidence-reader" aria-label="返回来源列表">←</button><div><span>${options.sourceOnly ? "来源全文" : "引用证据"}</span><h2>${escapeHtml(sourceTitle(citation))}</h2><p>${escapeHtml(meta || anchorNote)}</p></div></header>${tabs}<div class="evidence-reader-summary"><span>${escapeHtml(anchorNote)}</span><blockquote>${escapeHtml(compact(quote, 680))}</blockquote></div><div class="evidence-reader-frame-wrap"><iframe class="evidence-reader-frame" id="evidenceReaderFrame" title="${escapeHtml(sourceTitle(citation))} 的来源全文" src="${escapeHtml(evidenceReaderFrameUrl(reader))}" sandbox="allow-same-origin"></iframe></div>`;
+  target.innerHTML = `<header class="evidence-reader-head"><button type="button" class="evidence-reader-back" data-action="close-evidence-reader" aria-label="返回来源列表">←</button><div><span>${options.sourceOnly ? "来源全文" : "引用证据"}</span><h2>${escapeHtml(sourceTitle(citation))}</h2><p>${escapeHtml(meta || anchorNote)}</p></div></header>${tabs}<div class="evidence-reader-summary"><span>${escapeHtml(anchorNote)}</span><blockquote>${escapeHtml(compact(quote, 680))}</blockquote>${evidenceDetailsMarkup(citation)}</div><div class="evidence-reader-frame-wrap"><iframe class="evidence-reader-frame" id="evidenceReaderFrame" title="${escapeHtml(sourceTitle(citation))} 的来源全文" src="${escapeHtml(evidenceReaderFrameUrl(reader))}" sandbox="allow-same-origin"></iframe></div>`;
   setContextPanel("evidence");
 }
 
@@ -1592,6 +1643,14 @@ function closeNotionWizard(result = null) {
   notionWizardResolve = null;
   byId("confirmDialogHost")?.replaceChildren();
   document.body.classList.remove("has-confirm-dialog");
+  const scopeRestore = notionWizardScopeRestore;
+  notionWizardScopeRestore = null;
+  if (scopeRestore) {
+    state.knowledgeScopeDraftIds = scopeRestore.draftIds;
+    renderKnowledgeScopeDialog();
+    const scopeDialog = byId("knowledgeScopeDialog");
+    if (scopeDialog && !scopeDialog.open) scopeDialog.showModal();
+  }
   resolve(result);
 }
 
@@ -1599,21 +1658,48 @@ function openNotionWizard() {
   if (notionWizardResolve) closeNotionWizard(null);
   const host = byId("confirmDialogHost");
   if (!host) return Promise.resolve(null);
-  const wizard = { step: 1, token: "", rootPageId: "", title: "Notion 知识库", verified: false };
+  const scopeDialog = byId("knowledgeScopeDialog");
+  const resumeScope = Boolean(scopeDialog?.open);
+  const scopeDraftIds = Array.isArray(state.knowledgeScopeDraftIds)
+    ? [...state.knowledgeScopeDraftIds]
+    : null;
+  if (resumeScope) scopeDialog.close();
+  notionWizardScopeRestore = resumeScope ? { draftIds: scopeDraftIds } : null;
+  const wizard = {
+    step: 1,
+    token: "",
+    rootPageId: "",
+    title: "Notion 知识库",
+    verified: false,
+    tokenConfigured: Boolean(state.settings?.notion_api_token_configured),
+  };
   host.innerHTML = `<div class="confirm-dialog-backdrop" data-notion-wizard-cancel><section class="confirm-dialog-card notion-wizard-card" role="dialog" aria-modal="true" aria-labelledby="notionWizardTitle"><div class="confirm-dialog-icon notion-brand-icon" aria-hidden="true"><img src="/notion-logo.png" alt="" /></div><div class="confirm-dialog-copy"><p class="confirm-dialog-eyebrow">Notion 知识库接入</p><div class="notion-wizard-progress"><span>01</span><i></i><span>02</span><i></i><span>03</span></div><div id="notionWizardBody"></div></div><footer class="confirm-dialog-actions"><button type="button" class="secondary-button" data-notion-wizard-cancel>取消</button><button type="button" class="secondary-button" id="notionWizardBack">上一步</button><button type="button" class="primary-button" id="notionWizardNext">下一步</button></footer></section></div>`;
   document.body.classList.add("has-confirm-dialog");
   const body = byId("notionWizardBody");
   const setStatus = (message, error = false) => { const status = byId("notionWizardStatus"); if (status) { status.textContent = message; status.classList.toggle("is-error", error); } };
-  const saveInputs = () => { wizard.token = byId("notionWizardToken")?.value.trim() || wizard.token; wizard.rootPageId = byId("notionWizardRoot")?.value.trim() || wizard.rootPageId; wizard.title = byId("notionWizardTitleInput")?.value.trim() || wizard.title; };
+  const saveInputs = () => {
+    const tokenInput = byId("notionWizardToken");
+    if (tokenInput) wizard.token = tokenInput.value.trim();
+    wizard.rootPageId = byId("notionWizardRoot")?.value.trim() || wizard.rootPageId;
+    wizard.title = byId("notionWizardTitleInput")?.value.trim() || wizard.title;
+  };
   const render = () => {
     saveInputs();
+    const temporaryPreview = state.settings?.workspace_profile === "temporary" && !window.pywebview?.api;
+    const credentialNote = temporaryPreview
+      ? `<p class="notion-wizard-tip">当前是临时浏览器预览，资料与密钥和 ScanSci 桌面软件隔离。${wizard.tokenConfigured ? "此预览工作区已保存密钥，可留空直接验证；它不会同步到桌面软件。" : "桌面软件会复用其工作区已保存的密钥；只有单独测试此预览时才需要在这里输入。"}</p>`
+      : wizard.tokenConfigured
+        ? `<p class="notion-wizard-tip">已找到当前工作区保存在本机的密钥，可直接验证复用；留空即可，无需重新粘贴。</p>`
+        : `<p class="notion-wizard-tip">验证成功后，密钥会保存在本机凭据管理器。同一工作区的桌面软件与浏览器会自动复用；若已在另一工作区保存，请切换到该工作区。</p>`;
     body.innerHTML = wizard.step === 1
-      ? `<h2 id="notionWizardTitle">第 1 步：拿到 Notion 密钥</h2><p class="notion-wizard-lead">只做两件事：打开创建页，复制一串以 <b>ntn_</b> 开头的密钥。不要打开笔记，也不要点笔记里的“…”。</p><a class="notion-wizard-open" href="https://app.notion.com/developers/tokens" target="_blank" rel="noreferrer">打开 Notion 密钥创建页 ↗</a><div class="notion-wizard-action-card"><strong>在 Notion 页面里这样点</strong><span>1. 点击 <b>New token</b></span><span>2. 选择你的工作区</span><span>3. 点击 <b>Create token</b></span><span>4. 复制出现的 <b>ntn_…</b> 密钥</span></div><p class="notion-wizard-wrong">如果你看到“新连接 / Internal connection”，说明进错页面了，返回后点击上面的“密钥创建页”。</p><label class="notion-wizard-label">把密钥粘贴到这里<input id="notionWizardToken" type="password" autocomplete="off" value="${escapeHtml(wizard.token)}" placeholder="粘贴 ntn_…" /></label><p class="notion-wizard-status" id="notionWizardStatus">${wizard.verified ? "密钥验证成功，点击下一步。" : "密钥只显示一次；复制后回到这里粘贴。"}</p>`
+      ? `<h2 id="notionWizardTitle">第 1 步：验证 Notion 密钥</h2>${credentialNote}<a class="notion-wizard-open" href="https://app.notion.com/developers/tokens" target="_blank" rel="noreferrer">打开 Notion 密钥创建页 ↗</a><label class="notion-wizard-label">Integration Token<input id="notionWizardToken" type="password" autocomplete="off" value="${escapeHtml(wizard.token)}" placeholder="${wizard.tokenConfigured ? "留空复用本机密钥；或粘贴新的 Token" : "粘贴 ntn_…"}" /></label><p class="notion-wizard-status" id="notionWizardStatus">${wizard.verified ? "密钥验证成功，点击下一步。" : wizard.tokenConfigured ? "点击“验证已保存密钥”继续。" : "首次连接时需要输入 Notion Token。"}</p>`
       : wizard.step === 2
         ? `<h2 id="notionWizardTitle">第 2 步：确认同步全部资料</h2><p class="notion-wizard-lead">PAT 会按照你的 Notion 用户权限读取全部可访问内容。你不需要打开任何单篇笔记，也不需要寻找“连接”菜单。</p><div class="notion-wizard-scope-card"><strong>同步范围：你的全部 Notion 内容</strong><span>包括你能看到的页面、子页面、数据库、数据库条目和文件。ScanSci 会自动搜索它们。</span></div><label class="notion-wizard-label">知识库名称<input id="notionWizardTitleInput" type="text" value="${escapeHtml(wizard.title)}" /></label><p class="notion-wizard-tip">如果以后 Notion 中新增内容，再次同步即可更新。ScanSci 不会修改你的 Notion 原文。</p>`
         : `<h2 id="notionWizardTitle">第 3 步：开始同步</h2><p class="notion-wizard-lead">PAT 已验证。点击下面的按钮后，ScanSci 会把你当前 Notion 用户能够访问的全部内容建立为一个固定知识库。</p><div class="notion-wizard-summary"><span>Token</span><strong>已验证</strong><span>同步范围</span><strong>全部可访问内容</strong><span>知识库</span><strong>${escapeHtml(wizard.title || "Notion 知识库")}</strong></div><p class="notion-wizard-tip">点击“连接并同步”后，Notion 会出现在知识库左侧列表中。</p>`;
     byId("notionWizardBack").disabled = wizard.step === 1;
-    byId("notionWizardNext").textContent = wizard.step === 1 && !wizard.verified ? "验证 Token" : wizard.step === 3 ? "连接并同步" : "下一步";
+    byId("notionWizardNext").textContent = wizard.step === 1 && !wizard.verified
+      ? wizard.tokenConfigured && !wizard.token ? "验证已保存密钥" : "验证 Token"
+      : wizard.step === 3 ? "连接并同步" : "下一步";
     host.querySelectorAll(".notion-wizard-progress span").forEach((item, index) => item.classList.toggle("is-active", index + 1 === wizard.step));
   };
   host.querySelectorAll("[data-notion-wizard-cancel]").forEach((item) => item.addEventListener("click", (event) => {
@@ -1623,10 +1709,24 @@ function openNotionWizard() {
   byId("notionWizardNext").addEventListener("click", async () => {
     saveInputs();
     if (wizard.step === 1) {
-      if (!wizard.token) return setStatus("请先粘贴 Integration Token。", true);
+      if (!wizard.token && !wizard.tokenConfigured) return setStatus("请先粘贴 Integration Token。", true);
       if (!wizard.verified) {
-        setStatus("正在验证 Token…");
-        try { const result = await request("/api/notion/test", { method: "POST", body: JSON.stringify({ token: wizard.token }) }); wizard.verified = true; setStatus(`Token 验证成功：${result.name || "Notion Integration"}。点击下一步授权全部资料。`); render(); } catch (error) { setStatus(`${error.message}。请检查 Token 是否完整，并确认它以 secret_ 或 ntn_ 开头。`, true); }
+        setStatus(wizard.token ? "正在验证 Token…" : "正在验证本机已保存的密钥…");
+        try {
+          const result = await request("/api/notion/test", { method: "POST", body: JSON.stringify({ token: wizard.token }) });
+          if (wizard.token) {
+            state.settings = mergeProviderCatalogIntoSettings(
+              await request("/api/notion/token", { method: "POST", body: JSON.stringify({ token: wizard.token }) }),
+              state.presets,
+            );
+            wizard.tokenConfigured = true;
+          }
+          wizard.verified = true;
+          render();
+          setStatus(wizard.token ? `验证成功，密钥已保存在本机；${result.name || "Notion Integration"}。` : `已复用本机密钥验证成功：${result.name || "Notion Integration"}。`);
+        } catch (error) {
+          setStatus(`${error.message}。请检查 Token，或确认当前工作区已保存密钥。`, true);
+        }
         return;
       }
       wizard.step = 2; render(); return;
@@ -2106,18 +2206,25 @@ function bootstrapWorkspaceFallback() {
 // credential-free copy of the provider directory here so a failed /api/settings
 // request does not make the Model Services page look as if its providers were
 // deleted. The backend remains the source of truth once it is reachable.
+const ZHIPU_STANDARD_BASE_URL = "https://open.bigmodel.cn/api/paas/v4";
+const ZHIPU_CODING_PLAN_BASE_URL = "https://open.bigmodel.cn/api/coding/paas/v4";
+const JEV_DEFAULT_ENDPOINT = "https://api.typesafe.ai/v1/systemone";
+
 const BOOTSTRAP_PROVIDER_DEFINITIONS = [
   { id: "scansci-managed", name: "ScanSci", category: "ScanSci", baseUrl: "https://scansci-glm-gateway.932196440.workers.dev/v1", modelId: "glm-4.7-flash", modelName: "GLM-4.7 Flash", authMode: "managed", modelListing: false },
+  { id: "jev", name: "JEV", logo: "typesafe", category: "Pi 决策层", baseUrl: JEV_DEFAULT_ENDPOINT, apiSurface: "jev_systemone", summary: "JEV 作为 Pi 的结构化决策层，按需参与工具与 Skill 流程。", modelId: "jev-decision-layer", modelName: "JEV Decision Layer", modelListing: false, capabilities: ["reasoning", "tool"] },
   { id: "openai", name: "OpenAI", category: "国际模型", baseUrl: "https://api.openai.com/v1", modelId: "gpt-5.2", modelName: "GPT-5.2" },
   { id: "anthropic", name: "Anthropic", category: "国际模型", kind: "anthropic-compatible", baseUrl: "https://api.anthropic.com/v1", modelId: "claude-sonnet-4-6", modelName: "Claude Sonnet 4.6" },
   { id: "gemini", name: "Google Gemini", category: "国际模型", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", modelId: "gemini-3.1-pro-preview", modelName: "Gemini 3.1 Pro" },
   { id: "vertex-ai", name: "Google Vertex AI", category: "国际模型", modelId: "gemini-3.1-pro-preview", modelName: "Gemini 3.1 Pro" },
   { id: "openrouter", name: "OpenRouter", category: "模型聚合", baseUrl: "https://openrouter.ai/api/v1", modelId: "openai/gpt-5.2", modelName: "OpenAI GPT-5.2" },
+  { id: "opencode-go", name: "OpenCode Go", category: "订阅模型", baseUrl: "https://opencode.ai/zen/go/v1", apiSurface: "auto", modelId: "glm-5.3-flash", modelName: "GLM-5.3 Flash" },
   { id: "nvidia", name: "NVIDIA NIM", category: "国际模型", baseUrl: "https://integrate.api.nvidia.com/v1", modelId: "meta/llama-3.3-70b-instruct", modelName: "Llama 3.3 70B Instruct" },
   { id: "deepseek", name: "DeepSeek", category: "国内直连", baseUrl: "https://api.deepseek.com", modelId: "deepseek-v4-flash", modelName: "DeepSeek V4 Flash" },
   { id: "dashscope", name: "阿里云百炼", category: "国内直连", baseUrl: "https://dashscope.aliyuncs.com/compatible-mode/v1", modelId: "qwen-plus", modelName: "Qwen Plus" },
   { id: "zai", name: "Z.ai", category: "国内直连", baseUrl: "https://api.z.ai/api/paas/v4", modelId: "glm-4.7", modelName: "GLM-4.7" },
-  { id: "zhipu", name: "智谱开放平台", category: "国内直连", baseUrl: "https://open.bigmodel.cn/api/paas/v4", modelId: "glm-4.7-flash", modelName: "GLM-4.7 Flash" },
+  { id: "zhipu", name: "智谱开放平台", category: "国内直连", baseUrl: ZHIPU_STANDARD_BASE_URL, standardBaseUrl: ZHIPU_STANDARD_BASE_URL, codingPlanBaseUrl: ZHIPU_CODING_PLAN_BASE_URL, modelId: "glm-4.7-flash", modelName: "GLM-4.7 Flash" },
+  { id: "paratera", name: "并行智算云（Paratera）", category: "国内直连", baseUrl: "https://llmapi.paratera.com/v1", modelId: "WanX2.1-T2I-Plus", modelName: "WanX2.1-T2I-Plus", modelListing: false, capabilities: ["image"] },
   { id: "moonshot", name: "Kimi", category: "国内直连", baseUrl: "https://api.moonshot.ai/v1", modelId: "kimi-k2.5", modelName: "Kimi K2.5" },
   { id: "minimax", name: "MiniMax", category: "国内直连", baseUrl: "https://api.minimaxi.com/v1", modelId: "MiniMax-M2.7", modelName: "MiniMax M2.7" },
   { id: "xiaomi-mimo", name: "Xiaomi MiMo", category: "国内直连", modelId: "mimo-v2-flash", modelName: "MiMo V2 Flash" },
@@ -2150,10 +2257,15 @@ function bootstrapProviderCatalogFallback() {
     return {
       id: definition.id,
       name: definition.name,
-      logo: definition.id,
+      logo: definition.logo || definition.id,
       kind: definition.kind || "openai-compatible",
       base_url: definition.baseUrl || "",
-      api_surface: "chat_completions",
+      ...(definition.standardBaseUrl ? {
+        standard_base_url: definition.standardBaseUrl,
+        coding_plan_base_url: definition.codingPlanBaseUrl || "",
+        coding_plan_enabled: Boolean(definition.codingPlanEnabled),
+      } : {}),
+      api_surface: definition.apiSurface || "chat_completions",
       responses_enabled: false,
       enabled: managed,
       category: definition.category || "自定义提供商",
@@ -2166,7 +2278,7 @@ function bootstrapProviderCatalogFallback() {
         name: definition.modelName || "通用对话模型",
         group: definition.name,
         context_window: managed ? "200K" : "",
-        capabilities: ["reasoning", "tool", "coding"],
+        capabilities: definition.capabilities || ["reasoning", "tool", "coding"],
       }],
     };
   });
@@ -2197,6 +2309,7 @@ function bootstrapSettingsFallback() {
       reranking: "auto",
       vision: "",
       audio: "",
+      image: "auto",
       slides: "provider:scansci-managed:glm-4.7-flash",
     },
     document_processing: {
@@ -2213,6 +2326,7 @@ function bootstrapSettingsFallback() {
         subagent_completion_notifications: false,
       },
       directories: { default_workspace: "", conversation_workspace: "" },
+      updates: { auto_check: true },
     },
     skills: [],
     mcp_servers: [],
@@ -2237,9 +2351,34 @@ function mergeProviderCatalogIntoSettings(settings, presets) {
       api_key_configured: String(preset.id) === "scansci-managed",
       models: Array.isArray(preset.models) ? preset.models.map((model) => ({ ...model })) : [],
     }));
-  return missingProviders.length
-    ? { ...base, providers: [...currentProviders, ...missingProviders] }
-    : base;
+  if (!missingProviders.length) return base;
+  const mergedProviders = [...currentProviders];
+  for (const missingProvider of missingProviders) {
+    if (missingProvider.id === "jev") {
+      const managedIndex = mergedProviders.findIndex((item) => item.id === "scansci-managed");
+      mergedProviders.splice(managedIndex >= 0 ? managedIndex + 1 : mergedProviders.length, 0, missingProvider);
+    } else {
+      mergedProviders.push(missingProvider);
+    }
+  }
+  return { ...base, providers: mergedProviders };
+}
+
+function renderRuntimeBadge() {
+  const badge = byId("runtimeModeBadge");
+  if (!badge || !state.settings) return;
+  const desktop = Boolean(window.pywebview?.api);
+  const temporary = state.settings.workspace_profile === "temporary";
+  const mode = desktop ? "desktop" : temporary ? "preview" : "browser";
+  badge.dataset.mode = mode;
+  badge.textContent = desktop ? "桌面软件" : temporary ? "浏览器预览" : "浏览器模式";
+  badge.title = desktop
+    ? "ScanSci 桌面软件：本机密钥保存在系统凭据管理器，同一工作区会自动复用。"
+    : temporary
+      ? "临时预览工作区与桌面软件隔离，知识库和密钥不会互相覆盖。"
+      : "浏览器正在使用当前工作区；同一工作区已保存的本机密钥可复用。文件夹原位置绑定需使用桌面软件。";
+  badge.setAttribute("aria-label", badge.title);
+  badge.hidden = false;
 }
 
 async function initialize() {
@@ -2288,6 +2427,8 @@ async function initialize() {
     // catalog contains no credentials; user-specific values still come from
     // the successful /api/settings response and remain authoritative.
     state.settings = mergeProviderCatalogIntoSettings(settings, state.presets);
+    renderRuntimeBadge();
+    state.autoCheckUpdates = state.settings?.general?.updates?.auto_check !== false;
     state.selectedProviderId = state.settings.active_model?.provider_id || state.settings.providers?.[0]?.id || "";
     applyAppearancePreferences();
     const preview = new URLSearchParams(window.location.search).get("preview");
@@ -2305,23 +2446,23 @@ async function initialize() {
       storage: "storage",
     }[preview];
     state.onboardingOpen = !Boolean(state.settings?.onboarding?.welcome_dismissed) && !previewSettings;
-    // The current first-run flow is the four-page local-capability guide.
-    // Older builds left onboardingMode empty and therefore rendered the
-    // retired three-page flow with links to the old resource settings page.
     if (state.onboardingOpen) {
-      state.onboardingMode = "resources";
+      state.onboardingMode = "welcome";
       state.resourceGuideStep = 0;
     }
     renderWorkspace();
     renderResourceOnboarding();
+    if (state.onboardingOpen && state.onboardingMode === "welcome") {
+      window.setTimeout(() => byId("homeQuestionInput")?.focus({ preventScroll: true }), 0);
+    }
+    if (state.autoCheckUpdates) void refreshAppUpdate({ quiet: true });
 
-    const [capabilities, runsPayload, directHistoryPayload, slideTemplatesPayload, localInstalled, localCatalog, localInstall, localRuntime, runtimeComponents, ollamaStatus, modelHealthPayload, skillsPayload] = await Promise.all([
+    const [capabilities, runsPayload, directHistoryPayload, slideTemplatesPayload, localInstalled, localInstall, localRuntime, runtimeComponents, ollamaStatus, modelHealthPayload, skillsPayload] = await Promise.all([
       request("/api/capabilities").catch(() => ({})),
       request("/api/runs?view=all&limit=200").catch(() => ({ runs: [] })),
       request(`/api/chat/history?view=${state.historyView === "archived" ? "archived" : "active"}&limit=200`).catch(() => ({ conversations: [] })),
       request("/api/slides/templates").catch(() => ({ available: false, templates: [] })),
       request("/api/local-models/installed").catch(() => ({ models: [] })),
-      request("/api/local-models/market").catch(() => ({ items: [] })),
       request("/api/local-models/install-status").catch(() => ({ jobs: [], active: null })),
       request("/api/local-runtime").catch(() => ({ installed: false, install_available: false, mode: "missing" })),
       request("/api/runtime-components").catch(() => ({ components: {} })),
@@ -2334,12 +2475,13 @@ async function initialize() {
     state.directConversations = directHistoryPayload.conversations || [];
     state.slideTemplates = slideTemplatesPayload.templates || [];
     state.slideTemplatesPlugin = slideTemplatesPayload.plugin || {};
-    state.localModelMarket = { installed: localInstalled.models || [], catalog: localCatalog.items || [], source: localCatalog.source || "", loading: false };
+    state.localModelMarket = { installed: localInstalled.models || [], catalog: [], source: "", query: "", loading: false, loaded: false };
     state.localModelInstall = localInstall || { jobs: [], active: null };
     state.localRuntime = { ...(localRuntime || { installed: false, install_available: false, mode: "missing" }), channels: null };
     state.runtimeComponents = { ...state.runtimeComponents, ...(runtimeComponents?.components || {}) };
     state.ollama = ollamaStatus || state.ollama;
     state.modelHealth = modelHealthPayload || state.modelHealth;
+    applyModelSelectionCatalog(state.modelHealth);
     state.extensions.skills = skillsPayload.skills || [];
     state.extensions.libraryPath = skillsPayload.library_path || "";
     state.slideTemplatesAvailable = Boolean(slideTemplatesPayload.available && state.slideTemplates.length);
@@ -2360,7 +2502,9 @@ async function initialize() {
     renderWorkspace();
     renderResourceOnboarding();
     void restoreSessionStats();
-    void ensureActiveKnowledgeIndex();
+    // Startup observes index readiness only. Index creation and model
+    // preparation remain attached to imports and explicit retry actions.
+    void refreshKnowledgeIndexStatus();
     if (state.localModelInstall?.active) scheduleLocalModelInstallPoll();
     if (["queued", "installing"].includes(state.localRuntime?.install_job?.state)) scheduleLocalRuntimeInstallPoll();
     for (const [componentId, component] of Object.entries(state.runtimeComponents || {})) {
@@ -2373,9 +2517,14 @@ async function initialize() {
     // a fresh direct chat.  Persist only the task id; the authoritative run
     // (including messages and artifacts) is fetched from the API below.
     const rememberedTaskId = window.localStorage.getItem("scansci.active.task") || "";
-    if (rememberedTaskId && state.runs.some((item) => item.run_id === rememberedTaskId)) {
+    const rememberedTask = state.runs.find((item) => item.run_id === rememberedTaskId);
+    if (rememberedTask && rememberedTask.workflow_type !== "evidence_index") {
       await openTask(rememberedTaskId, { record: false });
     } else {
+      if (rememberedTaskId) {
+        window.localStorage.removeItem("scansci.active.task");
+        window.localStorage.removeItem("scansci.active.session");
+      }
       const rememberedDirectId = window.localStorage.getItem("scansci.active.direct") || "";
       if (rememberedDirectId && state.directConversations.some((item) => item.conversation_id === rememberedDirectId)) {
         await openDirectConversation(rememberedDirectId, { record: false });
@@ -2401,7 +2550,7 @@ async function ensureActiveKnowledgeIndex(requestedNotebookId = "", { force = fa
   try {
     // Retrying the vector index must not reload already prepared model
     // weights. Model retries have their own explicit action below.
-    await refreshLocalAiStatus(notebookId, { prepare: true });
+    if (force) await refreshLocalAiStatus(notebookId, { prepare: true });
     const result = await request(`/api/notebooks/${encodeURIComponent(notebookId)}/evidence-index`, {
       method: "POST",
       body: JSON.stringify(force ? { force: true } : { auto: true }),
@@ -2845,8 +2994,8 @@ async function refreshLocalAiStatus(notebookId = state.notebook?.notebook_id || 
       window.clearTimeout(state.localAiStatusPollTimers[id]);
       delete state.localAiStatusPollTimers[id];
     }
-    if (previous.state === "preparing" && ["ready", "fallback", "error"].includes(String(result?.state || ""))) {
-      void ensureActiveKnowledgeIndex(id);
+    if (previous.state === "preparing" && result?.state === "ready") {
+      void ensureActiveKnowledgeIndex(id, { force: true });
     }
     return result;
   } catch (_error) {
@@ -3075,6 +3224,59 @@ function knowledgeLocalBindingSummary(notebook) {
   };
 }
 
+function knowledgeConnectionStatus(notebook) {
+  const metadata = notebook?.metadata || {};
+  const kind = knowledgeSourceKind(notebook);
+  const count = Number(notebook?.counts?.sources || 0);
+  const bindings = knowledgeLocalBindings(notebook);
+  const zotero = metadata.zotero || {};
+  const notion = metadata.notion || {};
+  const connected = kind === "zotero"
+    ? Boolean(zotero.connected)
+    : kind === "notion"
+      ? Boolean(notion.last_sync || Number(notion.page_count || 0) > 0)
+      : bindings.length > 0;
+  const indexState = String(
+    state.knowledgeIndexStatuses?.[String(notebook?.notebook_id || "")]?.state
+      || zotero.evidence_index?.status
+      || "",
+  ).toLowerCase();
+  const indexing = ["queued", "running", "indexing", "processing"].includes(indexState);
+  if (count > 0) {
+    return {
+      state: connected ? "connected" : "ready",
+      label: `${connected ? "已连接" : "已有资料"} · ${count} 个可检索文档`,
+    };
+  }
+  if (connected && indexing) return { state: "indexing", label: "已连接 · 正在建立索引" };
+  if (connected && kind === "zotero") {
+    return {
+      state: "connected",
+      label: Number(zotero.pdf_count || 0) > 0
+        ? "已连接 Zotero · 暂无可检索全文"
+        : "已连接 Zotero · 未找到全文",
+    };
+  }
+  if (connected && kind === "notion") return { state: "connected", label: "已连接 Notion · 暂无可检索内容" };
+  if (connected) return { state: "connected", label: "已链接 · 暂无可检索内容" };
+  if (bindings.length) return { state: "linked", label: `已链接 ${bindings.length} 项 · 暂无可检索内容` };
+  if (String(metadata.library_kind || "") === "empty") return { state: "empty", label: "已建库 · 尚未添加资料" };
+  return { state: "disconnected", label: "尚未连接资料" };
+}
+
+function knowledgeConnectorSummary(kind) {
+  const notebooks = (state.workspace?.notebooks || []).filter((notebook) => knowledgeSourceKind(notebook) === kind);
+  if (!notebooks.length) {
+    return kind === "notion" && state.settings?.notion_api_token_configured
+      ? "密钥已保存 · 尚未同步"
+      : "尚未连接";
+  }
+  const searchableCount = notebooks.reduce((total, notebook) => total + Number(notebook.counts?.sources || 0), 0);
+  return searchableCount
+    ? `${notebooks.length} 个库 · ${searchableCount} 个可检索`
+    : `${notebooks.length} 个库 · 暂无可检索内容`;
+}
+
 function selectedKnowledgeNotebooks() {
   const selected = new Set(sanitizeKnowledgeScopeIds());
   return (state.workspace?.notebooks || []).filter((notebook) => selected.has(String(notebook.notebook_id)));
@@ -3265,7 +3467,7 @@ function syncKnowledgeScopeDialogFooter() {
   const selected = knowledgeScopeDialogSelection();
   const committed = sanitizeKnowledgeScopeIds();
   text.textContent = knowledgeScopeSelectionsEqual(selected, committed)
-    ? "仅建立本地链接与索引，不上传原文件"
+    ? selected.length ? `本轮使用 ${selected.length} 个知识库` : "下方显示连接状态；勾选知识库可用于本轮检索"
     : `${selected.length ? `已选择 ${selected.length} 个知识库` : "未选择知识库"} · 点击完成后生效`;
   status.classList.toggle("is-dirty", !knowledgeScopeSelectionsEqual(selected, committed));
 }
@@ -3374,16 +3576,12 @@ function renderKnowledgeScopeDialog() {
     const kind = knowledgeKind(notebook);
     const ready = notebookHasSearchableContent(notebook);
     const active = ready && selected.has(String(notebook.notebook_id));
-    const count = Number(notebook.counts?.sources || 0);
+    const status = knowledgeConnectionStatus(notebook);
     const personal = knowledgeSourceKind(notebook) === "personal";
-    const bindingSummary = knowledgeLocalBindingSummary(notebook);
     const action = ready ? "toggle-notebook-scope" : "knowledge-scope-unavailable";
-    const label = ready
-      ? `${count} 个文档${bindingSummary.label === "未链接资料" ? "" : ` · ${bindingSummary.label}`}`
-      : bindingSummary.label;
     const selectionMark = active
-      ? `<span class="knowledge-scope-selected" aria-label="已选中">${uiIcon("check")}</span>`
-      : `<span class="knowledge-scope-selected" aria-label="已选中" hidden>${uiIcon("check")}</span>`;
+      ? `<span class="knowledge-scope-selected" aria-label="已加入本轮">${uiIcon("check")}</span>`
+      : `<span class="knowledge-scope-selected" aria-label="已加入本轮" hidden>${uiIcon("check")}</span>`;
     const linkedKinds = knowledgeLocalBindingKinds(notebook);
     const resourceButtons = [
       linkedKinds.file ? "" : `<button type="button" data-action="choose-library-files" data-notebook-id="${escapeHtml(notebook.notebook_id)}" aria-label="向 ${escapeHtml(knowledgeScopeTitle(notebook))} 链接文件" title="链接文件">${uiIcon("file-plus")}</button>`,
@@ -3394,11 +3592,9 @@ function renderKnowledgeScopeDialog() {
         ? `<div class="knowledge-scope-resource-actions">${resourceButtons.join("")}</div>`
         : `<span class="knowledge-scope-resource-status" title="文件与文件夹已连接">已全部连接</span>`
       : "";
-    return `<div class="knowledge-scope-row ${active ? "is-active" : ""} ${ready ? "" : "is-unavailable"}" data-knowledge-scope-row data-notebook-id="${escapeHtml(notebook.notebook_id)}"><button type="button" class="knowledge-scope-row-main" data-action="${ready ? "toggle-knowledge-scope-draft" : action}" data-notebook-id="${escapeHtml(notebook.notebook_id)}" aria-label="${escapeHtml(ready ? `选择 ${knowledgeScopeTitle(notebook)}` : `${knowledgeScopeTitle(notebook)}尚无可检索内容`)}" aria-pressed="${ready ? String(active) : "false"}" ${ready ? "" : "disabled"}><img src="${knowledgeLogoUrl(kind.key)}" alt="" /><span>${escapeHtml(knowledgeScopeTitle(notebook))}</span><small title="${escapeHtml(ready ? `${count} 个文档可检索；${bindingSummary.title}` : bindingSummary.title)}">${escapeHtml(label)}</small>${selectionMark}</button>${resourceActions}</div>`;
+    return `<div class="knowledge-scope-row ${active ? "is-active" : ""} ${ready ? "" : "is-unavailable"}" data-knowledge-scope-row data-notebook-id="${escapeHtml(notebook.notebook_id)}"><button type="button" class="knowledge-scope-row-main" data-action="${ready ? "toggle-knowledge-scope-draft" : action}" data-notebook-id="${escapeHtml(notebook.notebook_id)}" aria-label="${escapeHtml(ready ? `选择 ${knowledgeScopeTitle(notebook)}用于本轮检索` : `${knowledgeScopeTitle(notebook)}：${status.label}`)}" aria-pressed="${ready ? String(active) : "false"}" ${ready ? "" : "disabled"}><img src="${knowledgeLogoUrl(kind.key)}" alt="" /><span>${escapeHtml(knowledgeScopeTitle(notebook))}</span><small data-connection-state="${escapeHtml(status.state)}" title="${escapeHtml(status.label)}">${escapeHtml(status.label)}</small>${selectionMark}</button>${resourceActions}</div>`;
   }).join("");
-  target.innerHTML = `<section class="knowledge-scope-connect"><button type="button" data-action="create-empty-library"><img src="/knowledge-personal.svg" alt="" /><span>个人知识库</span>${uiIcon("plus")}</button><button type="button" data-action="choose-zotero-library"><img src="/zotero-logo.svg" alt="" /><span>Zotero</span>${uiIcon("plus")}</button><button type="button" data-action="choose-obsidian-vault"><img src="/obsidian-logo.svg" alt="" /><span>Obsidian</span>${uiIcon("plus")}</button></section><section class="knowledge-scope-list"><header><h3>选择知识库</h3><span>可多选</span></header><p class="knowledge-scope-hint">选择个人知识库后，可在右侧直接链接文件或文件夹。</p>${rows || `<div class="knowledge-scope-empty">先创建一个个人知识库</div>`}</section>`;
-  hydrateIcons(target);
-  target.querySelector(".knowledge-scope-connect")?.insertAdjacentHTML("beforeend", `<button type="button" data-action="connect-notion"><img src="/notion-logo.png" alt="" /><span>Notion</span>${uiIcon("plus")}</button>`);
+  target.innerHTML = `<section class="knowledge-scope-connect"><button type="button" data-action="create-empty-library"><img src="/knowledge-personal.svg" alt="" /><span><strong>个人知识库</strong><small>新建后链接本地资料</small></span>${uiIcon("plus")}</button><button type="button" data-action="choose-zotero-library" title="${escapeHtml(knowledgeConnectorSummary("zotero"))}"><img src="/zotero-logo.svg" alt="" /><span><strong>Zotero</strong><small>${escapeHtml(knowledgeConnectorSummary("zotero"))}</small></span>${uiIcon("plus")}</button><button type="button" data-action="choose-obsidian-vault" title="${escapeHtml(knowledgeConnectorSummary("obsidian"))}"><img src="/obsidian-logo.svg" alt="" /><span><strong>Obsidian</strong><small>${escapeHtml(knowledgeConnectorSummary("obsidian"))}</small></span>${uiIcon("plus")}</button><button type="button" data-action="connect-notion" title="${escapeHtml(knowledgeConnectorSummary("notion"))}"><img src="/notion-logo.png" alt="" /><span><strong>Notion</strong><small>${escapeHtml(knowledgeConnectorSummary("notion"))}</small></span>${uiIcon("plus")}</button></section><section class="knowledge-scope-list"><header><h3>选择知识库</h3><span>可多选</span></header><p class="knowledge-scope-hint">资料连接状态和本轮检索范围会分别显示。</p>${rows || `<div class="knowledge-scope-empty">先连接资料来源</div>`}</section>`;
   hydrateIcons(target);
   syncKnowledgeScopeDialogFooter();
 }
@@ -3417,7 +3613,21 @@ function activeModel() {
   return { provider, model };
 }
 
+function uniqueModelProviderLabel(primary, secondary, separator = " · ") {
+  const first = String(primary || "").trim();
+  const second = String(secondary || "").trim();
+  if (!first) return second;
+  if (!second || first.localeCompare(second, undefined, { sensitivity: "base" }) === 0) return first;
+  return `${first}${separator}${second}`;
+}
+
 function activeModelLabel() {
+  const imageSelection = selectedComposerImageModel();
+  if (imageSelection) {
+    const provider = state.settings?.providers?.find(p => p.id === imageSelection.provider_id);
+    const model = provider?.models?.find(m => m.id === imageSelection.model_id);
+    return `${model?.name || imageSelection.model_id} · 生图`;
+  }
   const { provider, model } = activeModel();
   if (!provider || !model || !isConversationModel(model)) return "选择模型";
   return model.name;
@@ -3425,7 +3635,30 @@ function activeModelLabel() {
 
 function isConversationModel(model) {
   const capabilities = new Set(model?.capabilities || []);
+  if (["audio", "image"].some((item) => capabilities.has(item)) && !["reasoning", "writing", "vision", "tool", "coding"].some((item) => capabilities.has(item))) {
+    return false;
+  }
   return !capabilities.has("embedding") && !capabilities.has("reranking");
+}
+
+function selectedComposerImageModel() {
+  const value = String(state.composerImageModel || "");
+  const separator = value.indexOf("::");
+  return separator > 0 && value.slice(separator + 2)
+    ? { provider_id: value.slice(0, separator), model_id: value.slice(separator + 2) }
+    : null;
+}
+
+function composerModelAvailability(model, provider) {
+  if (!model?.capabilities?.includes("image")) return conversationModelAvailability(model, provider);
+  const enabled = model.enabled !== false;
+  const available = model.available !== false && String(model.readiness || "production") === "production";
+  const selectable = enabled && available && isProviderUsable(provider);
+  return {
+    visible: Boolean(provider?.enabled), selectable,
+    label: selectable ? "" : !enabled ? "已停用" : !available ? "不可用" : "待配置",
+    detail: selectable ? "文生图 · 仅使用本条文字描述" : model.unavailable_reason || "请在模型服务中检查模型状态和图像服务配置。",
+  };
 }
 
 function modelHealthKey(providerId, modelId) {
@@ -3434,6 +3667,32 @@ function modelHealthKey(providerId, modelId) {
 
 function modelHealthEntry(providerId, modelId) {
   return state.modelHealth?.models?.[modelHealthKey(providerId, modelId)] || null;
+}
+
+function applyModelSelectionCatalog(snapshot) {
+  const catalog = snapshot?.selection_catalog;
+  if (!catalog || !state.settings) return;
+  const discovered = Array.isArray(catalog.providers) ? catalog.providers : [];
+  const discoveredById = new Map(discovered.map((provider) => [String(provider?.id || ""), provider]));
+  const merged = [];
+  const seen = new Set();
+  for (const provider of (state.settings.providers || [])) {
+    const id = String(provider?.id || "");
+    const derived = id === "local-huggingface" || id.startsWith("local-runtime-");
+    if (derived && discoveredById.has(id)) {
+      merged.push(discoveredById.get(id));
+      seen.add(id);
+    } else if (!derived) {
+      merged.push(provider);
+      seen.add(id);
+    }
+  }
+  for (const provider of discovered) {
+    const id = String(provider?.id || "");
+    if (id && !seen.has(id)) merged.push(provider);
+  }
+  state.settings.providers = merged;
+  if (Array.isArray(catalog.local_models)) state.settings.local_models = catalog.local_models;
 }
 
 function localModelSnapshotReady(modelId) {
@@ -3445,24 +3704,67 @@ function localModelSnapshotReady(modelId) {
   ));
 }
 
-function isSelectableConversationModel(model, provider = null) {
-  const capabilities = new Set(model?.capabilities || []);
-  // ASR is a preprocessing capability, not a text-generation model.  Keep
-  // it in Settings → 模型路由, but never put it in the chat-model picker.
-  if (capabilities.has("audio") && !["reasoning", "writing", "vision", "tool", "coding"].some((item) => capabilities.has(item))) {
-    return false;
+function isLocalModelProvider(provider) {
+  return provider?.kind === "local" || provider?.auth_mode === "local" || String(provider?.id || "").startsWith("local-runtime-");
+}
+
+function localModelStatusLabel(status, detail = "") {
+  const message = String(detail || "");
+  if (/\b1455\b|page\s*file|paging\s*file|\u9875\u9762\u6587\u4ef6|\u865a\u62df\u5185\u5b58/i.test(message)) return "\u865a\u62df\u5185\u5b58\u4e0d\u8db3";
+  if (/VRAM|\u663e\u5b58\u4e0d\u8db3|(?:cuda|gpu).{0,64}(?:out of memory|outofmemory|memory allocation)/i.test(message)) return "\u663e\u5b58\u4e0d\u8db3";
+  if (/out of memory|memory allocation|\u5185\u5b58\u4e0d\u8db3/i.test(message)) return "\u5185\u5b58\u4e0d\u8db3";
+  if (/\u672a\u8fd0\u884c|\u672a\u54cd\u5e94|refused|\u65e0\u6cd5\u8fde\u63a5|timed out|timeout/i.test(message)) return "\u8fd0\u884c\u65f6\u672a\u542f\u52a8";
+  return ({
+    incompatible: "\u5f53\u524d\u73af\u5883\u4e0d\u517c\u5bb9",
+    not_installed: "\u672a\u5b89\u88c5",
+    unavailable: "\u6682\u4e0d\u53ef\u7528",
+    disabled: "\u5df2\u505c\u7528",
+    needs_key: "\u5f85\u914d\u7f6e",
+  })[String(status || "")] || "\u6682\u4e0d\u53ef\u7528";
+}
+
+function conversationModelAvailability(model, provider = null) {
+  if (!isConversationModel(model) || String(model?.readiness || "production") !== "production") {
+    return { visible: false, selectable: false, status: "unsupported", label: "", detail: "" };
   }
-  if (!isConversationModel(model) || String(model?.readiness || "production") !== "production") return false;
-  if (!provider) return true;
-  const isLocal = provider.kind === "local" || provider.auth_mode === "local" || String(provider.id || "").startsWith("local-runtime-");
-  if (!isLocal) return true;
+  const local = isLocalModelProvider(provider);
+  const explicitReason = String(model?.unavailable_reason || "").trim();
+  if (!provider) {
+    const selectable = model?.available !== false;
+    return { visible: true, selectable, status: selectable ? "ready" : "unavailable", label: selectable ? "" : localModelStatusLabel("unavailable", explicitReason), detail: explicitReason };
+  }
+  if (!provider.enabled) {
+    return { visible: local, selectable: false, status: "disabled", label: "\u5df2\u505c\u7528", detail: "\u8be5\u672c\u5730\u670d\u52a1\u5df2\u505c\u7528\uff0c\u53ef\u5728\u6a21\u578b\u8bbe\u7f6e\u4e2d\u91cd\u65b0\u542f\u7528\u3002" };
+  }
+  if (model?.available === false) {
+    return { visible: local, selectable: false, status: "incompatible", label: localModelStatusLabel("incompatible", explicitReason), detail: explicitReason || "\u5f53\u524d\u672c\u5730\u8fd0\u884c\u7ec4\u4ef6\u65e0\u6cd5\u52a0\u8f7d\u8fd9\u4e2a\u6a21\u578b\u3002" };
+  }
+  if (!local) {
+    const selectable = isProviderUsable(provider);
+    return { visible: selectable, selectable, status: selectable ? "ready" : "needs_key", label: selectable ? "" : "\u5f85\u914d\u7f6e", detail: selectable ? "" : "\u8bf7\u5148\u5b8c\u6210\u670d\u52a1\u5546\u914d\u7f6e\u3002" };
+  }
   const health = modelHealthEntry(provider.id, model.id);
-  if (health) return ["ready", "connected"].includes(String(health.status || ""));
+  if (health) {
+    const status = String(health.status || "unknown");
+    const selectable = ["ready", "connected", "configured"].includes(status);
+    const detail = String(health.detail || explicitReason || "").trim();
+    return { visible: true, selectable, status, label: selectable ? "" : localModelStatusLabel(status, detail), detail };
+  }
   // Keep the initial render migration-safe if an older embedded page loads
   // before the health endpoint responds. Once a snapshot exists, local models
-  // without a ready cache entry must stay out of the picker.
-  if (!state.modelHealth?.checked_at) return provider.id === "local-evidence" || localModelSnapshotReady(model.id);
-  return provider.id === "local-evidence";
+  // without a ready cache entry stay visible with an honest pending state.
+  const selectable = provider.id === "local-evidence" || (!state.modelHealth?.checked_at && localModelSnapshotReady(model.id));
+  return {
+    visible: true,
+    selectable,
+    status: selectable ? "ready" : "unavailable",
+    label: selectable ? "" : "\u72b6\u6001\u5f85\u786e\u8ba4",
+    detail: selectable ? "" : "\u5c1a\u672a\u53d6\u5f97\u672c\u5730\u8fd0\u884c\u72b6\u6001\uff0c\u53ef\u5237\u65b0\u68c0\u6d4b\u3002",
+  };
+}
+
+function isSelectableConversationModel(model, provider = null) {
+  return conversationModelAvailability(model, provider).selectable;
 }
 
 function parseTokenCapacity(value) {
@@ -3614,7 +3916,7 @@ function renderContextUsage() {
 }
 
 function renderModelSelectors() {
-  const current = state.settings?.active_model || {};
+  const current = selectedComposerImageModel() || state.settings?.active_model || {};
   const label = activeModelLabel();
   ["homeModelLabel", "chatModelLabel"].forEach((id) => {
     const target = byId(id);
@@ -3628,6 +3930,17 @@ function renderModelSelectors() {
   renderThinkingSelectors();
   setWebSearchMode(state.webSearchMode, { announce: false });
   renderContextUsage();
+  if (selectedComposerImageModel()) {
+    ["homeQuestionInput", "chatQuestionInput"].forEach(id => {
+      const input = byId(id);
+      if (input) input.placeholder = "描述你想生成的图片（仅使用本条文字）";
+    });
+  }
+  document.querySelectorAll("[data-context-usage]").forEach(control => {
+    control.hidden = Boolean(selectedComposerImageModel());
+  });
+  if (selectedComposerImageModel()) closeContextUsagePopovers();
+  renderComposerSendButtons();
 }
 
 const thinkingLevels = [
@@ -3648,7 +3961,7 @@ function currentThinkingLabel() {
 }
 
 function activeModelSupportsReasoning() {
-  return Boolean(activeModel().model?.capabilities?.includes("reasoning"));
+  return !selectedComposerImageModel() && Boolean(activeModel().model?.capabilities?.includes("reasoning"));
 }
 
 function renderThinkingSelectors() {
@@ -3689,21 +4002,43 @@ function setComposerThinkingLevel(value) {
 }
 
 function composerModelMenuMarkup(current = {}) {
-  const providers = (state.settings?.providers || []).filter(isProviderUsable);
-  const groups = providers.map((provider) => {
-    const models = (provider.models || []).filter((model) => isSelectableConversationModel(model, provider));
-    if (!models.length) return "";
-    const rows = models.map((model) => {
+  const groupedProviders = new Map();
+  for (const provider of (state.settings?.providers || [])) {
+    const local = isLocalModelProvider(provider);
+    if (!local && !isProviderUsable(provider) && !(provider.enabled && provider.models?.some(m => m.capabilities?.includes("image")))) continue;
+    const models = (provider.models || [])
+      .map((model) => ({ model, availability: composerModelAvailability(model, provider) }))
+      .filter(({ model, availability }) => availability.visible && (local || availability.selectable || model.capabilities?.includes("image")));
+    if (!models.length) continue;
+    const runtime = String(provider.runtime || provider.logo || "local").toLowerCase();
+    const runtimeLabel = ({ ollama: "Ollama", "lm-studio": "LM Studio", "llama.cpp": "llama.cpp", local: "\u672c\u5730\u8fd0\u884c\u65f6" })[runtime] || runtime;
+    const groupKey = String(provider.id || "").startsWith("local-runtime-")
+      ? `runtime:${runtime}:${String(provider.base_url || "").toLowerCase()}`
+      : String(provider.id || "");
+    if (!groupedProviders.has(groupKey)) {
+      groupedProviders.set(groupKey, { name: String(provider.id || "").startsWith("local-runtime-") ? `\u672c\u5730 \u00b7 ${runtimeLabel}` : provider.name, entries: [] });
+    }
+    groupedProviders.get(groupKey).entries.push(...models.map(({ model, availability }) => ({ provider, model, availability })));
+  }
+  const groups = [...groupedProviders.values()].map((group) => {
+    const rows = group.entries.map(({ provider, model, availability }) => {
       const selected = provider.id === current.provider_id && model.id === current.model_id;
       const tags = [
-        model.capabilities?.includes("vision") ? '<span class="composer-model-tag">视觉</span>' : "",
-        model.capabilities?.includes("audio") ? '<span class="composer-model-tag">语音</span>' : "",
+        model.capabilities?.includes("image") ? '<span class="composer-model-tag">生图</span>' : "",
+        model.capabilities?.includes("vision") ? '<span class="composer-model-tag">\u89c6\u89c9</span>' : "",
+        model.capabilities?.includes("audio") ? '<span class="composer-model-tag">\u8bed\u97f3</span>' : "",
       ].join("");
-      return `<button type="button" class="composer-model-option ${selected ? "is-selected" : ""}" data-action="select-composer-model" data-model-value="${escapeHtml(`${provider.id}::${model.id}`)}" role="option" aria-selected="${selected ? "true" : "false"}"><span class="composer-model-option-name">${escapeHtml(model.name || model.id)}</span>${tags}<span class="composer-model-check" aria-hidden="true">${uiIcon("check")}</span></button>`;
+      const detail = availability.selectable && !model.capabilities?.includes("image") ? "" : availability.detail;
+      const status = availability.selectable ? "" : `<span class="composer-model-status">${escapeHtml(availability.label)}</span>`;
+      return `<button type="button" class="composer-model-option ${selected ? "is-selected" : ""} ${availability.selectable ? "" : "is-unavailable"}" data-action="select-composer-model" data-model-value="${escapeHtml(`${provider.id}::${model.id}`)}" role="option" aria-selected="${selected ? "true" : "false"}" ${availability.selectable ? "" : "disabled aria-disabled=\"true\""} title="${escapeHtml(detail)}"><span class="composer-model-option-main"><strong>${escapeHtml(model.name || model.id)}</strong>${detail ? `<small>${escapeHtml(detail)}</small>` : ""}</span><span class="composer-model-option-meta">${tags}${status}</span><span class="composer-model-check" aria-hidden="true">${uiIcon("check")}</span></button>`;
     }).join("");
-    return `<section class="composer-model-group"><span>${escapeHtml(provider.name)}</span>${rows}</section>`;
+    const singleName = group.entries.length === 1 ? group.entries[0].model.name || group.entries[0].model.id : "";
+    const groupLabel = singleName && String(group.name || "").localeCompare(String(singleName), undefined, { sensitivity: "base" }) === 0
+      ? ""
+      : `<span>${escapeHtml(group.name)}</span>`;
+    return `<section class="composer-model-group">${groupLabel}${rows}</section>`;
   }).join("");
-  const empty = groups || '<div class="composer-model-empty">尚未配置可用模型</div>';
+  const empty = groups || '<div class="composer-model-empty">暂无可用的对话或生图模型</div>';
   const webMode = Object.hasOwn(webSearchLabels, state.webSearchMode) ? state.webSearchMode : "auto";
   const webOptions = [
     ["auto", "自动"],
@@ -3717,17 +4052,17 @@ function composerModelMenuMarkup(current = {}) {
     return capabilities.includes("chat") || capabilities.includes("vision") || item?.kind === "vision";
   }).length;
   const localInventoryNote = installedSnapshots.length
-    ? `<p class="composer-model-note">本机已发现 ${installedSnapshots.length} 个模型快照；其中 ${readyConversationSnapshots} 个可作为对话/视觉入口。一个模型可以同时拥有多项能力，其他已安装能力会由 Agent 按需调用。</p>`
+    ? `<p class="composer-model-note">\u672c\u673a\u5df2\u53d1\u73b0 ${installedSnapshots.length} \u4e2a\u6a21\u578b\u5feb\u7167\uff1b\u5176\u4e2d ${readyConversationSnapshots} \u4e2a\u53ef\u4f5c\u4e3a\u5bf9\u8bdd/\u89c6\u89c9\u5165\u53e3\u3002\u6682\u4e0d\u53ef\u7528\u7684\u5bf9\u8bdd\u6a21\u578b\u4f1a\u663e\u793a\u539f\u56e0\uff1b\u5d4c\u5165\u3001\u91cd\u6392\u548c\u8bed\u97f3\u7b49\u4e13\u7528\u6a21\u578b\u7531 Agent \u6309\u9700\u8c03\u7528\u3002</p>`
     : "";
   return `<div class="composer-settings-panel">
-    <section class="composer-settings-section web-search-picker" data-web-search-picker>
+    ${selectedComposerImageModel() ? "" : `<section class="composer-settings-section web-search-picker" data-web-search-picker>
       <header><span data-ui-icon="globe"></span><span>联网搜索</span></header>
       <div class="composer-segmented-control" role="listbox" aria-label="联网搜索策略">${webOptions}</div>
     </section>
     <section class="composer-settings-section composer-thinking" data-composer-thinking>
       <header><span data-ui-icon="brain"></span><span>思考模式</span></header>
       <div class="composer-thinking-popover composer-segmented-control" role="listbox" aria-label="调整思考等级"></div>
-    </section>
+    </section>`}
     <section class="composer-settings-models">
       <header><span>可用模型</span></header>
       ${empty}
@@ -3737,8 +4072,28 @@ function composerModelMenuMarkup(current = {}) {
 }
 
 async function setActiveComposerModel(value) {
-  const [providerId, modelId] = String(value || "").split("::");
+  const separator = String(value || "").indexOf("::");
+  if (separator < 1) return;
+  const providerId = String(value || "").slice(0, separator);
+  const modelId = String(value || "").slice(separator + 2);
   if (!providerId || !modelId) return;
+  const provider = state.settings?.providers?.find(p => p.id === providerId);
+  const model = provider?.models?.find(m => m.id === modelId);
+  if (!model || !composerModelAvailability(model, provider).selectable) throw Error("所选模型尚不可用，请先完成模型服务配置。");
+  state.composerImageModel = model.capabilities?.includes("image") ? String(value) : "";
+  window.localStorage.setItem("scansci.composer.image-model", state.composerImageModel);
+  if (state.composerImageModel) {
+    renderModelSelectors();
+    renderComposerSendButtons();
+    closeComposerModelPickers();
+    toast("已切换文生图，仅使用本条文字描述。");
+    return;
+  }
+  if (state.settings.active_model?.provider_id === providerId && state.settings.active_model?.model_id === modelId) {
+    renderModelSelectors();
+    closeComposerModelPickers();
+    return;
+  }
   state.settings.active_model = { provider_id: providerId, model_id: modelId };
   renderModelSelectors();
   closeComposerModelPickers();
@@ -3747,6 +4102,7 @@ async function setActiveComposerModel(value) {
 
 function isProviderUsable(provider) {
   if (!provider?.enabled) return false;
+  if (provider.id === "jev" || provider.api_surface === "jev_systemone") return false;
   // An Ollama model is only selectable after the exact model has been
   // confirmed by /api/tags.  The resource page still shows the install/setup
   // action while this is false.
@@ -4011,6 +4367,11 @@ function isBuiltInProvider(provider) {
   return (state.presets?.providers || []).some((preset) => preset.id === provider?.id);
 }
 
+function zhipuEndpointValue(provider, codingPlanEnabled = Boolean(provider?.coding_plan_enabled)) {
+  const configured = codingPlanEnabled ? provider?.coding_plan_base_url : provider?.standard_base_url;
+  return String(configured || "").trim() || (codingPlanEnabled ? ZHIPU_CODING_PLAN_BASE_URL : ZHIPU_STANDARD_BASE_URL);
+}
+
 const modelCapabilityDefinitions = [
   ["reasoning", "推理", "brain"], ["vision", "视觉", "eye"], ["embedding", "嵌入", "arrow-up-right"],
   ["reranking", "重排", "arrow-up-down"], ["tool", "工具", "wrench"], ["coding", "代码", "code"],
@@ -4026,15 +4387,15 @@ function providerLogo(provider, large = false) {
     "xiaomi-mimo": "mimo.svg", modelscope: "modelscope.png", volcengine: "volcengine.png",
     "new-api": "new-api.png", aihubmix: "aihubmix.webp", ocoolai: "ocoolai.png", alaya: "alaya.webp",
     dmxapi: "dmxapi.webp", aionly: "aionly.webp", burncloud: "burncloud.png", cherryin: "cherryin.png",
-    "github-copilot": "github-copilot.webp",
+    "github-copilot": "github-copilot.webp", typesafe: "typesafe.png",
   };
   const marks = {
-    openai: "◎", anthropic: "A", gemini: "✦", "vertex-ai": "V", openrouter: "◌", nvidia: "N",
-    deepseek: "DS", dashscope: "Q", zai: "Z", zhipu: "Z", moonshot: "K", minimax: "M", "xiaomi-mimo": "mi",
+    openai: "◎", anthropic: "A", gemini: "✦", "vertex-ai": "V", openrouter: "◌", "opencode-go": "OC", nvidia: "N",
+    deepseek: "DS", dashscope: "Q", zai: "Z", zhipu: "Z", paratera: "PT", moonshot: "K", minimax: "M", "xiaomi-mimo": "mi",
     siliconflow: "SF", modelscope: "MS", ppio: "P", volcengine: "V", "huawei-cloud": "H", infinigence: "∞",
     "qiniu-ai": "7", modal: "M", "new-api": "N", "one-api": "1", aihubmix: "AH", ocoolai: "oc",
     alaya: "A", dmxapi: "D", aionly: "AI", burncloud: "B", cherryai: "C", cherryin: "CI",
-    "github-copilot": "GH", wuwen: "W", "local-evidence": "S",
+    "github-copilot": "GH", typesafe: "J", wuwen: "W", "local-evidence": "S",
   };
   const rawKey = String(provider?.logo || provider?.id || "custom").toLowerCase();
   const key = rawKey.replace(/[^a-z0-9-]/g, "-");
@@ -4052,6 +4413,9 @@ function modelCapabilityChips(model, index, options = {}) {
   const showAll = Boolean(options.showAll);
   const definitions = showAll ? modelCapabilityDefinitions : modelCapabilityDefinitions.filter(([id]) => enabled.has(id));
   const empty = !definitions.length && !showAll ? '<span class="model-capability-empty">未标注</span>' : "";
+  if (options.readOnly) {
+    return `<div class="model-capabilities" aria-label="模型能力">${definitions.map(([id, label, iconName]) => `<span class="model-capability-chip is-active" title="${escapeHtml(label)}"><i>${uiIcon(iconName)}</i><span>${label}</span></span>`).join("")}${empty}</div>`;
+  }
   return `<div class="model-capabilities ${showAll ? "is-picker" : ""}" aria-label="模型能力">${definitions.map(([id, label, iconName]) => `<button type="button" class="model-capability-chip ${enabled.has(id) ? "is-active" : ""}" data-action="toggle-model-capability" data-model-index="${index}" data-capability="${id}" title="${enabled.has(id) ? `移除${label}能力` : `添加${label}能力`}"><i>${uiIcon(iconName)}</i><span>${label}</span></button>`).join("")}${empty}</div>`;
 }
 
@@ -4397,7 +4761,7 @@ function maxSidebarWidth() {
 }
 
 function clampSidebarWidth(value) {
-  return Math.round(Math.max(260, Math.min(maxSidebarWidth(), Number(value) || 352)));
+  return Math.round(Math.max(260, Math.min(maxSidebarWidth(), Number(value) || 288)));
 }
 
 function applySidebarWidth({ persist = false } = {}) {
@@ -4643,6 +5007,7 @@ function selectProfileAvatar(value) {
 }
 
 function setView(name, { record = true } = {}) {
+  navigationRequestGeneration += 1;
   state.activeView = name;
   byId("workbench").classList.toggle("is-settings", name === "settings");
   updateSidebarNavigation();
@@ -4655,10 +5020,14 @@ function setView(name, { record = true } = {}) {
       settingsContent.scrollTop = 0;
       settingsContent.scrollLeft = 0;
     }
+    if (state.activeSettings === "local-models" && !state.localModelMarket?.loaded && !state.localModelMarket?.loading) {
+      void refreshLocalModelMarket().catch((error) => toast(error.message, true));
+    }
   }
   if (name === "mode") renderMode();
   if (name === "extensions") renderExtensions();
   if (name === "mcp") renderMcpMarketplaceView();
+  renderFirstRunWelcome();
   if (record) recordNavigation();
 }
 
@@ -4889,14 +5258,14 @@ function renderTasks() {
   renderHistoryControls();
   const query = state.historyQuery.trim().toLowerCase();
   const archived = state.historyView === "archived";
-  const availableRuns = state.runs.filter((run) => Boolean(run.archived) === archived);
+  const availableRuns = state.runs.filter((run) => run.workflow_type !== "evidence_index" && Boolean(run.archived) === archived);
   const availableRecords = [
     ...availableRuns,
     ...(archived ? [] : state.directConversations),
   ].sort((left, right) => String(right.updated_at || "").localeCompare(String(left.updated_at || "")));
   const records = availableRecords.filter((record) => {
     const searchable = record.kind === "direct"
-      ? [record.title, record.preview, record.updated_at, "直接对话", "已完成"]
+      ? [record.title, record.preview, record.status, record.updated_at, "直接对话"]
       : [record.title, record.status, record.updated_at];
     return searchable.join(" ").toLowerCase().includes(query);
   });
@@ -4918,8 +5287,19 @@ function renderTasks() {
       const organizeAction = archived ? "restore-direct-conversation" : "archive-direct-conversation";
       const organizeLabel = archived ? "恢复到历史对话" : "归档对话";
       const organizeIcon = archived ? "archive-restore" : "archive";
-      const statusClass = job ? (job.status === "paused" ? "paused" : job.status === "queued" ? "queued" : "running") : "completed";
-      const statusLabel = archived ? "已归档" : job ? job.pauseRequested ? "正在暂停" : job.status === "paused" ? "已暂停" : (job.queue.length ? `处理中 · 后续 ${job.queue.length}` : "处理中") : "已完成";
+      const persistedStatus = String(record.status || "completed");
+      const queueCount = job ? job.queue.length : Math.max(0, Number(record.queue_count || 0));
+      const recoverable = ["starting", "running", "retrying", "queued", "paused", "interrupted"].includes(persistedStatus);
+      const statusClass = job
+        ? (job.status === "paused" ? "paused" : job.status === "queued" ? "queued" : "running")
+        : recoverable ? (persistedStatus === "paused" ? "paused" : "queued") : persistedStatus;
+      const statusLabel = archived
+        ? "已归档"
+        : job
+          ? job.pauseRequested ? "正在暂停" : job.status === "paused" ? "已暂停" : (queueCount ? `处理中 · 后续 ${queueCount}` : "处理中")
+          : recoverable
+            ? persistedStatus === "paused" ? (queueCount ? `已暂停 · 后续 ${queueCount}` : "已暂停") : (queueCount ? `待恢复 · 后续 ${queueCount}` : "待恢复")
+            : persistedStatus === "failed" ? "失败" : persistedStatus === "cancelled" ? "已取消" : record.preview === "图片已生成并保存。" ? "已生成" : "已完成";
       const manageDisabled = Boolean(job);
       return `<div class="task-row ${open ? "has-open-menu" : ""}" data-conversation-id="${escapeHtml(conversationId)}"><button type="button" class="task-item ${active ? "is-active" : ""}" data-action="open-direct-conversation" data-conversation-id="${escapeHtml(conversationId)}"><span>${escapeHtml(compact(record.title || "直接对话", 28))}</span><time class="task-status ${statusClass}">${escapeHtml(statusLabel)}</time></button><button type="button" class="task-more" data-action="toggle-direct-menu" data-conversation-id="${escapeHtml(conversationId)}" aria-expanded="${open}" aria-label="管理对话" title="管理对话">${uiIcon("more-horizontal")}</button>${open ? `<div class="task-menu" role="menu"><button type="button" data-action="${organizeAction}" data-conversation-id="${escapeHtml(conversationId)}" ${manageDisabled ? "disabled" : ""}>${uiIcon(organizeIcon)}<span>${organizeLabel}</span></button><button type="button" class="is-danger" data-action="delete-direct-conversation" data-conversation-id="${escapeHtml(conversationId)}" ${manageDisabled ? "disabled" : ""}>${uiIcon("trash")}<span>删除对话</span></button>${manageDisabled ? '<small>运行结束后可整理</small>' : ""}</div>` : ""}</div>`;
     }
@@ -5125,6 +5505,66 @@ function directChatJob(conversationId = state.directConversationId) {
   return directChatJobs.get(String(conversationId || "")) || null;
 }
 
+function createDirectChatJobState({
+  conversationId,
+  title,
+  titleSource = "provisional",
+  createdAt = new Date().toISOString(),
+  sessionId = "",
+  messages = [],
+  queue = [],
+  status = "starting",
+  currentTurn = null,
+  pausedTurn = null,
+  pausedMessage = null,
+  branchId = "",
+  branchFromMessageId = "",
+  branchReason = "",
+  titleGenerationPending = false,
+  firstQuestion = "",
+  firstQuestionHasImages = false,
+} = {}) {
+  return {
+    conversationId,
+    title,
+    titleSource,
+    titleGenerationPending,
+    titleGenerationStarted: false,
+    firstQuestion,
+    firstQuestionHasImages,
+    createdAt,
+    sessionId,
+    messages,
+    queue,
+    controller: null,
+    runId: "",
+    status,
+    currentStartedAt: 0,
+    currentTurn,
+    streamingMessage: null,
+    runtimeTrace: [],
+    interventionTrace: [],
+    modelNoticeCodes: [],
+    steeringPending: false,
+    pendingSteer: null,
+    steerAckTimer: 0,
+    agentPhase: "",
+    agentLifecycle: [],
+    piQueue: { steering: [], follow_up: [], pending_count: 0 },
+    lastAgentControl: null,
+    restartForSteer: false,
+    cancelRequested: false,
+    pauseRequested: false,
+    pausedMessage,
+    pausedTurn,
+    sessionStats: null,
+    persistChain: null,
+    branchId,
+    branchFromMessageId,
+    branchReason,
+  };
+}
+
 function syncActiveDirectChatState() {
   const job = directChatJob();
   if (job && !state.activeTaskId) {
@@ -5167,20 +5607,31 @@ function composerSendControlState() {
     }
   }
   if (composerSubmissionInFlight) return { state: "running", icon: "square", label: "暂停当前操作" };
-  return { state: "idle", icon: "send", label: "发送问题" };
+  return { state: "idle", icon: "send", label: selectedComposerImageModel() ? "生成图片" : "发送问题" };
 }
 
 function renderComposerSendButtons() {
   const control = composerSendControlState();
+  const imageMode = Boolean(selectedComposerImageModel());
+  const rename = byId("renameConversationButton");
+  if (rename) rename.hidden = Boolean(state.activeTaskId || !state.directConversationId || directChatJob());
   document.querySelectorAll("#homeAskForm, #chatAskForm").forEach((form) => {
+    form.classList.toggle("is-image-mode", imageMode);
     const button = form.querySelector("button[type='submit']");
     if (!button) return;
     button.dataset.composerState = control.state;
-    button.innerHTML = uiIcon(control.icon);
+    const imageSend = imageMode && control.state === "idle";
+    button.classList.toggle("is-image-send", imageSend);
+    button.innerHTML = imageSend ? "生成" : uiIcon(control.icon);
     button.setAttribute("aria-label", control.label);
     button.setAttribute("title", control.label);
     button.setAttribute("aria-busy", String(control.state === "pausing"));
     button.disabled = control.state === "pausing";
+    const input = form.querySelector("textarea");
+    if (input && input.offsetParent) {
+      input.style.height = "auto";
+      input.style.height = `${Math.min(input.scrollHeight, 200)}px`;
+    }
   });
 }
 
@@ -5204,6 +5655,7 @@ function directTurnConfiguration({
     question: String(question || "").trim(),
     key: key === "home" ? "home" : "chat",
     directChatMode,
+    imageModel: selectedComposerImageModel(),
     selectedSkillIds: [...selectedSkillIds],
     selectedSkills: [...selectedSkills],
     images: [...images],
@@ -5225,6 +5677,7 @@ function generalPreferences() {
   const source = state.settings?.general || {};
   const conversation = source.conversation && typeof source.conversation === "object" ? source.conversation : {};
   const directories = source.directories && typeof source.directories === "object" ? source.directories : {};
+  const updates = source.updates && typeof source.updates === "object" ? source.updates : {};
   return {
     conversation: {
       send_shortcut: conversation.send_shortcut === "shift-enter" ? "shift-enter" : "enter",
@@ -5238,6 +5691,9 @@ function generalPreferences() {
       model_cache: String(directories.model_cache || "").trim(),
       local_runtime: String(directories.local_runtime || "").trim(),
       vector_index: String(directories.vector_index || "").trim(),
+    },
+    updates: {
+      auto_check: updates.auto_check !== false,
     },
   };
 }
@@ -5275,12 +5731,53 @@ function directJobSummary(job) {
     updated_at: new Date().toISOString(),
     message_count: job.messages.filter((message) => !message.streaming).length,
     session_id: job.sessionId || "",
+    title_source: job.titleSource || "provisional",
+    status: job.status || "completed",
+    queue_count: Array.isArray(job.queue) ? job.queue.length : 0,
   };
 }
 
 function directConversationTitle(messages = state.directMessages) {
   const firstUser = (messages || []).find((message) => message?.role === "user" && String(message.content || "").trim());
-  return compact(String(firstUser?.content || "直接对话").split(/\r?\n/, 1)[0], 120);
+  const firstLine = String(firstUser?.content || "直接对话").split(/\r?\n/, 1)[0];
+  const firstClause = firstLine.split(/[。！？!?；;]/, 1)[0];
+  return compact(firstClause || firstLine || "直接对话", 24);
+}
+
+function ensureDirectMessageIds(messages, conversationId) {
+  return (Array.isArray(messages) ? messages : []).map((message, index) => {
+    if (String(message?.message_id || "").trim()) return message;
+    const role = String(message?.role || "message");
+    return {
+      ...message,
+      message_id: `${conversationId || "direct"}-legacy-${index + 1}-${role}`,
+    };
+  });
+}
+
+function persistedDirectTurn(raw) {
+  if (!raw || typeof raw !== "object" || !String(raw.question || "").trim()) return null;
+  return {
+    queueId: String(raw.queueId || (globalThis.crypto?.randomUUID?.() || `turn-${Date.now()}-${Math.random().toString(16).slice(2)}`)),
+    question: String(raw.question || "").trim(),
+    key: raw.key === "home" ? "home" : "chat",
+    directChatMode: String(raw.directChatMode || "general"),
+    imageModel: raw.imageModel || null,
+    selectedSkillIds: Array.isArray(raw.selectedSkillIds) ? raw.selectedSkillIds : [],
+    selectedSkills: Array.isArray(raw.selectedSkills) ? raw.selectedSkills : [],
+    images: Array.isArray(raw.images) ? raw.images : [],
+    audio: Array.isArray(raw.audio) ? raw.audio : [],
+    sourceFiles: Array.isArray(raw.sourceFiles) ? raw.sourceFiles : [],
+    knowledgeScopes: Array.isArray(raw.knowledgeScopes) ? raw.knowledgeScopes : [],
+    notebookId: String(raw.notebookId || ""),
+    notebookIds: Array.isArray(raw.notebookIds) ? raw.notebookIds : [],
+    knowledgeScope: raw.knowledgeScope || null,
+    knowledgeScopePayloads: Array.isArray(raw.knowledgeScopePayloads) ? raw.knowledgeScopePayloads : [],
+    thinkingLevel: String(raw.thinkingLevel || currentThinkingLevel()),
+    webSearch: Boolean(raw.webSearch),
+    deliveryMode: raw.deliveryMode === "steer" ? "steer" : "follow-up",
+    createdAt: String(raw.createdAt || new Date().toISOString()),
+  };
 }
 
 function directHistoryMessage(message) {
@@ -5299,6 +5796,7 @@ function directHistoryMessage(message) {
   }
   if (Array.isArray(copy.audio)) {
     copy.audio = copy.audio.map((audio) => ({
+      ...(audio?.id ? { id: audio.id } : {}),
       name: audio?.name || "语音",
       ...(audio?.mime_type ? { mime_type: audio.mime_type } : {}),
       ...(audio?.size ? { size: audio.size } : {}),
@@ -5312,6 +5810,10 @@ function directHistoryMessage(message) {
       ...(source?.doc_id ? { doc_id: source.doc_id } : {}),
       ...(source?.doi ? { doi: source.doi } : {}),
       ...(source?.file_url ? { file_url: source.file_url } : {}),
+      ...(source?.job_id ? { job_id: source.job_id } : {}),
+      ...(source?.source_id ? { source_id: source.source_id } : {}),
+      ...(source?.suffix ? { suffix: source.suffix } : {}),
+      ...(source?.size ? { size: source.size } : {}),
     }));
   }
   return copy;
@@ -5330,7 +5832,10 @@ function upsertDirectConversation(record) {
     updated_at: String(record.updated_at || new Date().toISOString()),
     message_count: Number(record.message_count || messages.length || 0),
     session_id: String(record.session_id || ""),
+    title_source: String(record.title_source || ""),
     model: record.model || null,
+    status: String(record.status || "completed"),
+    queue_count: Math.max(0, Number(record.queue_count || 0)),
   };
   state.directConversations = [
     summary,
@@ -5344,9 +5849,16 @@ async function persistDirectConversationSnapshot({
   messages: sourceMessages = state.directMessages,
   sessionId = state.sessionId,
   title = "",
+  titleSource = "",
+  queue = [],
+  status = "completed",
+  currentTurn = null,
+  branchId = "",
+  branchFromMessageId = "",
+  branchReason = "",
 } = {}) {
   const messages = sourceMessages
-    .filter((message) => message && !message.streaming)
+    .filter((message) => message && (!message.streaming || message.artifacts?.length))
     .map(directHistoryMessage);
   if (!messages.length) return null;
   const id = String(conversationId || newDirectConversationId());
@@ -5356,8 +5868,15 @@ async function persistDirectConversationSnapshot({
     body: JSON.stringify({
       conversation_id: id,
       title: title || directConversationTitle(messages),
+      title_source: titleSource || "",
       session_id: sessionId || "",
       messages,
+      queue,
+      status,
+      current_turn: currentTurn,
+      branch_id: branchId,
+      branch_from_message_id: branchFromMessageId,
+      branch_reason: branchReason,
     }),
   });
   upsertDirectConversation(saved);
@@ -5369,12 +5888,79 @@ async function persistDirectConversation() {
 }
 
 function persistDirectChatJob(job) {
-  return persistDirectConversationSnapshot({
+  const snapshot = {
     conversationId: job.conversationId,
-    messages: job.messages,
+    messages: [...job.messages],
     sessionId: job.sessionId,
     title: job.title,
+    titleSource: job.titleSource || "provisional",
+    queue: job.queue.map((turn) => ({ ...turn })),
+    status: job.status,
+    currentTurn: job.currentTurn ? { ...job.currentTurn } : job.pausedTurn ? { ...job.pausedTurn } : null,
+    branchId: job.branchId,
+    branchFromMessageId: job.branchFromMessageId,
+    branchReason: job.branchReason,
+  };
+  const pending = (job.persistChain || Promise.resolve())
+    .catch(() => {})
+    .then(() => persistDirectConversationSnapshot(snapshot));
+  job.persistChain = pending;
+  return pending;
+}
+
+async function stageDirectTurnAttachments(turn) {
+  if (!turn) return turn;
+  const hasAttachments = turn.images.length || turn.audio.length || turn.sourceFiles.length;
+  if (!hasAttachments) return turn;
+  const staged = await request("/api/chat/attachments/stage", {
+    method: "POST",
+    body: JSON.stringify({
+      images: turn.images,
+      audio: turn.audio,
+      source_files: turn.sourceFiles,
+    }),
   });
+  turn.images = Array.isArray(staged.images) ? staged.images : [];
+  turn.audio = Array.isArray(staged.audio) ? staged.audio : [];
+  turn.sourceFiles = Array.isArray(staged.source_files) ? staged.source_files : [];
+  return turn;
+}
+
+async function generateDirectConversationTitle(job, firstQuestion, hasImages = false) {
+  if (!job || job.titleGenerationStarted || job.titleSource === "user") return;
+  if (!String(firstQuestion || "").trim() && !hasImages) return;
+  job.titleGenerationStarted = true;
+  try {
+    const result = await request("/api/chat/title", {
+      method: "POST",
+      body: JSON.stringify({
+        conversation_id: job.conversationId,
+        question: String(firstQuestion || ""),
+        has_images: Boolean(hasImages),
+      }),
+    });
+    const title = compact(String(result?.title || "").trim(), 120);
+    if (!title) return;
+    job.title = title;
+    job.titleSource = String(result?.source || "model");
+    upsertDirectConversation(directJobSummary(job));
+    if (String(state.directConversationId || "") === String(job.conversationId)) {
+      const heading = byId("conversationTitle");
+      if (heading) heading.textContent = compact(title, 80);
+    }
+    await request("/api/chat/history/" + encodeURIComponent(job.conversationId) + "/title", {
+      method: "POST",
+      body: JSON.stringify({
+        title,
+        title_source: job.titleSource,
+      }),
+    });
+  } catch (error) {
+    // The provisional first-line title remains useful when the naming call is
+    // unavailable. A title request must never turn a completed chat into an
+    // error state.
+    console.warn("Direct conversation title generation was unavailable", error);
+  }
 }
 
 function queueDirectChatTurn(job, turn, { front = false, announce = true } = {}) {
@@ -5385,6 +5971,50 @@ function queueDirectChatTurn(job, turn, { front = false, announce = true } = {})
   if (announce) toast(`已加入后续队列（${job.queue.length}）`);
   renderDirectLiveControls();
   renderTasks();
+  persistDirectChatJob(job).catch((error) => console.warn("Direct chat queue could not be saved", error));
+}
+
+function beginEditingQueuedDirectTurn(queueId) {
+  const job = directChatJob();
+  const id = String(queueId || "");
+  const turn = job?.queue.find((item) => item.queueId === id);
+  if (!job || !turn) return;
+  directQueueEdit = { conversationId: job.conversationId, queueId: id, value: String(turn.question || "") };
+  renderDirectLiveControls();
+  window.setTimeout(() => {
+    const input = document.querySelector("[data-queue-edit-input]");
+    input?.focus({ preventScroll: true });
+    input?.select();
+  }, 0);
+}
+
+function cancelEditingQueuedDirectTurn() {
+  if (!directQueueEdit) return;
+  directQueueEdit = null;
+  renderDirectLiveControls();
+}
+
+function saveEditingQueuedDirectTurn() {
+  const edit = directQueueEdit;
+  if (!edit) return;
+  const job = directChatJobs.get(edit.conversationId);
+  const turn = job?.queue.find((item) => item.queueId === edit.queueId);
+  const question = String(edit.value || "").trim();
+  if (!job || !turn) {
+    directQueueEdit = null;
+    renderDirectLiveControls();
+    return;
+  }
+  if (!question) {
+    toast("队列消息不能为空", true);
+    return;
+  }
+  turn.question = question;
+  directQueueEdit = null;
+  toast("队列消息已修改");
+  renderDirectLiveControls();
+  renderTasks();
+  persistDirectChatJob(job).catch((error) => console.warn("Edited direct chat queue could not be saved", error));
 }
 
 async function steerDirectChat(job, turn) {
@@ -5449,37 +6079,32 @@ async function submitToRunningDirectChat(job, turn, input) {
 
 function beginDirectChatJob(turn) {
   const conversationId = String(state.directConversationId || newDirectConversationId());
-  const existingMessages = state.directMessages.filter((message) => message && !message.streaming).slice(-16);
-  const title = directConversationTitle([...existingMessages, { role: "user", content: turn.question }]);
-  const job = {
+  const existingMessages = ensureDirectMessageIds(
+    state.directMessages.filter((message) => message && !message.streaming),
+    conversationId,
+  );
+  const hasExistingUserMessage = existingMessages.some((message) => message?.role === "user");
+  const existingConversation = state.directConversations.find((item) => item.conversation_id === conversationId) || null;
+  const titleGenerationPending = !turn.imageModel && !hasExistingUserMessage && !existingConversation && !turn.branchId;
+  const title = String(
+    existingConversation?.title
+      || directConversationTitle([...existingMessages, { role: "user", content: turn.question }]),
+  );
+  const job = createDirectChatJobState({
     conversationId,
     title,
+    titleSource: String(existingConversation?.title_source || "provisional"),
     createdAt: new Date().toISOString(),
     sessionId: state.sessionId || "",
     messages: existingMessages,
-    queue: [],
-    controller: null,
-    runId: "",
     status: "starting",
-    currentStartedAt: 0,
-    currentTurn: null,
-    streamingMessage: null,
-    runtimeTrace: [],
-    interventionTrace: [],
-    steeringPending: false,
-    pendingSteer: null,
-    steerAckTimer: 0,
-    agentPhase: "",
-    agentLifecycle: [],
-    piQueue: { steering: [], follow_up: [], pending_count: 0 },
-    lastAgentControl: null,
-    restartForSteer: false,
-    cancelRequested: false,
-    pauseRequested: false,
-    pausedMessage: null,
-    pausedTurn: null,
-    sessionStats: null,
-  };
+    branchId: String(turn.branchId || ""),
+    branchFromMessageId: String(turn.branchFromMessageId || ""),
+    branchReason: String(turn.branchReason || ""),
+    titleGenerationPending,
+    firstQuestion: titleGenerationPending ? String(turn.question || "") : "",
+    firstQuestionHasImages: titleGenerationPending && Array.isArray(turn.images) && turn.images.length > 0,
+  });
   directChatJobs.set(conversationId, job);
   state.directConversationId = conversationId;
   state.activeTaskId = "";
@@ -5491,6 +6116,46 @@ function beginDirectChatJob(turn) {
   return job;
 }
 
+function restoreDirectChatJob(conversation) {
+  const conversationId = String(conversation?.conversation_id || "").trim();
+  if (!conversationId) return null;
+  const existing = directChatJob(conversationId);
+  if (existing) return existing;
+  const queue = (Array.isArray(conversation.queue) ? conversation.queue : [])
+    .map(persistedDirectTurn)
+    .filter(Boolean);
+  const currentTurn = persistedDirectTurn(conversation.current_turn);
+  const recoverable = ["starting", "running", "retrying", "queued", "paused", "interrupted"].includes(
+    String(conversation.status || ""),
+  );
+  if (!recoverable && !queue.length) return null;
+  const pausedTurn = currentTurn || queue.shift() || null;
+  if (!pausedTurn) return null;
+  const messages = ensureDirectMessageIds(
+    (Array.isArray(conversation.messages) ? conversation.messages : []).filter((message) => message && !message.streaming),
+    conversationId,
+  );
+  const pausedMessage = currentTurn
+    ? [...messages].reverse().find((message) => message?.role === "assistant" && message?.paused) || null
+    : null;
+  const job = createDirectChatJobState({
+    conversationId,
+    title: String(conversation.title || directConversationTitle(messages)),
+    titleSource: String(conversation.title_source || "provisional"),
+    createdAt: String(conversation.created_at || new Date().toISOString()),
+    sessionId: String(conversation.session_id || ""),
+    messages,
+    queue,
+    status: "paused",
+    currentTurn: pausedTurn,
+    pausedTurn,
+    pausedMessage,
+  });
+  directChatJobs.set(conversationId, job);
+  upsertDirectConversation(directJobSummary(job));
+  return job;
+}
+
 async function runDirectChatTurn(job, turn) {
   if (!job || job.cancelRequested || job.pauseRequested || !turn?.question) return;
   job.status = "starting";
@@ -5498,6 +6163,7 @@ async function runDirectChatTurn(job, turn) {
   job.runId = "";
   job.runtimeTrace = [];
   job.interventionTrace = [];
+  job.modelNoticeCodes = [];
   window.clearTimeout(job.steerAckTimer);
   job.steerAckTimer = 0;
   job.pendingSteer = null;
@@ -5506,18 +6172,27 @@ async function runDirectChatTurn(job, turn) {
   job.agentLifecycle = [];
   job.piQueue = { steering: [], follow_up: [], pending_count: 0 };
   job.lastAgentControl = null;
+  const priorMessages = job.messages.filter((message) => !message.streaming);
+  const parentMessage = priorMessages[priorMessages.length - 1] || null;
   const userMessage = {
+    message_id: turn.queueId,
+    ...(parentMessage?.message_id ? { parent_message_id: parentMessage.message_id } : {}),
     role: "user",
     content: turn.question,
+    mode: turn.directChatMode,
+    image_model: turn.imageModel || null,
+    knowledgeScopes: turn.knowledgeScopes,
     skills: turn.selectedSkills,
     sources: turn.sourceFiles,
     images: turn.images,
     audio: turn.audio,
     created_at: turn.createdAt || new Date().toISOString(),
   };
-  const promptMessages = [...job.messages.filter((message) => !message.streaming), userMessage].slice(-16);
+  const promptMessages = [...priorMessages, userMessage];
   const startedAt = performance.now();
   const streamingMessage = {
+    message_id: `assistant-${turn.queueId}`,
+    parent_message_id: userMessage.message_id,
     role: "assistant",
     content: "",
     streaming: true,
@@ -5525,12 +6200,12 @@ async function runDirectChatTurn(job, turn) {
     mode: turn.directChatMode,
     trace: [],
     knowledgeScopes: turn.knowledgeScopes,
-    model: modelIdentitySnapshot(),
+    model: modelIdentitySnapshot(turn.imageModel),
     created_at: new Date().toISOString(),
   };
   job.currentStartedAt = startedAt;
   job.streamingMessage = streamingMessage;
-  job.messages = [...promptMessages, streamingMessage].slice(-16);
+  job.messages = [...promptMessages, streamingMessage];
   job.controller = new AbortController();
   job.status = "running";
   if (job.conversationId === state.directConversationId && !state.activeTaskId) {
@@ -5552,6 +6227,7 @@ async function runDirectChatTurn(job, turn) {
         source_files: turn.sourceFiles,
         thinking_level: turn.thinkingLevel,
         chat_mode: turn.directChatMode,
+        ...(turn.imageModel ? { image_model: turn.imageModel, image_request_id: turn.queueId } : {}),
         web_search: turn.webSearch,
         ...(turn.notebookId ? { notebook_id: turn.notebookId } : {}),
         ...(turn.notebookIds.length ? { notebook_ids: turn.notebookIds } : {}),
@@ -5559,6 +6235,7 @@ async function runDirectChatTurn(job, turn) {
         ...(turn.knowledgeScopePayloads.length ? { knowledge_scopes: turn.knowledgeScopePayloads } : {}),
         conversation_id: job.conversationId,
         session_id: job.sessionId || "",
+        pi_session_id: job.sessionId || "",
         skills: turn.selectedSkillIds,
       },
       (eventType, payload) => {
@@ -5572,6 +6249,50 @@ async function runDirectChatTurn(job, turn) {
         if (eventType === "delta" || eventType === "TEXT_MESSAGE_CONTENT") {
           streamingMessage.content += String(payload.content || payload.delta || "");
           scheduleDirectConversationRender(job.conversationId);
+          return;
+        }
+        if (
+          eventType === "retry"
+          || (eventType === "status" && String(payload.subtype || "") === "retry")
+        ) {
+          const attempt = Number(payload.attempt || 0);
+          const delaySeconds = Math.max(
+            0,
+            Number(payload.delay_seconds || 0) || Number(payload.delay_ms || 0) / 1000,
+          );
+          job.status = "retrying";
+          job.agentPhase = attempt ? `正在恢复模型连接（第 ${attempt} 次）` : "正在恢复模型连接";
+          job.runtimeTrace = [
+            ...job.runtimeTrace.filter((item) => item.status !== "retrying"),
+            {
+              title: "正在恢复模型连接",
+              detail: delaySeconds > 0
+                ? `服务暂时拥堵，${delaySeconds.toFixed(0)} 秒后自动重试。`
+                : "服务暂时拥堵，正在自动重试。",
+              status: "retrying",
+            },
+          ].slice(-8);
+          streamingMessage.trace = [...job.runtimeTrace, ...job.interventionTrace];
+          scheduleDirectConversationRender(job.conversationId, { forceFollow: true });
+          renderDirectLiveControls();
+          return;
+        }
+        if (eventType === "compatibility.fallback" || eventType === "model.fallback") {
+          const toModel = String(payload.to_model_name || payload.to_model || "").trim();
+          job.agentPhase = toModel ? `正在切换到 ${toModel}` : "正在切换可用模型通道";
+          job.runtimeTrace = [
+            ...job.runtimeTrace,
+            {
+              title: eventType === "model.fallback" ? "正在切换模型" : "正在切换兼容通道",
+              detail: toModel
+                ? `当前模型暂时不可用，ScanSci 正在尝试 ${toModel}。`
+                : "当前模型协议或连接暂时不可用，ScanSci 正在尝试有界回退。",
+              status: "retrying",
+            },
+          ].slice(-8);
+          streamingMessage.trace = [...job.runtimeTrace, ...job.interventionTrace];
+          scheduleDirectConversationRender(job.conversationId, { forceFollow: true });
+          renderDirectLiveControls();
           return;
         }
         if (eventType === "session") {
@@ -5594,6 +6315,17 @@ async function runDirectChatTurn(job, turn) {
         if (eventType === "CUSTOM" && payload.name === "session_stats") {
           job.sessionStats = payload.value || {};
           if (job.conversationId === state.directConversationId) updateSessionStats(job.sessionStats);
+          return;
+        }
+        if (eventType === "CUSTOM" && payload.name === "model_notice") {
+          const notice = payload.value && typeof payload.value === "object" ? payload.value : {};
+          const code = String(notice.code || "model-advisory");
+          if (!Array.isArray(job.modelNoticeCodes)) job.modelNoticeCodes = [];
+          if (!job.modelNoticeCodes.includes(code)) {
+            job.modelNoticeCodes.push(code);
+            const message = String(notice.message || "当前模型有已知能力边界，请核对最终结果。");
+            toast(`模型提示：${message}`);
+          }
           return;
         }
         if (eventType === "CUSTOM" && payload.name === "agent_lifecycle") {
@@ -5631,6 +6363,15 @@ async function runDirectChatTurn(job, turn) {
           renderDirectLiveControls();
           return;
         }
+        if (eventType === "CUSTOM" && payload.name === "generated_image") {
+          const artifact = payload.value;
+          if (artifact?.artifact_type === "image" && generatedImageArtifactsMarkup([artifact])) {
+            streamingMessage.artifacts = [...(streamingMessage.artifacts || []), artifact];
+            scheduleDirectConversationRender(job.conversationId);
+            persistDirectChatJob(job).catch((error) => console.warn("Generated image history could not be saved", error));
+          }
+          return;
+        }
         if (eventType === "CUSTOM" && payload.name === "process_trace") {
           job.runtimeTrace = Array.isArray(payload.value) ? payload.value : [];
           streamingMessage.trace = [...job.runtimeTrace, ...job.interventionTrace];
@@ -5647,11 +6388,14 @@ async function runDirectChatTurn(job, turn) {
           if (Array.isArray(result.user_images)) userMessage.images = result.user_images;
           const message = {
             ...result.message,
+            message_id: result.message?.message_id || streamingMessage.message_id,
+            parent_message_id: result.message?.parent_message_id || userMessage.message_id,
             model: modelIdentitySnapshot(result.model || result.message?.model || payload.model || streamingMessage.model),
             mode: turn.directChatMode,
             knowledgeScopes: turn.knowledgeScopes,
             agent_runtime: result.agent_runtime || null,
             usage: result.message?.usage || streamingMessage.usage,
+            artifacts: result.message?.artifacts || streamingMessage.artifacts,
             trace: result.message?.trace || streamingMessage.trace,
             created_at: result.message?.created_at || new Date().toISOString(),
             processing_ms: Math.max(0, Math.round(performance.now() - startedAt)),
@@ -5687,6 +6431,9 @@ async function runDirectChatTurn(job, turn) {
     );
     if (!completed) throw new Error("模型流在最终回复到达前结束。");
   } catch (error) {
+    if (Array.isArray(error?.userImages) && error.userImages.length) {
+      userMessage.images = error.userImages;
+    }
     const restartingForSteer = error?.name === "AbortError" && job.restartForSteer;
     job.restartForSteer = false;
     streamingMessage.streaming = false;
@@ -5696,7 +6443,8 @@ async function runDirectChatTurn(job, turn) {
     if (restartingForSteer && !streamingMessage.content.trim()) {
       job.messages = job.messages.filter((message) => message !== streamingMessage);
     }
-    if (job.conversationId === state.directConversationId && error?.name !== "AbortError") toast(error.message, true);
+    // The inline failure card is the durable, actionable error surface. A
+    // second red toast repeats the same message and obscures the composer.
     scheduleDirectConversationRender(job.conversationId);
   } finally {
     const paused = Boolean(job.pauseRequested);
@@ -5716,11 +6464,34 @@ async function runDirectChatTurn(job, turn) {
       job.streamingMessage = null;
       job.currentTurn = null;
     }
+    if (!paused && job.pendingSteer) {
+      const unacknowledgedTurn = job.pendingSteer;
+      window.clearTimeout(job.steerAckTimer);
+      job.steerAckTimer = 0;
+      job.pendingSteer = null;
+      job.steeringPending = false;
+      job.queue.unshift(unacknowledgedTurn);
+      toast("调整未在本轮结束前获得确认，已作为下一条消息继续。", true);
+    }
+    if (!paused && job.cancelRequested) job.queue = [];
+    if (!paused) {
+      job.status = job.cancelRequested
+        ? "cancelled"
+        : job.queue.length
+        ? "queued"
+        : completed
+        ? "completed"
+        : "failed";
+    }
     try {
       await persistDirectChatJob(job);
     } catch (error) {
       console.warn("Direct conversation history could not be saved", error);
       if (job.conversationId === state.directConversationId) toast("回复已保留，但历史保存失败；请稍后重试。", true);
+    }
+    if (!paused && job.titleGenerationPending && (completed || !job.cancelRequested)) {
+      job.titleGenerationPending = false;
+      void generateDirectConversationTitle(job, job.firstQuestion, job.firstQuestionHasImages);
     }
     if (paused) {
       scheduleDirectConversationRender(job.conversationId);
@@ -5728,23 +6499,11 @@ async function runDirectChatTurn(job, turn) {
       renderTasks();
       return;
     }
-    if (job.pendingSteer) {
-      const unacknowledgedTurn = job.pendingSteer;
-      window.clearTimeout(job.steerAckTimer);
-      job.steerAckTimer = 0;
-      job.pendingSteer = null;
-      job.steeringPending = false;
-      queueDirectChatTurn(job, unacknowledgedTurn, { front: true, announce: false });
-      toast("调整未在本轮结束前获得确认，已作为下一条消息继续。", true);
-    }
-    if (job.cancelRequested) job.queue = [];
     const nextTurn = job.queue.shift() || null;
     if (nextTurn && !job.cancelRequested) {
-      job.status = "queued";
       scheduleDirectConversationRender(job.conversationId);
       window.setTimeout(() => { void runDirectChatTurn(job, nextTurn); }, 0);
     } else {
-      job.status = "completed";
       directChatJobs.delete(job.conversationId);
       scheduleDirectConversationRender(job.conversationId);
     }
@@ -5773,7 +6532,10 @@ async function resumeDirectChatJob(conversationId = state.directConversationId) 
   if (!job || job.status !== "paused" || !job.pausedTurn) return;
   const turn = job.pausedTurn;
   const pausedMessage = job.pausedMessage;
-  const userMessage = [...job.messages].reverse().find((message) => message.role === "user" && message.created_at === turn.createdAt);
+  const userMessage = [...job.messages].reverse().find((message) => (
+    message.role === "user"
+    && (message.message_id === turn.queueId || message.created_at === turn.createdAt)
+  ));
   job.messages = job.messages.filter((message) => message !== pausedMessage && message !== userMessage);
   job.pausedMessage = null;
   job.pausedTurn = null;
@@ -5905,10 +6667,10 @@ async function legacyAskQuestion(event, inputId) {
   try {
     if (isDirectConversation) {
       const userMessage = { role: "user", content: question, images, audio, created_at: new Date().toISOString() };
-      const messages = [...state.directMessages, userMessage].slice(-16);
+      const messages = [...state.directMessages, userMessage];
       const startedAt = performance.now();
       streamingMessage = { role: "assistant", content: "", streaming: true, processing_started_at: startedAt, model: modelIdentitySnapshot(), created_at: new Date().toISOString() };
-      state.directMessages = [...messages, streamingMessage].slice(-16);
+      state.directMessages = [...messages, streamingMessage];
       renderDirectConversation();
       let completed = false;
       await streamChatWithRecovery({ messages, audio, thinking_level: currentThinkingLevel(), web_search: state.webSearchMode }, (eventType, event) => {
@@ -6013,7 +6775,6 @@ async function legacyAskQuestion(event, inputId) {
       streamingMessage.error = error.message;
       streamingMessage.failure = error.failure || null;
       renderDirectConversation();
-      toast(error.message, true);
     } else {
       byId("answerArea").innerHTML = `<div class="error-state">${escapeHtml(error.message)}</div>`;
     }
@@ -6066,7 +6827,8 @@ async function askQuestion(event, inputId) {
   const key = composerKey(inputId);
   const selectedSkillIds = composerSkillIds(key, input.value);
   const selectedSkills = skillRecordsForIds(selectedSkillIds);
-  const selectedMode = composerMode(inputId);
+  const imageSelection = inputId === "reviewQuestionInput" ? null : selectedComposerImageModel();
+  const selectedMode = imageSelection ? "general" : composerMode(inputId);
   const images = imagePayloadForComposer(key);
   const audio = audioPayloadForComposer(key);
   if (state.composerRecordings[key]) {
@@ -6075,6 +6837,18 @@ async function askQuestion(event, inputId) {
   }
   const sourceFiles = sourcePayloadForComposer(key);
   const activeRun = state.runs.find((item) => item.run_id === state.activeTaskId);
+  if (imageSelection) {
+    const provider = state.settings?.providers?.find(p => p.id === imageSelection.provider_id);
+    const model = provider?.models?.find(m => m.id === imageSelection.model_id);
+    if (!model?.capabilities?.includes("image") || !composerModelAvailability(model, provider).selectable) {
+      toast("所选生图模型尚不可用，请重新选择或检查模型服务配置。", true);
+      return;
+    }
+    if (images.length || sourceFiles.length || audio.length) {
+      toast("当前生图入口使用文字描述；请移除附件后发送。", true);
+      return;
+    }
+  }
   // The selected historical task is the source of truth.  `activeView` can
   // briefly be `home` during navigation/refresh even though the task id is
   // already restored, which previously routed a follow-up to a brand-new
@@ -6088,13 +6862,31 @@ async function askQuestion(event, inputId) {
       : `请阅读《${sourceFiles[0].name}》并概括最重要的信息。`
     : images.length ? "请分析我粘贴的图片。" : audio.length ? "请根据我上传的语音回答。" : "");
   if (!question) return;
+  if (inputId === "homeQuestionInput" && state.onboardingOpen && state.onboardingMode === "welcome") {
+    await finishFirstRun("已开始研究", { focusComposer: false });
+  }
   let mode = ["research", "academic"].includes(selectedMode) ? resolveResearchComposerMode(question) : selectedMode;
 
   // An open historical task is a chat thread. Composer modes only affect new
-  // tasks; changing the mode must never fork an already-open conversation.
-  const isTaskFollowUp = isTaskConversation;
+  // tasks; a pure greeting after a finished evidence task is the small
+  // exception so it can receive a normal conversational reply.
+  const taskIsFinished = !activeRun || ["completed", "failed", "cancelled", "paused"].includes(String(activeRun.status || ""));
+  let isTaskFollowUp = isTaskConversation;
+  const casualKnowledgeMessage = mode === "knowledge"
+    && taskIsFinished
+    && !images.length
+    && !sourceFiles.length
+    && !audio.length
+    && isCasualConversationMessage(question);
+  if (casualKnowledgeMessage) {
+    mode = "general";
+  }
+  isTaskFollowUp = isTaskFollowUp && !casualKnowledgeMessage;
   const isLikelyDirectConversation = !isTaskFollowUp && !state.notebook && ["general", "writing"].includes(selectedMode);
   const activeConversationJob = !isTaskFollowUp ? directChatJob() : null;
+  const hasExistingDirectHistory = isLikelyDirectConversation && state.directMessages.some(
+    (message) => message?.role === "user" && String(message.content || "").trim(),
+  );
   if (isLikelyDirectConversation && composerSubmissionInFlight) {
     toast("这条消息正在提交，请稍候。", true);
     return;
@@ -6109,16 +6901,16 @@ async function askQuestion(event, inputId) {
   composerSubmissionInFlight = true;
   renderComposerSendButtons();
   const isReviewWorkflow = inputId === "reviewQuestionInput";
-  const selectedKnowledge = selectedKnowledgeNotebooks();
+  const selectedKnowledge = imageSelection ? [] : selectedKnowledgeNotebooks();
   const searchableKnowledgeSelected = selectedKnowledge.some((notebook) => Number(notebook.counts?.sources || 0) > 0);
-  const writingArtifactRoute = !isTaskFollowUp && !isReviewWorkflow && !images.length && !sourceFiles.length && !audio.length
+  const writingArtifactRoute = !imageSelection && !isTaskFollowUp && !isReviewWorkflow && !images.length && !sourceFiles.length && !audio.length
     ? academicWritingArtifactRoute(mode, question, { searchableKnowledgeSelected })
     : null;
   let routedTask = null;
   // General input stays general by default.  For an explicit, multi-step
   // product request the host may offer a durable route; the server repeats
   // this decision when creating the run, so this preview is never authority.
-  if (selectedMode === "general" && !activeConversationJob && !isTaskFollowUp && !isReviewWorkflow && !images.length && !sourceFiles.length && !audio.length) {
+  if (!imageSelection && selectedMode === "general" && !activeConversationJob && !hasExistingDirectHistory && !isTaskFollowUp && !isReviewWorkflow && !images.length && !sourceFiles.length && !audio.length) {
     try {
       const decision = await previewFreeformTask(question, selectedSkillIds);
       if (decision?.route === "durable_run" && decision?.workflow_type) {
@@ -6131,7 +6923,7 @@ async function askQuestion(event, inputId) {
     }
   }
   const isDirectConversation = !isReviewWorkflow && !routedTask && !writingArtifactRoute && (mode === "general" || mode === "writing");
-  const directChatMode = isDirectConversation && searchableKnowledgeSelected ? "knowledge" : mode;
+  const directChatMode = isDirectConversation && searchableKnowledgeSelected && !casualKnowledgeMessage ? "knowledge" : mode;
   const isStandaloneSlides = mode === "slides" && sourceFiles.length > 0;
   if (mode === "knowledge" && !selectedKnowledge.length && !isTaskFollowUp) {
     composerSubmissionInFlight = false;
@@ -6193,6 +6985,16 @@ async function askQuestion(event, inputId) {
         sourceFiles,
       })
     : null;
+  if (directTurn) {
+    try {
+      await stageDirectTurnAttachments(directTurn);
+    } catch (error) {
+      composerSubmissionInFlight = false;
+      renderComposerSendButtons();
+      toast(`附件暂存失败：${error.message}`, true);
+      return;
+    }
+  }
   if (isDirectConversation && activeConversationJob) {
     composerSubmissionInFlight = false;
     await submitToRunningDirectChat(activeConversationJob, directTurn, input);
@@ -6207,7 +7009,14 @@ async function askQuestion(event, inputId) {
   const plannedResearchDocument = ["literature_review", "deep_research"].includes(plannedWorkflowType);
   button.disabled = true;
   let streamingMessage = null;
-  byId("conversationTitle").textContent = compact(question, 80);
+  const hasDirectUserHistory = isDirectConversation && state.directMessages.some(
+    (message) => message?.role === "user" && String(message.content || "").trim(),
+  );
+  if (!isDirectConversation || !hasDirectUserHistory) {
+    byId("conversationTitle").textContent = isDirectConversation
+      ? compact(directConversationTitle([...state.directMessages, { role: "user", content: question }]), 80)
+      : compact(question, 80);
+  }
   if (!isTaskFollowUp) state.reviewDocumentOpen = false;
   applyContextPanelPreset(directChatMode === "knowledge" ? "knowledge" : "none");
   setView("conversation");
@@ -6288,7 +7097,6 @@ async function askQuestion(event, inputId) {
     }
     if (isTaskFollowUp && activeRun) {
       renderFailedTaskFollowUp(activeRun, question, error, selectedSkills);
-      toast(error.message, true);
     } else if (isDirectConversation && streamingMessage) {
       streamingMessage.streaming = false;
       // Keep any partial provider output, but do not present a fake answer
@@ -6298,7 +7106,6 @@ async function askQuestion(event, inputId) {
       streamingMessage.failure = error.failure || null;
       renderDirectConversation();
       persistDirectConversation().catch((historyError) => console.warn("Failed to save failed direct conversation", historyError));
-      toast(error.message, true);
     } else {
       byId("answerArea").innerHTML = `<div class="error-state">${escapeHtml(error.message)}</div>`;
     }
@@ -6427,13 +7234,27 @@ function messageUsageMarkup(role, content, usage, promptContent = "") {
   return `<p class="message-usage">Tokens: ${formatTokenCount(total)}${detail}</p>`;
 }
 
-function messageFooterMarkup(content, usageMarkup, isUser) {
+function messageFooterMarkup(content, usageMarkup, isUser, {
+  editable = false,
+  editing = false,
+  messageIndex = "",
+} = {}) {
   const copyText = String(content || "");
-  const copyAction = copyText.trim()
-    ? `<div class="message-hover-actions"><button type="button" class="message-copy-button" data-action="copy-conversation-message" data-copy-text="${escapeHtml(copyText)}" aria-label="复制消息" title="复制消息">${uiIcon("copy")}</button></div>`
+  const copyButton = copyText.trim() && !editing
+    ? `<button type="button" class="message-copy-button" data-action="copy-conversation-message" data-copy-text="${escapeHtml(copyText)}" aria-label="复制消息" title="复制消息">${uiIcon("copy")}</button>`
     : "";
-  if (!copyAction && !usageMarkup) return "";
-  return `<footer class="message-footer">${isUser ? `${usageMarkup}${copyAction}` : `${copyAction}${usageMarkup}`}</footer>`;
+  const editButton = isUser && editable && !editing
+    ? `<button type="button" class="message-edit-button" data-action="edit-last-conversation-message" data-message-index="${escapeHtml(String(messageIndex))}" aria-label="编辑最后一条消息" title="编辑消息">${uiIcon("pen")}</button>`
+    : "";
+  const editActions = isUser && editable && editing
+    ? `<button type="button" class="message-edit-save" data-action="save-last-message-edit" aria-label="保存并重新生成" title="保存并重新生成">${uiIcon("check")}</button><button type="button" class="message-edit-cancel" data-action="cancel-last-message-edit" aria-label="取消编辑" title="取消编辑">${uiIcon("x")}</button>`
+    : "";
+  const actionButtons = editing ? editActions : `${copyButton}${editButton}`;
+  const actionMarkup = actionButtons
+    ? `<div class="message-hover-actions message-edit-actions" role="group" aria-label="消息操作">${actionButtons}</div>`
+    : "";
+  if (!actionMarkup && !usageMarkup) return "";
+  return `<footer class="message-footer">${isUser ? `${usageMarkup}${actionMarkup}` : `${actionMarkup}${usageMarkup}`}</footer>`;
 }
 
 function userAvatarMarkup() {
@@ -6453,6 +7274,10 @@ function conversationMessageMarkup({
   extra = "",
   classes = "",
   promptContent = "",
+  editable = false,
+  editing = false,
+  messageIndex = "",
+  imageReply = false,
 } = {}) {
   const isUser = role === "user";
   const identity = messageModelIdentity(model);
@@ -6460,24 +7285,111 @@ function conversationMessageMarkup({
     ? `<div class="user-turn-bubble"><p>${renderAssistantInline(content)}</p></div>`
     : `<div class="answer-sentence">${renderAssistantContent(content)}</div>`);
   const avatar = isUser ? userAvatarMarkup() : `<span class="message-avatar is-assistant">${providerLogo(identity.provider)}</span>`;
-  const name = isUser ? "你" : (identity.modelName ? `${identity.modelName} | ${identity.provider?.name || "ScanSci"}` : "ScanSci");
+  const modelName = String(identity.modelName || "").trim();
+  const providerName = String(identity.provider?.name || "").trim();
+  const name = isUser ? "你" : uniqueModelProviderLabel(modelName, providerName, " | ") || "ScanSci";
   const badge = label ? `<b>${escapeHtml(label)}</b>` : "";
   const time = `<time datetime="${escapeHtml(createdAt || "")}">${escapeHtml(formatMessageTime(createdAt))}</time>`;
   const usageMarkup = messageUsageMarkup(role, content, usage, promptContent);
-  const footer = messageFooterMarkup(content, usageMarkup, isUser);
+  const footer = messageFooterMarkup(imageReply && content === "图片已生成并保存。" ? "" : content, imageReply ? "" : usageMarkup, isUser, { editable, editing, messageIndex });
   return `<div class="conversation-message ${isUser ? "user-turn is-user" : "assistant-turn is-assistant"} ${escapeHtml(classes)}">${isUser ? "" : avatar}<div class="message-body"><header class="message-meta"><strong>${escapeHtml(name)}</strong>${badge}${time}</header>${processing}${body}${extra}${footer}</div>${isUser ? avatar : ""}</div>`;
 }
 
+function compactProcessTrace(message) {
+  const source = Array.isArray(message.trace) ? message.trace : [];
+  const unique = [];
+  const seen = new Set();
+  source.forEach((item) => {
+    if (!item || typeof item !== "object") return;
+    const rawTitle = String(item.title || "").trim();
+    const detail = String(item.detail || "").trim();
+    if (!rawTitle && !detail) return;
+    const title = rawTitle || "处理步骤";
+    const key = `${title}\n${detail}`;
+    if (seen.has(key)) return;
+    seen.add(key);
+    unique.push({ ...item, title: title || "处理步骤", detail });
+  });
+  return unique.slice(-8);
+}
+
 function processTraceMarkup(message, duration) {
-  const trace = Array.isArray(message.trace) ? message.trace : [];
+  const trace = compactProcessTrace(message);
+  const rawTraceCount = Array.isArray(message.trace) ? message.trace.length : trace.length;
   const live = Boolean(message.streaming && Number(message.processing_started_at || 0));
   if (!trace.length && !live && duration <= 0) return "";
   const liveDuration = live ? Math.max(0, performance.now() - Number(message.processing_started_at)) : duration;
+  const latest = trace.length ? trace[trace.length - 1] : null;
+  const phase = latest?.title ? escapeHtml(latest.title) : "";
+  const phasePrefix = phase ? `${phase} · ` : "";
+  const recordCount = rawTraceCount > 0 ? ` · ${rawTraceCount} 条记录` : "";
   const status = live
-    ? `已处理 <time data-processing-timer="${escapeHtml(String(message.processing_started_at))}">${formatProcessingDuration(liveDuration)}</time>`
-    : duration > 0 ? `已处理 <time>${formatProcessingDuration(duration)}</time>` : "正在处理";
+    ? `${phasePrefix}已处理 <time data-processing-timer="${escapeHtml(String(message.processing_started_at))}">${formatProcessingDuration(liveDuration)}</time>${recordCount}`
+    : duration > 0 ? `${phasePrefix}已处理 <time>${formatProcessingDuration(duration)}</time>${recordCount}` : `${phase || "正在处理"}${recordCount}`;
   const rows = trace.map((item) => `<li><strong>${escapeHtml(item.title || "处理步骤")}</strong><span>${escapeHtml(item.detail || "")}</span></li>`).join("");
   return `<details class="answer-processing ${live ? "is-live" : ""}" aria-label="本次对话处理过程"><summary>${status}${uiIcon("chevron-right", "answer-processing-chevron")}</summary>${rows ? `<ol>${rows}</ol>` : ""}</details>`;
+}
+
+function reuseImagePrompt(prompt) {
+  const input = byId("chatQuestionInput");
+  if (!input || !prompt) return;
+  if (input.value.trim() && input.value !== prompt) {
+    toast("输入框已有草稿，请先保留或清空后再复用描述。");
+    input.focus();
+    return;
+  }
+  input.value = prompt;
+  input.dispatchEvent(new Event("input", { bubbles: true }));
+  input.focus();
+}
+
+function renameDirectConversation() {
+  const id = state.directConversationId;
+  if (!id || state.activeTaskId || directChatJob()) return;
+  const input = byId("conversationTitleInput");
+  input.dataset.conversationId = id;
+  input.value = state.directConversations.find(item => item.conversation_id === id)?.title || byId("conversationTitle").textContent;
+  byId("conversationTitle").hidden = true;
+  input.hidden = false;
+  input.focus();
+  input.select();
+}
+
+byId("conversationTitleInput").addEventListener("blur", () => {
+  byId("conversationTitleInput").hidden = true;
+  byId("conversationTitle").hidden = false;
+});
+byId("conversationTitleInput").addEventListener("keydown", async (event) => {
+  if (event.isComposing || !["Enter", "Escape"].includes(event.key)) return;
+  event.preventDefault();
+  event.stopPropagation();
+  const input = event.currentTarget;
+  const id = input.dataset.conversationId;
+  const title = input.value.trim();
+  if (event.key === "Escape") { input.blur(); return; }
+  if (!title || directChatJob(id)) return;
+  try {
+    const saved = await request("/api/chat/history/" + encodeURIComponent(id) + "/title", {
+      method: "POST", body: JSON.stringify({ title, title_source: "user" }),
+    });
+    upsertDirectConversation(saved);
+    if (state.directConversationId === id && !state.activeTaskId) byId("conversationTitle").textContent = compact(title, 80);
+    input.blur();
+    renderTasks();
+  } catch (error) { toast(error.message, true); }
+});
+
+function generatedImageArtifactsMarkup(artifacts = [], { promptContent = "", usageMarkup = "" } = {}) {
+  const rows = (Array.isArray(artifacts) ? artifacts : []).filter((artifact) => artifact?.artifact_type === "image").map((artifact) => {
+    const assetUrl = String(artifact.asset_url || "").trim();
+    if (!assetUrl.startsWith("/api/generated-images/") || assetUrl.slice("/api/generated-images/".length).includes("/")) return "";
+    const details = [artifact.provider_name || artifact.provider_id, artifact.model_id, artifact.size].filter(Boolean).join(" · ");
+    const prompt = String(promptContent || artifact.title || "");
+    const size = /^(\d{1,5})[x×*](\d{1,5})$/.exec(String(artifact.size || ""));
+    const aspect = size && Number(size[2]) > 0 ? Math.max(.25, Math.min(4, Number(size[1]) / Number(size[2]))) : 1;
+    return `<figure class="generated-image-artifact" style="--image-aspect:${aspect}"><a href="${escapeHtml(assetUrl)}" data-action="open-image-preview" data-image-src="${escapeHtml(assetUrl)}" data-image-alt="${escapeHtml(artifact.title || "AI 生成图片")}" aria-label="放大查看生成图片"><img src="${escapeHtml(assetUrl)}" alt="${escapeHtml(artifact.title || "AI 生成图片")}" loading="lazy" /></a><figcaption><details class="generated-image-prompt"><summary><strong>本次图片 · ${escapeHtml(artifact.title || "AI 生成图片")}</strong></summary><p>${escapeHtml(prompt)}</p></details><div class="generated-image-toolbar"><a class="generated-image-download" href="${escapeHtml(assetUrl)}" download>下载原图</a><button type="button" data-action="reuse-image-prompt" data-prompt="${escapeHtml(prompt)}">复用描述</button><details class="generated-image-details"><summary>详情</summary><div><small>${escapeHtml(details)}</small>${usageMarkup}</div></details></div></figcaption></figure>`;
+  }).filter(Boolean);
+  return rows.length ? `<div class="generated-image-artifacts">${rows.join("")}</div>` : "";
 }
 
 function renderDirectLiveControls() {
@@ -6487,39 +7399,47 @@ function renderDirectLiveControls() {
   const send = form?.querySelector("button[type='submit']");
   if (!surface) return;
   const job = !state.activeTaskId ? directChatJob() : null;
+  // Streaming updates render the conversation on animation frames. Preserve
+  // the live queue nodes while a native drag is in progress so a delayed
+  // token cannot replace the source or drop target underneath the pointer.
+  if (job && directQueueDrag.queueId && directQueueDrag.conversationId === job.conversationId) return;
   if (!job) {
     surface.hidden = true;
     surface.innerHTML = "";
+    surface.classList.remove("has-queue");
     form?.classList.remove("has-live-direct-job");
-    if (input) input.placeholder = "继续追问或提出新的研究问题";
+    form?.classList.remove("has-queued-direct-turn");
+    if (input) input.placeholder = selectedComposerImageModel() ? "描述你想生成的图片（仅使用本条文字）" : "继续追问或提出新的研究问题";
     if (send) send.setAttribute("aria-label", "发送问题");
     renderComposerSendButtons();
     return;
   }
   const paused = job.status === "paused" && !job.pauseRequested;
   if (!job.queue.length) {
-    // Keep the composer quiet while a response is being prepared or streamed.
-    // The send control still changes to pause/resume, so no separate status
-    // banner is needed inside the dialog.
     surface.hidden = true;
     surface.innerHTML = "";
+    surface.classList.remove("has-queue");
     form?.classList.add("has-live-direct-job");
+    form?.classList.remove("has-queued-direct-turn");
     if (input) input.placeholder = paused ? "点击播放键继续当前回复" : "输入下一条消息";
     if (send) send.setAttribute("aria-label", paused ? "继续回复" : "发送下一条消息");
     renderComposerSendButtons();
     return;
   }
+  const edit = directQueueEdit?.conversationId === job.conversationId ? directQueueEdit : null;
   const queueRows = job.queue.map((turn) => {
     const queueId = escapeHtml(turn.queueId);
-    const deliveryMode = turn.deliveryMode === "steer" ? "steer" : "follow-up";
-    const steerDisabled = paused || job.steeringPending ? "disabled" : "";
-    return `<li data-queue-id="${queueId}"><span title="${escapeHtml(turn.question)}">${escapeHtml(compact(turn.question, 52))}</span><div class="direct-live-actions" role="group" aria-label="这条队列消息的处理方式"><button type="button" data-action="set-queued-direct-mode" data-queue-id="${queueId}" data-queue-mode="follow-up" class="${deliveryMode === "follow-up" ? "is-active" : ""}" aria-pressed="${deliveryMode === "follow-up"}">完成后继续</button><button type="button" data-action="set-queued-direct-mode" data-queue-id="${queueId}" data-queue-mode="steer" class="${deliveryMode === "steer" ? "is-active" : ""}" aria-pressed="${deliveryMode === "steer"}" ${steerDisabled}>立即调整</button><button type="button" data-action="remove-direct-follow-up" data-queue-id="${queueId}" aria-label="移除这条后续消息" title="移除">${uiIcon("x")}</button></div></li>`;
+    const steerDisabled = paused || turn.imageModel || job.currentTurn?.imageModel || job.steeringPending ? "disabled" : "";
+    if (edit?.queueId === turn.queueId) {
+      return `<li class="direct-live-queue-item is-editing" data-direct-queue-item data-queue-id="${queueId}" data-queue-conversation-id="${escapeHtml(job.conversationId)}"><input type="text" data-queue-edit-input data-queue-id="${queueId}" value="${escapeHtml(edit.value)}" aria-label="编辑队列消息" autocomplete="off" spellcheck="false" /><div class="direct-live-queue-actions" role="group" aria-label="保存队列消息"><button type="button" class="direct-live-queue-action is-save" data-action="save-direct-queue-edit" data-queue-id="${queueId}" aria-label="保存队列消息" title="保存">${uiIcon("check")}<span>保存</span></button><button type="button" class="direct-live-queue-action" data-action="cancel-direct-queue-edit" data-queue-id="${queueId}" aria-label="取消编辑" title="取消">${uiIcon("x")}</button></div></li>`;
+    }
+    return `<li class="direct-live-queue-item" data-direct-queue-item data-queue-id="${queueId}" data-queue-conversation-id="${escapeHtml(job.conversationId)}"><button type="button" class="direct-live-queue-drag" data-direct-queue-drag draggable="true" aria-label="拖动以重新排序" title="拖动以重新排序">${uiIcon("grip-vertical")}</button><span class="direct-live-queue-text" title="${escapeHtml(turn.question)}">${escapeHtml(compact(turn.question, 64))}</span><div class="direct-live-queue-actions" role="group" aria-label="这条队列消息的操作"><button type="button" class="direct-live-queue-action is-immediate" data-action="set-queued-direct-mode" data-queue-id="${queueId}" data-queue-mode="steer" aria-label="立即执行这条消息" title="立即执行" ${steerDisabled}>${uiIcon("send")}<span>立即</span></button><button type="button" class="direct-live-queue-action" data-action="edit-direct-follow-up" data-queue-id="${queueId}" aria-label="编辑这条队列消息" title="编辑">${uiIcon("pen")}</button><button type="button" class="direct-live-queue-action is-danger" data-action="remove-direct-follow-up" data-queue-id="${queueId}" aria-label="删除这条队列消息" title="删除">${uiIcon("trash")}</button></div></li>`;
   }).join("");
-  const parallelCount = Math.max(0, directChatJobs.size - 1);
-  const parallelSummary = parallelCount ? ` · 另有 ${parallelCount} 个对话并行` : "";
   surface.hidden = false;
-  surface.innerHTML = `<div class="direct-live-queue"><span>接下来 ${job.queue.length}${parallelSummary}</span><ol>${queueRows}</ol></div>`;
+  surface.classList.add("has-queue");
+  surface.innerHTML = `<div class="direct-live-queue"><ol aria-label="后续消息队列，共 ${job.queue.length} 条">${queueRows}</ol></div>`;
   form?.classList.add("has-live-direct-job");
+  form?.classList.add("has-queued-direct-turn");
   if (input) input.placeholder = paused ? "点击播放键继续当前回复" : "输入下一条消息";
   if (send) send.setAttribute("aria-label", paused ? "继续回复" : "加入后续队列");
   renderComposerSendButtons();
@@ -6531,15 +7451,21 @@ async function setQueuedDirectTurnMode(queueId, mode) {
   const index = job.queue.findIndex((turn) => turn.queueId === String(queueId || ""));
   if (index < 0) return;
   const turn = job.queue[index];
+  if (mode === "steer" && (turn.imageModel || job.currentTurn?.imageModel)) {
+    toast("生图请求按队列执行，暂不支持中途调整。");
+    return;
+  }
   turn.deliveryMode = mode === "steer" ? "steer" : "follow-up";
   if (turn.deliveryMode !== "steer") {
     renderDirectLiveControls();
+    persistDirectChatJob(job).catch((error) => console.warn("Direct chat queue mode could not be saved", error));
     return;
   }
   if (job.steeringPending || job.status === "paused") return;
   job.queue.splice(index, 1);
   job.steeringPending = true;
   renderDirectLiveControls();
+  persistDirectChatJob(job).catch((error) => console.warn("Direct chat queue could not be saved", error));
   const steered = await steerDirectChat(job, turn);
   if (!steered) fallbackSteerDirectChat(job, turn);
   renderDirectLiveControls();
@@ -6554,6 +7480,7 @@ function removeQueuedDirectTurn(queueId) {
   if (job.queue.length !== before) toast("已移除后续消息");
   renderDirectLiveControls();
   renderTasks();
+  persistDirectChatJob(job).catch((error) => console.warn("Direct chat queue removal could not be saved", error));
 }
 
 function updateProcessingTimers() {
@@ -6772,6 +7699,127 @@ function directFailureMarkup(message, index) {
   return `<section class="stream-error-card" role="alert"><strong>这次回复没有完成</strong><p>${escapeHtml(reason)}</p>${detail && detail !== reason ? `<small>${escapeHtml(detail)}</small>` : ""}<div class="stream-error-actions">${retryAction}</div></section>`;
 }
 
+function lastDirectUserMessageIndex(messages = state.directMessages) {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    if (messages[index]?.role === "user") return index;
+  }
+  return -1;
+}
+
+function directTurnFromHistoryMessage(message, question, messages = state.directMessages) {
+  const selectedSkillIds = Array.isArray(message?.skills)
+    ? message.skills
+      .map((item) => String(item?.id || item || "").trim())
+      .filter(Boolean)
+    : [];
+  const selectedSkills = selectedSkillIds.map((skillId) => skillRecord(skillId)).filter(Boolean);
+  const knowledgeScopes = Array.isArray(message?.knowledgeScopes)
+    ? message.knowledgeScopes
+      .map((scope) => ({
+        notebook_id: String(scope?.notebook_id || "").trim(),
+        title: String(scope?.title || "").trim(),
+      }))
+      .filter((scope) => scope.notebook_id)
+    : [];
+  const messageIndex = messages.indexOf(message);
+  const nextAssistant = messageIndex >= 0
+    ? messages.slice(messageIndex + 1).find((item) => item?.role === "assistant")
+    : null;
+  const directChatMode = String(message?.mode || nextAssistant?.mode || (knowledgeScopes.length ? "knowledge" : "general"));
+  return {
+    queueId: globalThis.crypto?.randomUUID?.() || `turn-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    question: String(question || "").trim(),
+    key: "chat",
+    directChatMode,
+    imageModel: message?.image_model || null,
+    selectedSkillIds,
+    selectedSkills,
+    images: Array.isArray(message?.images) ? message.images : [],
+    audio: Array.isArray(message?.audio) ? message.audio : [],
+    sourceFiles: Array.isArray(message?.sources) ? message.sources : [],
+    knowledgeScopes,
+    notebookId: knowledgeScopes[0]?.notebook_id || "",
+    notebookIds: knowledgeScopes.map((scope) => scope.notebook_id),
+    knowledgeScope: null,
+    knowledgeScopePayloads: [],
+    thinkingLevel: currentThinkingLevel(),
+    webSearch: state.webSearchMode,
+    deliveryMode: "follow-up",
+    createdAt: new Date().toISOString(),
+  };
+}
+
+function beginEditingLastConversationMessage(messageIndex) {
+  if (state.activeTaskId || directChatJob()) return;
+  const index = Number(messageIndex);
+  const messages = Array.isArray(state.directMessages) ? state.directMessages : [];
+  const lastIndex = lastDirectUserMessageIndex(messages);
+  const message = messages[index];
+  if (!Number.isInteger(index) || index !== lastIndex || message?.role !== "user") return;
+  directMessageEdit = {
+    conversationId: String(state.directConversationId || ""),
+    messageIndex: index,
+    value: String(message.content || ""),
+  };
+  renderDirectConversation();
+  window.setTimeout(() => {
+    const input = document.querySelector("[data-last-message-edit-input]");
+    input?.focus({ preventScroll: true });
+    input?.setSelectionRange(input.value.length, input.value.length);
+  }, 0);
+}
+
+function cancelEditingLastConversationMessage() {
+  if (!directMessageEdit) return;
+  directMessageEdit = null;
+  renderDirectConversation();
+}
+
+function saveEditingLastConversationMessage() {
+  const edit = directMessageEdit;
+  if (!edit) return;
+  const conversationId = String(state.directConversationId || "");
+  if (!conversationId || edit.conversationId !== conversationId) {
+    directMessageEdit = null;
+    return;
+  }
+  if (directChatJob(conversationId)) {
+    toast("当前回复仍在处理，请等待完成后再编辑。", true);
+    return;
+  }
+  const messages = Array.isArray(state.directMessages) ? state.directMessages : [];
+  const index = Number(edit.messageIndex);
+  const lastIndex = lastDirectUserMessageIndex(messages);
+  const message = messages[index];
+  if (!Number.isInteger(index) || index !== lastIndex || message?.role !== "user") {
+    cancelEditingLastConversationMessage();
+    return;
+  }
+  const question = String(edit.value || "").trim();
+  if (!question) {
+    toast("消息不能为空", true);
+    return;
+  }
+  const turn = directTurnFromHistoryMessage(message, question, messages);
+  turn.branchId = globalThis.crypto?.randomUUID?.() || `branch-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  turn.branchFromMessageId = String(message.message_id || "");
+  turn.branchReason = "edit_last_user_message";
+  const retainedMessages = messages
+    .slice(0, index)
+    .filter((item) => item && !item.streaming);
+  directMessageEdit = null;
+  state.directMessages = retainedMessages;
+  state.sessionId = null;
+  state.sessionStats = null;
+  state.sessionTokens = 0;
+  state.contextUsagePercent = 0;
+  window.localStorage.removeItem("scansci.active.session");
+  state.conversationAutoFollow = true;
+  renderDirectConversation({ forceFollow: true });
+  beginDirectChatJob(turn);
+  toast("已按修改后的消息重新生成");
+}
+
 function retryDirectMessage(index) {
   if (composerSubmissionInFlight || directChatJob()) {
     toast("当前对话仍在处理；可将这条重试加入后续队列，或先停止当前回复。", true);
@@ -6790,38 +7838,48 @@ function retryDirectMessage(index) {
     return;
   }
 
-  const key = state.activeView === "conversation" ? "chat" : "home";
-  state.composerSkills[key] = (user.skills || []).map((item) => skillRecord(item?.id || item)).filter(Boolean);
-  state.composerImages[key] = Array.isArray(user.images) ? user.images : [];
-  state.composerAudio[key] = Array.isArray(user.audio) ? user.audio : [];
-  state.composerSources[key] = Array.isArray(user.sources) ? user.sources : [];
-  renderComposerSkills(key);
-  renderComposerImages(key);
-  renderComposerAudio(key);
-  renderComposerSources(key);
-  state.directMessages = state.directMessages.filter((_, itemIndex) => itemIndex !== failedIndex && itemIndex !== userIndex);
-  renderDirectConversation();
-
-  const input = byId(key === "chat" ? "chatQuestionInput" : "homeQuestionInput") || byId("chatQuestionInput") || byId("homeQuestionInput");
-  if (!input) {
-    toast("输入框尚未准备好，请重新输入问题。", true);
-    return;
-  }
-  input.value = String(user.content);
-  input.dispatchEvent(new Event("input", { bubbles: true }));
-  input.focus();
-  input.form?.requestSubmit();
+  const turn = directTurnFromHistoryMessage(user, user.content, state.directMessages);
+  turn.branchId = globalThis.crypto?.randomUUID?.() || `branch-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+  turn.branchFromMessageId = String(user.message_id || "");
+  turn.branchReason = "retry_failed_assistant";
+  state.directMessages = state.directMessages
+    .slice(0, userIndex)
+    .filter((message) => message && !message.streaming);
+  state.sessionId = null;
+  state.sessionStats = null;
+  state.sessionTokens = 0;
+  state.contextUsagePercent = 0;
+  window.localStorage.removeItem("scansci.active.session");
+  state.conversationAutoFollow = true;
+  renderDirectConversation({ forceFollow: true });
+  beginDirectChatJob(turn);
+  toast("正在重新生成，失败的尝试已保留在分支记录中");
 }
 
 function renderDirectConversation({ forceFollow = false } = {}) {
+  const conversationId = String(state.directConversationId || "");
+  const activeJob = directChatJob(conversationId);
+  if (directMessageEdit && (directMessageEdit.conversationId !== conversationId || activeJob)) {
+    directMessageEdit = null;
+  }
+  const lastUserIndex = lastDirectUserMessageIndex(state.directMessages);
   const scrollSnapshot = conversationScrollSnapshot();
   const turns = state.directMessages.map((message, index) => {
     if (message.role === "user") {
+      const editable = index === lastUserIndex && !activeJob;
+      const editing = editable && directMessageEdit?.messageIndex === index;
+      const attachments = `${messageSkillTokensMarkup(message.skills || [])}${composerSourcePreviewMarkup(message.sources || [])}${composerImagePreviewMarkup(message.images || [])}${composerAudioPreviewMarkup(message.audio || [])}`;
+      const userContent = editing
+        ? `<div class="user-turn-bubble is-editing">${attachments}<textarea rows="3" data-last-message-edit-input data-message-index="${index}" aria-label="编辑最后一条消息" autocomplete="off" spellcheck="false">${escapeHtml(directMessageEdit.value)}</textarea><p class="message-edit-hint">Ctrl/⌘ + Enter 保存并重新生成 · Esc 取消</p></div>`
+        : `<div class="user-turn-bubble">${attachments}<p>${renderAssistantInline(message.content)}</p></div>`;
       return conversationMessageMarkup({
         role: "user",
         content: message.content,
-        contentMarkup: `<div class="user-turn-bubble">${messageSkillTokensMarkup(message.skills || [])}${composerSourcePreviewMarkup(message.sources || [])}${composerImagePreviewMarkup(message.images || [])}${composerAudioPreviewMarkup(message.audio || [])}<p>${renderAssistantInline(message.content)}</p></div>`,
+        contentMarkup: userContent,
         createdAt: message.created_at,
+        editable,
+        editing,
+        messageIndex: index,
       });
     }
     const duration = Number(message.processing_ms || 0);
@@ -6830,6 +7888,11 @@ function renderDirectConversation({ forceFollow = false } = {}) {
     const answer = message.reader_answer
       ? directEvidenceAnswerMarkup(message, index, cursor)
       : (message.content ? `<div class="answer-sentence">${renderAssistantContent(message.content)}${cursor}</div>` : "");
+    const promptContent = [...state.directMessages.slice(0, index)]
+      .reverse().find((item) => item.role === "user")?.content || "";
+    const generatedImages = generatedImageArtifactsMarkup(message.artifacts, {
+      promptContent, usageMarkup: messageUsageMarkup("assistant", message.content, message.usage, promptContent),
+    });
     const visionRoute = message.agent_runtime?.vision_route || null;
     const visionFallback = message.agent_runtime?.vision_fallback || null;
     const visionFallbackNotice = visionFallback?.to_model
@@ -6843,13 +7906,10 @@ function renderDirectConversation({ forceFollow = false } = {}) {
     const error = message.error && !message.paused ? directFailureMarkup(message, index) : "";
     const interaction = interactionMarkup(message.interaction);
     const modeLabel = composerModeLabels[message.mode] || "通用对话";
-    const promptContent = [...state.directMessages.slice(0, index)]
-      .reverse()
-      .find((item) => item.role === "user")?.content || "";
     return conversationMessageMarkup({
       role: "assistant",
       content: message.content,
-      contentMarkup: visionNotice + answer,
+      contentMarkup: visionNotice + answer + generatedImages,
       createdAt: message.created_at,
       usage: message.usage,
       model: message.model,
@@ -6858,6 +7918,7 @@ function renderDirectConversation({ forceFollow = false } = {}) {
       extra: `${interaction}${generation}${paused}${error}`,
       classes: "direct-answer",
       promptContent,
+      imageReply: Boolean(generatedImages),
     });
   }).join("");
   byId("answerArea").innerHTML = `<article class="conversation-thread">${turns}</article>`;
@@ -6875,6 +7936,18 @@ function composerMode(inputId) {
   if (inputId === "reviewQuestionInput") return "writing";
   const selectId = inputId === "homeQuestionInput" ? "homeModeSelect" : "chatModeSelect";
   return byId(selectId)?.value || "general";
+}
+
+function isCasualConversationMessage(text = "") {
+  const normalized = String(text || "")
+    .trim()
+    .toLocaleLowerCase()
+    .replace(/[\s,，。.!！?？~～]+/g, "");
+  return [
+    "你好", "您好", "嗨", "哈喽", "早上好", "下午好", "晚上好", "晚安",
+    "谢谢", "多谢", "hello", "hi", "hey", "thankyou", "thanks",
+    "goodmorning", "goodafternoon", "goodevening", "goodnight", "bye",
+  ].includes(normalized);
 }
 
 function resolveResearchComposerMode(text) {
@@ -8211,6 +9284,7 @@ async function continueTaskConversation(runId, content, skills = []) {
     method: "POST",
     body: JSON.stringify({
       content,
+      ...(selectedComposerImageModel() ? { image_model: selectedComposerImageModel(), image_request_id: globalThis.crypto.randomUUID() } : {}),
       thinking_level: currentThinkingLevel(),
       chat_mode: composerMode("chatQuestionInput"),
       skills: selectedSkills,
@@ -8492,11 +9566,10 @@ function runCompletionMessageMarkup(run) {
 function runControlPlaneMarkup(run) {
   const interaction = run.interaction && Object.keys(run.interaction).length ? run.interaction : null;
   const recovery = run.recovery && Object.keys(run.recovery).length ? run.recovery : null;
-  const recentEvents = Array.isArray(run.events) ? run.events.slice(-3).reverse() : [];
   const advisorEvent = Array.isArray(run.events)
     ? [...run.events].reverse().find((item) => item?.type === "advisor.reviewed")
     : null;
-  const advisor = advisorEvent && typeof advisorEvent.payload === "object" ? advisorEvent.payload : null;
+  const advisor = run.advisor_report || (advisorEvent && typeof advisorEvent.payload === "object" ? advisorEvent.payload : null);
   const branchMeta = run.parent_run_id
     ? `<span class="run-control-chip">${uiIcon("git-branch")}分支任务</span>`
     : "";
@@ -8505,27 +9578,53 @@ function runControlPlaneMarkup(run) {
     : "";
   let panel = "";
   if (interaction) {
-    const interactionId = String(interaction.interaction_id || "");
     const summary = interaction.summary || interaction.payload?.summary || "需要你的决定";
-    panel = `<section class="run-control-panel is-interaction"><header><strong>${interaction.kind === "plan" ? "计划确认" : "需要你的回答"}</strong><span>任务已安全暂停</span></header><p>${escapeHtml(summary)}</p><div><button type="button" data-action="respond-run-interaction" data-run-id="${escapeHtml(run.run_id)}" data-interaction-id="${escapeHtml(interactionId)}" data-decision="approve">批准并继续</button><button type="button" data-action="respond-run-interaction" data-run-id="${escapeHtml(run.run_id)}" data-interaction-id="${escapeHtml(interactionId)}" data-decision="cancel">取消</button></div></section>`;
+    panel = `<section class="run-control-panel is-interaction"><header><strong>${interaction.kind === "plan" ? "计划确认" : "需要你的回答"}</strong><span>任务已安全暂停</span></header><p>${escapeHtml(summary)}</p></section>`;
   } else if (recovery) {
     const failedStage = (run.stages || []).find((stage) => stage.status === "failed");
-    const primaryAction = (recovery.actions || []).find((action) => action.kind !== "branch") || (recovery.actions || [])[0];
-    const button = primaryAction
-      ? `<button type="button" data-action="recover-run" data-run-id="${escapeHtml(run.run_id)}" data-recovery-action="${escapeHtml(primaryAction.kind || primaryAction.id || "retry")}">${escapeHtml(primaryAction.label || "继续")}</button>`
-      : "";
-    panel = `<section class="run-control-panel is-recovery"><header><strong>${escapeHtml(runFailureSummary(run))}</strong><span>${escapeHtml(failedStage?.title || "未完成步骤")}</span></header><div>${button}</div></section>`;
+    panel = `<section class="run-control-panel is-recovery"><header><strong>${escapeHtml(runFailureSummary(run))}</strong><span>${escapeHtml(failedStage?.title || "未完成步骤")}</span></header></section>`;
   }
   if (advisor?.recommended_next_action && advisor.recommended_next_action !== "none") {
     const findings = Array.isArray(advisor.findings) ? advisor.findings : [];
     const nextAction = String(advisor.recommended_next_action);
     const finding = String(findings[0]?.message || "A durable completion check found a gap.");
-    panel += `<section class="run-control-panel is-advisor"><header><strong>Research advisor</strong><span>${escapeHtml(String(advisor.verdict || "needs_review"))}</span></header><p>${escapeHtml(finding)}</p><div><button type="button" data-action="advisor-action" data-run-id="${escapeHtml(run.run_id)}" data-advisor-action="${escapeHtml(nextAction)}">Create evidence-safe follow-up</button></div></section>`;
+    panel += `<section class="run-control-panel is-advisor"><header><strong>研究任务核查</strong><span>${escapeHtml(({ passed: "已通过", needs_review: "待核查", insufficient: "交付不足" })[advisor.verdict] || "待核查")}</span></header><p>${escapeHtml(findings[0]?.message ? finding : "任务完成核查发现待补充项。")}</p><div><button type="button" data-action="advisor-action" data-run-id="${escapeHtml(run.run_id)}" data-advisor-action="${escapeHtml(nextAction)}">创建补充核查任务</button></div></section>`;
   }
-  const trace = recentEvents.length
-    ? `<details class="run-event-trace"><summary>任务记录 · ${escapeHtml(String(run.event_count || recentEvents.length))}</summary><ol>${recentEvents.map((item) => `<li><span>${escapeHtml(item.summary || item.type || "任务更新")}</span><time>${escapeHtml(formatMessageTime(item.created_at))}</time></li>`).join("")}</ol></details>`
-    : "";
-  return `${branchMeta || background ? `<div class="run-control-chips">${background}${branchMeta}</div>` : ""}${panel}${trace}`;
+  return `${branchMeta || background ? `<div class="run-control-chips">${background}${branchMeta}</div>` : ""}${panel}`;
+}
+
+function runSummaryActionsMarkup(run) {
+  const interaction = run.interaction && Object.keys(run.interaction).length ? run.interaction : null;
+  if (interaction) {
+    const interactionId = String(interaction.interaction_id || "");
+    return `<button type="button" class="run-summary-action is-primary" data-action="respond-run-interaction" data-run-id="${escapeHtml(run.run_id)}" data-interaction-id="${escapeHtml(interactionId)}" data-decision="approve">继续</button><button type="button" class="run-summary-action" data-action="respond-run-interaction" data-run-id="${escapeHtml(run.run_id)}" data-interaction-id="${escapeHtml(interactionId)}" data-decision="cancel">取消</button>`;
+  }
+  const recovery = run.recovery && Object.keys(run.recovery).length ? run.recovery : null;
+  if (recovery) {
+    const primaryAction = (recovery.actions || []).find((action) => action.kind !== "branch");
+    return primaryAction
+      ? `<button type="button" class="run-summary-action is-primary" data-action="recover-run" data-run-id="${escapeHtml(run.run_id)}" data-recovery-action="${escapeHtml(primaryAction.kind || primaryAction.id || "retry")}">${escapeHtml(primaryAction.label || "继续")}</button>`
+      : "";
+  }
+  if (run.pausable) {
+    return `<button type="button" class="run-action stop" data-action="pause-run" data-run-id="${escapeHtml(run.run_id)}">暂停</button>`;
+  }
+  if (run.resumable) {
+    const label = run.status === "needs_confirmation" ? "确认计划并执行" : run.workflow_type.startsWith("paper_") ? "继续下载并交付" : "继续";
+    return `<button type="button" class="run-action" data-action="resume-run" data-run-id="${escapeHtml(run.run_id)}">${label}</button>`;
+  }
+  return "";
+}
+
+function compactRecentRunEvents(events) {
+  const groups = [];
+  for (const item of (Array.isArray(events) ? events.slice(-3).reverse() : [])) {
+    const summary = String(item.summary || item.type || "任务更新");
+    const existing = groups.find((group) => group.summary === summary);
+    if (existing) existing.count += 1;
+    else groups.push({ item, summary, count: 1 });
+  }
+  return groups;
 }
 
 function renderRun(run) {
@@ -8540,6 +9639,7 @@ function renderRun(run) {
     artifact: run.output_artifact?.file_path || run.output_artifact?.summary || "",
     interaction: run.interaction || {},
     recovery: run.recovery || {},
+    advisor: run.advisor_report || null,
     parent: run.parent_run_id || "",
     events: (run.events || []).map((item) => [item.event_id, item.type, item.summary, item.created_at]),
     messages: (run.messages || []).map((message) => [message.message_id, message.role, message.content, message.processing_ms, message.created_at, message.usage]),
@@ -8547,12 +9647,16 @@ function renderRun(run) {
   if (state.lastRunRenderKey === renderKey) return;
   state.lastRunRenderKey = renderKey;
   const answerArea = byId("answerArea");
+  if (state.runExecutionDetailsRunId !== String(run.run_id || "")) {
+    state.runExecutionDetailsRunId = String(run.run_id || "");
+    state.runExecutionDetailsOpen = false;
+  }
   const scrollSnapshot = conversationScrollSnapshot();
   byId("conversationTitle").textContent = ["literature_review", "deep_research"].includes(run.workflow_type) ? researchDocumentPresentation(run).conversationTitle : compact(runDisplayTitle(run), 80);
   const percent = Math.round((run.progress || 0) * 100);
   const evidenceIndex = run.workflow_type === "evidence_index" ? evidenceIndexContext(run) : null;
   const stageCalls = new Map((run.tool_calls || []).map((call) => [call.stage_id, call]));
-  const stages = (run.stages || []).map((stage) => {
+  const stageRows = (run.stages || []).map((stage) => {
     const call = stageCalls.get(stage.stage_id);
     const isIndexBuild = Boolean(evidenceIndex && stage.key === "build");
     const stageTitle = isIndexBuild
@@ -8569,8 +9673,12 @@ function renderRun(run) {
     const detail = isIndexBuild
       ? (stage.error_message || indexDetail)
       : (stage.error_message || stage.summary || (call ? `${call.tool_name}${call.status === "running" ? " · 调用中" : ""}` : "等待执行"));
-    return `<li class="run-stage ${escapeHtml(stage.status)}"><span class="stage-node">${stage.status === "completed" ? "✓" : stage.status === "running" ? "·" : stage.status === "failed" ? "!" : stage.position + 1}</span><div><strong>${escapeHtml(stageTitle)}</strong><small>${escapeHtml(detail)}</small></div>${call ? `<code>${escapeHtml(call.tool_name)}</code>` : ""}</li>`;
-  }).join("");
+    return { stage, call, title: stageTitle, detail };
+  });
+  const stages = stageRows.map(({ stage, call, title, detail }) => `<li class="run-stage ${escapeHtml(stage.status)}"><span class="stage-node">${stage.status === "completed" ? "✓" : stage.status === "running" ? "·" : stage.status === "failed" ? "!" : stage.position + 1}</span><div><strong>${escapeHtml(title)}</strong><small>${escapeHtml(detail)}</small></div>${call ? `<code>${escapeHtml(call.tool_name)}</code>` : ""}</li>`).join("");
+  const currentStageRow = stageRows.find(({ stage }) => stage.status === "running")
+    || stageRows.find(({ stage }) => ["pending", "queued", "waiting"].includes(String(stage.status || "")))
+    || stageRows.find(({ stage }) => stage.status === "failed");
   const artifact = run.output_artifact;
   const partialDownloadMarkup = partialDownloadArtifactMarkup(run);
   let resultMarkup = "";
@@ -8609,11 +9717,9 @@ function renderRun(run) {
   } else if (run.status === "paused") {
     resultMarkup = `<div class="run-state-message"><strong>任务已暂停</strong><p>${escapeHtml(run.error?.message || "可以从当前阶段继续。")}</p></div>`;
   } else {
-    resultMarkup = `<div class="run-live"><span></span><div><strong>${escapeHtml(evidenceIndex ? evidenceIndexRunTitle(run) : runStatusLabel(run))}</strong><p>${escapeHtml(evidenceIndex?.total ? `已处理 ${evidenceIndex.completed.toLocaleString("zh-CN")} / ${evidenceIndex.total.toLocaleString("zh-CN")} 条原文证据` : (run.stages || []).find((stage) => stage.status === "running")?.title || "正在准备下一阶段")}</p></div></div>`;
+    resultMarkup = "";
   }
   const actions = [
-    run.pausable ? `<button type="button" class="run-action stop" data-action="pause-run" data-run-id="${escapeHtml(run.run_id)}">暂停</button>` : "",
-    run.resumable && !run.interaction?.interaction_id ? `<button type="button" class="run-action" data-action="resume-run" data-run-id="${escapeHtml(run.run_id)}">${run.status === "needs_confirmation" ? "确认计划并执行" : run.workflow_type.startsWith("paper_") ? "继续下载并交付" : "继续"}</button>` : "",
     `<button type="button" class="run-action" data-action="branch-run" data-run-id="${escapeHtml(run.run_id)}">建立分支</button>`,
   ].join("");
   if (["literature_review", "deep_research"].includes(run.workflow_type)) {
@@ -8648,17 +9754,28 @@ function renderRun(run) {
   const workflowLabel = ({ evidence_index: "语义检索", ask: "证据问答", literature_review: "证据综述", academic_search: "学术搜索", deep_research: "深度研究", research_idea: "研究构思", novelty_check: "证据查新", paper_download: "文献下载", paper_download_batch: "批量下载", paper_search_download: "检索并下载", ppt_outline: "幻灯片大纲", ppt_project: "演示项目", pdf_to_ppt: "PPTX" })[run.workflow_type] || "科研任务";
   const active = !["completed", "failed", "cancelled", "paused"].includes(String(run.status || ""));
   const runResult = resultMarkup ? `<section class="run-result">${resultMarkup}</section>` : "";
-  const executionTitle = active
-    ? (evidenceIndex ? evidenceIndexRunTitle(run) : "正在执行")
-    : "执行过程";
-  const executionMeta = evidenceIndex?.total
-    ? `${evidenceIndex.completed.toLocaleString("zh-CN")} / ${evidenceIndex.total.toLocaleString("zh-CN")} 条原文证据 · ${percent}%`
-    : `${runStatusLabel(run)} · ${percent}%`;
+  const activityTitle = active
+    ? (currentStageRow?.title || (evidenceIndex ? evidenceIndexRunTitle(run) : runStatusLabel(run)))
+    : ({ completed: "已完成", failed: "任务未完成", cancelled: "已停止", paused: "已暂停" })[run.status] || runStatusLabel(run);
+  const summaryTitle = active ? "正在研究" : run.status === "failed" ? "研究未完成" : run.status === "completed" ? "研究完成" : activityTitle;
+  const detailsMeta = `${activityTitle}${percent || run.status === "completed" ? ` · ${percent}%` : ""}`;
+  const summaryActions = runSummaryActionsMarkup(run);
+  const summaryIcon = active ? "refresh" : run.status === "failed" ? "x" : "check";
+  const recentEvents = compactRecentRunEvents(run.events);
+  const eventTrace = recentEvents.length
+    ? `<div class="run-event-trace"><div class="run-event-trace-label">最近动态 · ${escapeHtml(String(run.event_count || recentEvents.length))}</div><ol>${recentEvents.map(({ item, summary, count }) => `<li><span>${escapeHtml(summary)}${count > 1 ? `<small class="run-event-repeat">×${count}</small>` : ""}</span><time>${escapeHtml(formatMessageTime(item.created_at))}</time></li>`).join("")}</ol></div>`
+    : "";
+  const detailsOpen = state.runExecutionDetailsRunId === String(run.run_id || "") && state.runExecutionDetailsOpen;
   const indexContext = evidenceIndex
     ? `<p class="run-index-context">资料库：<strong>${escapeHtml(evidenceIndex.title)}</strong>${evidenceIndex.sourceCount ? ` · ${escapeHtml(String(evidenceIndex.sourceCount))} 个文档` : ""}<span>原文件与原文证据无需重新导入</span></p>`
     : "";
-  const executionLog = `${runControlPlaneMarkup(run)}<details class="run-execution-log ${evidenceIndex ? "is-evidence-index" : ""}" ${active ? "open" : ""}><summary><span>${uiIcon(active ? "refresh" : "check")}</span><div><strong>${escapeHtml(executionTitle)}</strong><small>${escapeHtml(executionMeta)}</small></div>${uiIcon("chevron-right", "run-execution-chevron")}</summary><section class="run-card"><header class="run-card-head"><div><span class="run-kind">${escapeHtml(workflowLabel)}</span><h2>${escapeHtml(runDisplayTitle(run))}</h2>${indexContext}</div><div class="run-head-actions"><span class="run-status ${escapeHtml(run.status)}">${escapeHtml(runStatusLabel(run))}</span>${actions}</div></header><div class="run-progress"><i class="${progressWidthClass(percent)}"></i></div><ol class="run-stage-list">${stages}</ol></section>${runResult}</details>`;
+  const executionLog = `<details class="run-execution-log ${evidenceIndex ? "is-evidence-index" : ""}" ${detailsOpen ? "open" : ""}><summary><span>${uiIcon(summaryIcon)}</span><div><strong>${escapeHtml(summaryTitle)}</strong><small>${escapeHtml(detailsMeta)}</small></div><div class="run-summary-actions">${summaryActions}</div>${uiIcon("chevron-right", "run-execution-chevron")}</summary><section class="run-card"><header class="run-card-head"><div><span class="run-kind">${escapeHtml(workflowLabel)}</span><h2>${escapeHtml(runDisplayTitle(run))}</h2>${indexContext}</div><div class="run-head-actions"><span class="run-status ${escapeHtml(run.status)}">${escapeHtml(runStatusLabel(run))}</span>${actions}</div></header>${runControlPlaneMarkup(run)}<div class="run-progress"><i class="${progressWidthClass(percent)}"></i></div><ol class="run-stage-list">${stages}</ol>${eventTrace}</section></details>${runResult}`;
   byId("answerArea").innerHTML = `<article class="run-shell">${userMessage}${executionLog}${runCompletionMessageMarkup(run)}</article>`;
+  const executionDetails = answerArea.querySelector(".run-execution-log");
+  executionDetails?.addEventListener("toggle", () => {
+    state.runExecutionDetailsOpen = executionDetails.open;
+    state.runExecutionDetailsRunId = String(run.run_id || "");
+  });
   const taskConversation = taskConversationMarkup(run);
   if (taskConversation) answerArea.querySelector(".run-shell")?.insertAdjacentHTML("beforeend", taskConversation);
   bindRunCitations(run);
@@ -8729,7 +9846,10 @@ function slideProjectArtifactMarkup(payload, runId = "") {
   }
   const preview = template?.preview_url ? `<img class="slide-project-cover" src="${escapeHtml(template.preview_url)}" alt="${escapeHtml(template.name || "幻灯片模板")}" />` : '<div class="slide-project-cover"></div>';
   const slideSummary = slides.length ? `${slides.length} 页 · ${outline.evidence_linked ? "已绑定来源" : "待绑定来源"}` : "演示项目";
-  return `<div class="slide-project-artifact">${preview}<div class="slide-project-copy"><span>演示文稿</span><h3>${escapeHtml(template?.name || "学术幻灯片")}</h3><p>${escapeHtml(slideSummary)}</p>${payload.project_path ? `<div class="artifact-file-link">${localFileLinkMarkup(payload.project_path, "打开项目", { folder: true, inline: true })}</div>` : ""}</div></div>`;
+  const projectActions = payload.project_path
+    ? `<div class="artifact-file-link">${window.pywebview?.api ? localFileLinkMarkup(payload.project_path, "打开项目", { folder: true, inline: true }) : ""}${runId ? runArtifactDownloadLinkMarkup(runId, payload.project_path, { folder: true, label: "下载项目 ZIP" }) : ""}</div>`
+    : "";
+  return `<div class="slide-project-artifact">${preview}<div class="slide-project-copy"><span>演示文稿</span><h3>${escapeHtml(template?.name || "学术幻灯片")}</h3><p>${escapeHtml(slideSummary)}</p>${projectActions}</div></div>`;
 }
 
 async function exportActiveSlidePlan(button) {
@@ -9282,6 +10402,15 @@ function localFileLinkMarkup(path, label = "", { folder = false, compact = false
   return `<span class="${classes}" title="${escapeHtml(value)}"><button type="button" class="local-artifact-open" data-action="open-local-path" data-local-path="${escapeHtml(value)}" aria-label="${kind === "folder" ? "打开文件夹" : "打开文件"} ${escapeHtml(name)}"><span class="local-artifact-icon is-${escapeHtml(kind)}">${uiIcon(localResourceIcon(kind))}</span><span>${escapeHtml(name)}</span></button>${kind === "folder" || inline ? "" : `<button type="button" class="local-artifact-reveal" data-action="reveal-local-path" data-local-path="${escapeHtml(value)}" aria-label="在文件夹中显示 ${escapeHtml(name)}" title="在文件夹中显示">${uiIcon("folder-open")}</button>`}</span>`;
 }
 
+function runArtifactDownloadLinkMarkup(runId, path, { folder = false, label = "" } = {}) {
+  const value = String(path || "").trim();
+  if (!runId || !value) return "";
+  const name = label || localPathLeaf(value);
+  const downloadName = `${localPathLeaf(value) || "ScanSci-演示项目"}${folder ? ".zip" : ""}`;
+  const href = `/api/runs/${encodeURIComponent(String(runId))}/download`;
+  return `<span class="local-artifact-link is-inline"><a class="local-artifact-open" href="${escapeHtml(href)}" download="${escapeHtml(downloadName)}" aria-label="下载 ${escapeHtml(name)}"><span class="local-artifact-icon is-archive">${uiIcon("download")}</span><span>${escapeHtml(name)}</span></a></span>`;
+}
+
 async function openLocalArtifact(path, { reveal = false } = {}) {
   const method = reveal ? "reveal_local_path" : "open_local_path";
   const api = window.pywebview?.api;
@@ -9403,21 +10532,29 @@ function bindRunCitations(result, scope = byId("answerArea")) {
 async function openDirectConversation(conversationId, { record = true } = {}) {
   const id = String(conversationId || "").trim();
   if (!id) return;
-  const job = directChatJob(id);
+  const requestGeneration = ++navigationRequestGeneration;
+  let job = directChatJob(id);
   let conversation = null;
   try {
     conversation = await request(`/api/chat/history/${encodeURIComponent(id)}`);
   } catch (error) {
     // A just-started background run may be visible in the sidebar a few
     // milliseconds before its first durable history write completes.
+    if (requestGeneration !== navigationRequestGeneration) return;
     if (!job) throw error;
     conversation = directJobSummary(job);
   }
+  if (requestGeneration !== navigationRequestGeneration) return;
+  if (!job) job = restoreDirectChatJob(conversation);
   state.activeTaskId = "";
   state.reviewDocument = null;
   state.reviewDocumentOpen = false;
+  directMessageEdit = null;
   state.directConversationId = id;
-  state.directMessages = job?.messages || (Array.isArray(conversation.messages) ? conversation.messages : []);
+  state.directMessages = job?.messages || ensureDirectMessageIds(
+    Array.isArray(conversation.messages) ? conversation.messages : [],
+    id,
+  );
   state.sessionId = job?.sessionId || conversation.session_id || null;
   state.lastRunRenderKey = "";
   window.localStorage.removeItem("scansci.active.task");
@@ -9436,22 +10573,17 @@ async function openDirectConversation(conversationId, { record = true } = {}) {
 }
 
 async function openTask(id, { record = true } = {}) {
+  const requestGeneration = ++navigationRequestGeneration;
   try {
     const run = await request(`/api/runs/${encodeURIComponent(id)}`);
-    let displayRun = run;
-    // An application restart is an infrastructure interruption, not a user
-    // decision to pause. Reconnect the remembered task automatically so the
-    // worker can finish and deliver its artifact without a silent gap.
-    if (run.status === "paused" && run.error?.code === "app_restarted") {
-      try {
-        displayRun = await request(`/api/runs/${encodeURIComponent(id)}/resume`, { method: "POST", body: "{}" });
-      } catch (error) {
-        console.warn("Automatic task recovery failed", error);
-      }
-    }
+    if (requestGeneration !== navigationRequestGeneration) return;
+    // Opening history is read-only. Resume and recovery stay behind their
+    // explicit controls so application launch cannot restart model work.
+    const displayRun = run;
     upsertRun(displayRun);
     state.activeTaskId = displayRun.run_id;
     state.directConversationId = "";
+    directMessageEdit = null;
     syncActiveDirectChatState();
     state.reviewDocumentOpen = false;
     window.localStorage.setItem("scansci.active.task", displayRun.run_id);
@@ -9485,7 +10617,7 @@ async function openTask(id, { record = true } = {}) {
       });
     }
   } catch (error) {
-    toast(error.message, true);
+    if (requestGeneration === navigationRequestGeneration) toast(error.message, true);
   }
 }
 
@@ -9840,44 +10972,41 @@ function knowledgeIndexStatusMarkup(notebook) {
   const status = state.knowledgeIndexStatuses[notebookId] || {};
   const localAi = state.localAiStatuses[notebookId] || {};
   const localAiState = String(localAi.state || "");
-  const sourceCount = Number(notebook?.counts?.sources || knowledgeSourceItems(notebook).length || 0);
+  // Catalog-only Zotero records are not evidence. Count indexed sources only.
+  const sourceCount = Number(notebook?.counts?.sources ?? notebook?.sources?.length ?? 0);
+  const basicReady = Number(status.total ?? sourceCount) > 0;
   const binding = notebook?.metadata?.local_binding || {};
   const bindingState = String(binding.index_state || "");
   const fallbackState = bindingState === "failed"
     ? "failed"
     : bindingState === "queued"
       ? "importing"
-      : bindingState === "ready" && sourceCount
-        ? "ready"
-        : sourceCount
-          ? "pending"
-          : "empty";
-  const statusState = String(status.state || fallbackState);
+      : basicReady
+        ? "pending"
+        : "empty";
+  // The Host marks user-initiated semantic optimization as optional.
+  const statusState = String(status.state === "optional" ? "pending" : status.state || fallbackState);
   const progress = Math.max(
     0,
     Math.min(100, Math.round(Number(localAiState === "preparing" ? localAi.progress : status.progress || 0) * 100)),
   );
   const labels = {
-    ready: "检索已就绪",
+    ready: "语义检索已就绪",
     // Source text can be searched as soon as document evidence has been
     // materialized.  The later vector/reranker pass improves ranking, but it
     // must not make a populated Zotero shelf look empty or unusable.
     indexing: sourceCount ? `全文可检索 · 优化${progress ? ` ${progress}%` : ""}` : `正在建立索引${progress ? ` ${progress}%` : ""}`,
     importing: `正在建立索引${progress ? ` ${progress}%` : ""}`,
     installing: `正在安装检索组件${progress ? ` ${progress}%` : ""}`,
-    degraded: "部分可用",
-    failed: "同步失败",
-    pending: "等待同步",
+    degraded: basicReady ? "基础检索可用 · 可优化语义索引" : "部分可用",
+    failed: basicReady && bindingState !== "failed" ? "基础检索可用 · 语义优化失败" : "同步失败",
+    pending: basicReady ? "基础检索可用 · 可优化语义索引" : "等待同步",
     empty: "尚无内容",
   };
-  if (Boolean(status.automatic_build_deferred)) {
-    labels.pending = "可按需优化";
-    labels.degraded = "可按需优化";
-  }
   const localLabel = localAiState === "preparing"
-    ? "正在准备本地 AI"
-    : localAiState === "fallback" || localAiState === "error"
-      ? "基础检索可用"
+    ? (basicReady ? "基础检索可用 · 正在准备语义检索" : "正在准备本地 AI")
+    : basicReady && (localAiState === "fallback" || localAiState === "error") && bindingState !== "failed"
+      ? "基础检索可用 · 语义优化待重试"
       : "";
   const label = localLabel || labels[statusState] || "等待同步";
   const retryable = ["failed", "degraded", "pending"].includes(statusState);
@@ -9887,8 +11016,13 @@ function knowledgeIndexStatusMarkup(notebook) {
     ? "indexing"
     : localRetryable
       ? "degraded"
-      : statusState;
-  const details = [status.error, localAi.message, localAi.error].filter(Boolean).join(" · ");
+      : basicReady && statusState === "pending"
+        ? "ready"
+        : statusState;
+  const optimizationHint = basicReady && ["pending", "degraded", "failed"].includes(statusState) && bindingState !== "failed"
+    ? "基础全文检索已可用；点击可手动优化语义索引。"
+    : "";
+  const details = [optimizationHint, status.error, localAi.message, localAi.error].filter(Boolean).join(" · ");
   const title = details ? `检索索引：${label}。${String(details)}` : `检索索引：${label}`;
   return `<button type="button" class="ima-index-status is-${escapeHtml(visualState)}" data-knowledge-index-status data-action="${action}" data-notebook-id="${escapeHtml(notebookId)}" title="${escapeHtml(title)}" ${statusState === "empty" ? "disabled" : ""}><svg viewBox="0 0 12 12" aria-hidden="true"><circle class="track" cx="6" cy="6" r="4.5"></circle><circle class="value" cx="6" cy="6" r="4.5" pathLength="100" stroke-dasharray="${progress} 100"></circle></svg><span>${escapeHtml(label)}</span></button>`;
 }
@@ -9961,8 +11095,8 @@ function renderImaLibraryMode() {
       : `<span class="ima-scope-toggle is-disabled">导入后可用于对话</span>`;
   const linkedKinds = knowledgeLocalBindingKinds(active);
   const localLibraryActions = [
-    linkedKinds.file ? "" : `<button type="button" data-action="choose-library-files" data-notebook-id="${escapeHtml(active?.notebook_id || "")}">${uiIcon("link")}链接文件</button>`,
-    linkedKinds.folder ? "" : `<button type="button" data-action="choose-library-folder" data-notebook-id="${escapeHtml(active?.notebook_id || "")}">${uiIcon("folder-open")}链接文件夹</button>`,
+    `<button type="button" data-action="choose-library-files" data-notebook-id="${escapeHtml(active?.notebook_id || "")}">${uiIcon("link")}${linkedKinds.file ? "添加文件" : "链接文件"}</button>`,
+    `<button type="button" data-action="choose-library-folder" data-notebook-id="${escapeHtml(active?.notebook_id || "")}">${uiIcon("folder-open")}${linkedKinds.folder ? "添加文件夹" : "链接文件夹"}</button>`,
   ].filter(Boolean).join("") || `<span class="ima-library-linked-status" title="文件与文件夹已连接">已全部连接</span>`;
   const libraryToolbarActions = kind === "zotero"
     ? `<button type="button" data-action="choose-zotero-library" data-notebook-id="${escapeHtml(active?.notebook_id || "")}">${uiIcon(zoteroConnected ? "refresh-cw" : "link")} ${escapeHtml(zoteroActionLabel)}</button>`
@@ -10104,7 +11238,7 @@ const ONBOARDING_VISION_MODEL = "openbmb/MiniCPM-V-4.6-BNB";
 const ONBOARDING_RESOURCE_ORDER = ["embedding", "reranking", "chat", "vision", "audio"];
 const RESOURCE_GUIDE_STEPS = [
   { id: "retrieval", label: "研究检索组件", eyebrow: "第 1 页 · 研究检索组件", title: "先把研究检索准备好", description: "嵌入模型负责召回，重排模型负责筛选；这是最推荐优先配置的一组本地能力。", resourceIds: ["embedding", "reranking"] },
-  { id: "knowledge", label: "知识库链接", eyebrow: "第 2 页 · 知识库链接", title: "把你的资料链接进来", description: "模型准备好后，再选择知识库和资料源。原文件留在原处，ScanSci 只建立本地索引与证据定位。", resourceIds: [] },
+  { id: "knowledge", label: "知识库链接", eyebrow: "第 2 页 · 知识库链接", title: "把你的资料链接进来", description: "需要检索个人资料时，再选择知识库和资料源。没有语义模型时会继续使用关键词检索。", resourceIds: [] },
   { id: "multimodal", label: "视觉与语音", eyebrow: "第 3 页 · 视觉与语音", title: "按需添加视觉和语音", description: "图片理解与语音转写彼此独立；没有对应需求时可以直接跳过。", resourceIds: ["vision", "audio"] },
   { id: "chat", label: "小型本地对话模型", eyebrow: "第 4 页 · 可选能力", title: "最后再考虑本地对话", description: "小型本地对话模型不是必需项。只有在你希望离线对话或网络不稳定时，才建议安装。", resourceIds: ["chat"] },
 ];
@@ -10429,6 +11563,50 @@ function installResourceOnboardingDragHandle(host) {
   backdrop.prepend(handle);
 }
 
+function resourceOnboardingDialog() {
+  return byId("resourceOnboarding")?.querySelector?.('[role="dialog"]') || null;
+}
+
+function focusResourceOnboardingDialog() {
+  const dialog = resourceOnboardingDialog();
+  if (!dialog || dialog.contains(document.activeElement)) return;
+  const target = dialog.querySelector('.resource-guide-close, button:not(:disabled), [href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled)');
+  (target || dialog).focus({ preventScroll: true });
+}
+
+function trapResourceOnboardingFocus(event) {
+  const dialog = resourceOnboardingDialog();
+  if (!dialog || event.key !== "Tab") return false;
+  const controls = [...dialog.querySelectorAll('button:not(:disabled), [href], input:not(:disabled), select:not(:disabled), textarea:not(:disabled), [tabindex]:not([tabindex="-1"])')]
+    .filter((element) => !element.hidden && element.offsetParent !== null);
+  if (!controls.length) {
+    event.preventDefault();
+    dialog.focus({ preventScroll: true });
+    return true;
+  }
+  const first = controls[0];
+  const last = controls[controls.length - 1];
+  if (event.shiftKey && (document.activeElement === first || !dialog.contains(document.activeElement))) {
+    event.preventDefault();
+    last.focus();
+  } else if (!event.shiftKey && (document.activeElement === last || !dialog.contains(document.activeElement))) {
+    event.preventDefault();
+    first.focus();
+  }
+  return true;
+}
+
+function restoreOnboardingFocus() {
+  const settingsFallback = state.activeView === "settings"
+    ? document.querySelector('[data-action="reopen-resource-onboarding"], [data-action="open-resource-guide"]')
+    : null;
+  const target = onboardingReturnFocus?.isConnected && !["BODY", "HTML"].includes(onboardingReturnFocus.tagName)
+    ? onboardingReturnFocus
+    : settingsFallback || byId("homeQuestionInput");
+  onboardingReturnFocus = null;
+  window.setTimeout(() => target?.focus?.({ preventScroll: true }), 0);
+}
+
 function renderDataOnboarding() {
   const sources = connectedDataSourceCount();
   return `<div class="resource-onboarding-backdrop"><section class="resource-onboarding-card" role="dialog" aria-modal="true" aria-labelledby="resourceOnboardingTitle"><aside class="resource-onboarding-aside"><span class="resource-onboarding-brand">ScanSci · FIRST RUN</span><div class="resource-onboarding-glyph">${uiIcon("library")}</div><h1 id="resourceOnboardingTitle">把资料留在原处，<br />让证据变得可用。</h1><p>选择你愿意连接的资料源。ScanSci 只读取内容、建立本地索引与引用定位，不会移动或上传原文件。</p><div class="resource-onboarding-note"><span>${uiIcon("map-pin")}</span><p>每条回答都可回到文档、章节和原文证据片段。扫描件无法读取时会明确提示你启用 OCR。</p></div></aside><main class="resource-onboarding-main data-onboarding-main"><header><div><span>资料接入</span><h2>从一个资料源开始就够了</h2><p>连接后会自动完成：文档 → 章节 → 原文证据片段。其他资料源可随后在知识库中添加。</p></div><span class="resource-onboarding-step">02 / 02</span></header><div class="data-source-grid">${onboardingSourceCard({ kind: "folder", action: "onboarding-connect-folder", title: "本地文件夹", description: "递归读取论文、报告、Markdown 和常见办公文档。", actionLabel: "选择文件夹" })}${onboardingSourceCard({ kind: "zotero", action: "onboarding-connect-zotero", title: "Zotero", description: "连接本机文献库与其已管理的论文附件。", actionLabel: "连接 Zotero" })}${onboardingSourceCard({ kind: "obsidian", action: "onboarding-connect-obsidian", title: "Obsidian", description: "保留 Vault 的笔记层级，并为每个段落建立定位。", actionLabel: "选择 Vault" })}${onboardingSourceCard({ kind: "notion", action: "onboarding-connect-notion", title: "Notion", description: "使用你的 Integration 同步已授权的页面和数据库。", actionLabel: "连接 Notion" })}</div>${guidedImportJobMarkup()}<footer><p>${sources ? `<strong>已连接 ${sources} 个资料源。</strong> 你可完成配置；资料仍会在后台建立语义索引。` : "不接入资料也可先体验 ScanSci；随时可在 设置 · 默认能力 或 知识库 中继续。"}</p><div><button type="button" class="resource-skip-button" data-action="back-resource-onboarding">上一步</button><button type="button" class="resource-skip-button" data-action="skip-resource-onboarding">暂时跳过</button>${sources ? `<button type="button" class="resource-finish-button" data-action="finish-data-onboarding">完成并开始 ${uiIcon("arrow-up-right")}</button>` : ""}</div></footer></main></section></div>`;
@@ -10473,10 +11651,11 @@ function renderResourceGuideOverlay() {
   const nextButton = lastStep
     ? `<button type="button" class="resource-finish-button" data-action="close-resource-guide" data-resource-guide-result="complete">完成向导 ${uiIcon("check")}</button>`
     : `<button type="button" class="resource-finish-button" data-action="resource-guide-next">下一页 ${uiIcon("arrow-right")}</button>`;
-  return `<div class="resource-onboarding-backdrop"><section class="resource-onboarding-card resource-guide-card resource-guide-wizard" role="dialog" aria-modal="true" aria-labelledby="resourceGuideTitle"><aside class="resource-onboarding-aside resource-guide-aside"><span class="resource-onboarding-brand">ScanSci · LOCAL GUIDE</span><div class="resource-onboarding-glyph">${uiIcon(step.id === "knowledge" ? "library" : step.id === "multimodal" ? "eye" : step.id === "chat" ? "brain" : "download")}</div><h1 id="resourceGuideTitle">把本地能力<br />一步步配好。</h1><p>按照研究检索、知识库、视觉语音和本地对话的顺序配置；每一页都可以跳过。</p><ol class="resource-guide-step-rail">${resourceGuideStepRail(currentIndex)}</ol><div class="resource-onboarding-note"><span>${uiIcon("shield-check")}</span><p>模型只保存在这台电脑上。没有下载模型，也不影响基础对话和关键词检索。</p></div></aside><main class="resource-onboarding-main resource-guide-main"><header><div><span>${escapeHtml(step.eyebrow)}</span><h2>${escapeHtml(step.title)}</h2><p>${escapeHtml(step.description)}</p></div><span class="resource-guide-count">${readyCount}/${snapshots.length} 已就绪</span></header><div class="resource-guide-wizard-body">${resourceGuidePageMarkup(step)}</div><footer><p>第 ${currentIndex + 1} / ${RESOURCE_GUIDE_STEPS.length} 页 · 关闭后可从“默认能力”页再次打开。</p><div><button type="button" class="resource-skip-button" data-action="close-resource-guide" data-resource-guide-result="skip">暂时跳过</button>${backButton}${nextButton}</div></footer></main></section></div>`;
+  return `<div class="resource-onboarding-backdrop resource-guide-backdrop"><section class="resource-onboarding-card resource-guide-card resource-guide-wizard" role="dialog" aria-modal="true" aria-labelledby="resourceGuideTitle" tabindex="-1"><aside class="resource-onboarding-aside resource-guide-aside"><span class="resource-onboarding-brand">ScanSci · LOCAL GUIDE</span><div class="resource-onboarding-glyph">${uiIcon(step.id === "knowledge" ? "library" : step.id === "multimodal" ? "eye" : step.id === "chat" ? "brain" : "download")}</div><h1 id="resourceGuideTitle">把本地能力<br />一步步配好。</h1><p>按照研究检索、知识库、视觉语音和本地对话的顺序配置；每一页都可以跳过。</p><ol class="resource-guide-step-rail">${resourceGuideStepRail(currentIndex)}</ol><div class="resource-onboarding-note"><span>${uiIcon("shield-check")}</span><p>模型只保存在这台电脑上。没有下载模型，也不影响基础对话和关键词检索。</p></div></aside><main class="resource-onboarding-main resource-guide-main"><header><div><span>${escapeHtml(step.eyebrow)}</span><h2>${escapeHtml(step.title)}</h2><p>${escapeHtml(step.description)}</p></div><div class="resource-guide-header-actions"><span class="resource-guide-count">${readyCount}/${snapshots.length} 已就绪</span><button type="button" class="resource-guide-close" data-action="close-resource-guide" data-resource-guide-result="skip" aria-label="关闭本地能力引导">${uiIcon("x")}</button></div></header><div class="resource-guide-wizard-body">${resourceGuidePageMarkup(step)}</div><footer><p>第 ${currentIndex + 1} / ${RESOURCE_GUIDE_STEPS.length} 页 · 关闭后可从“本地模型”页再次打开。</p><div><button type="button" class="resource-skip-button" data-action="close-resource-guide" data-resource-guide-result="skip">暂时跳过</button>${backButton}${nextButton}</div></footer></main></section></div>`;
 }
 
 function openResourceGuideOverlay() {
+  if (state.onboardingMode !== "resources") onboardingReturnFocus = document.activeElement;
   state.onboardingMode = "resources";
   state.resourceGuideStep = 0;
   state.onboardingOpen = true;
@@ -10488,17 +11667,17 @@ function openResourceGuideOverlay() {
 async function closeResourceGuideOverlay(result = "skip") {
   state.onboardingMode = "";
   state.resourceGuideStep = 0;
-  if (result === "complete") {
-    await persistOnboardingPreferences(
-      { resource_setup_completed: true },
-      "本地能力配置已完成；之后可随时再次打开引导",
-      { close: true },
-    );
-    return;
-  }
-  state.onboardingOpen = false;
-  renderResourceOnboarding();
-  toast("已跳过本地能力配置；需要时可在默认能力页重新打开。", false);
+  const persistence = persistOnboardingPreferences(
+    result === "complete"
+      ? { welcome_dismissed: true, resource_setup_completed: true }
+      : { welcome_dismissed: true },
+    result === "complete"
+      ? "本地能力配置已完成；之后可随时再次打开引导"
+      : "已关闭本地能力配置；需要时可在本地模型页重新打开",
+    { close: true },
+  );
+  restoreOnboardingFocus();
+  await persistence;
 }
 
 function renderLegacyResourceOnboarding() {
@@ -10540,7 +11719,35 @@ function ensureOnboardingStorageConfigured() {
   return false;
 }
 
+function renderFirstRunWelcome() {
+  const host = byId("firstRunWelcome");
+  if (!host) return;
+  const visible = Boolean(
+    state.settings
+    && state.onboardingOpen
+    && state.onboardingMode === "welcome"
+    && state.activeView === "home",
+  );
+  host.hidden = !visible;
+  if (!visible) {
+    host.innerHTML = "";
+    return;
+  }
+  const disabled = state.onboardingPersisting ? " disabled" : "";
+  host.setAttribute("aria-busy", String(state.onboardingPersisting));
+  host.innerHTML = `<div class="first-run-welcome-copy"><span class="first-run-welcome-mark">${uiIcon("sparkles")}</span><div><h2 id="firstRunWelcomeTitle">现在就可以开始</h2><p>无需先安装本地模型。直接描述任务；知识库、本地能力和插件都可以按需添加。</p></div></div><div class="first-run-welcome-actions"><button type="button" class="first-run-primary" data-action="finish-first-run"${disabled}>开始研究</button><button type="button" data-action="onboarding-open-knowledge"${disabled}>连接知识库</button><button type="button" data-action="onboarding-open-models"${disabled}>配置本地能力</button></div>`;
+  host.setAttribute("aria-labelledby", "firstRunWelcomeTitle");
+  hydrateIcons(host);
+}
+
+async function finishFirstRun(message = "已进入研究工作区", { focusComposer = true } = {}) {
+  state.onboardingMode = "";
+  await persistOnboardingPreferences({ welcome_dismissed: true }, message, { close: true });
+  if (focusComposer) window.setTimeout(() => byId("homeQuestionInput")?.focus({ preventScroll: true }), 0);
+}
+
 function renderResourceOnboarding() {
+  renderFirstRunWelcome();
   const steps = [
     ["welcome", "认识工作区"],
     ["models", "按需配置模型"],
@@ -10561,17 +11768,17 @@ function renderResourceOnboarding() {
     host.innerHTML = "";
     return;
   }
-  // Only the current four-page guide is allowed to appear. Older persisted
-  // state used the retired three-page flow and its obsolete resource route.
-  if (state.onboardingMode !== "resources") {
-    state.onboardingMode = "resources";
-    state.resourceGuideStep = 0;
+  if (state.onboardingMode === "welcome") {
+    host.hidden = true;
+    host.innerHTML = "";
+    return;
   }
   if (state.onboardingMode === "resources") {
     host.hidden = false;
     host.innerHTML = renderResourceGuideOverlay();
     installResourceOnboardingDragHandle(host);
     hydrateIcons(host);
+    window.setTimeout(focusResourceOnboardingDialog, 0);
     return;
   }
   host.hidden = false;
@@ -10900,7 +12107,6 @@ function renderStorageSettings() {
       </div>
       <footer class="storage-settings-footer"><span>${uiIcon("info")}数据不会因软件更新被自动删除。</span><button type="button" class="settings-primary-button" data-action="open-general-directories">管理目录</button></footer>
     </section>
-    <section class="storage-settings-card storage-settings-note"><span class="storage-settings-icon">${uiIcon("shield-check")}</span><div><h2>安全与兼容</h2><p>本页只展示当前路径，不会在没有明确确认和完整校验前移动或覆盖你的数据。</p></div></section>
   </main>`;
 }
 
@@ -11325,7 +12531,9 @@ function renderGeneralSettings() {
     amber: "#BB7518",
   };
   const accentOption = (value) => `<option value="${escapeHtml(value)}" data-accent-color="${accentHex[value]}" ${appearance.accent === value ? "selected" : ""}>${accentHex[value]}</option>`;
-  const modelLabel = provider ? `${provider.name} · ${model?.name || ""}` : (appearance.locale === "en" ? "Not selected" : "未选择");
+  const modelLabel = provider
+    ? uniqueModelProviderLabel(provider.name, model?.name || "")
+    : (appearance.locale === "en" ? "Not selected" : "未选择");
   const tabs = [
     ["appearance", copy("generalTabAppearance"), "settings"],
     ["conversation", copy("generalTabConversation"), "message-circle"],
@@ -11427,8 +12635,45 @@ function renderSoftwareUpdateSettings() {
 function selectedProvider() {
   const providers = state.settings?.providers || [];
   const selected = providers.find((provider) => provider.id === state.selectedProviderId);
-  if (selected?.kind !== "local") return selected || providers.find((provider) => provider.kind !== "local") || providers[0];
-  return providers.find((provider) => provider.kind !== "local") || selected || providers[0];
+  if (selected && !isLocalModelProvider(selected)) return selected;
+  return providers.find((provider) => !isLocalModelProvider(provider)) || selected || providers[0];
+}
+
+function verifiedLocalServiceModels() {
+  const models = new Map();
+  const installed = state.localModelMarket?.installed || [];
+  const snapshots = new Map(installed.map((item) => [String(item.id), item]));
+  const ready = (item) => Boolean(item?.ready) && item.runtime_compatible !== false;
+  const add = (model) => {
+    const id = String(model.model_id || model.id || "");
+    if (id && !models.has(id)) models.set(id, { ...model, id, group: "本地模型" });
+  };
+  for (const provider of state.settings?.providers || []) {
+    if (!isLocalModelProvider(provider) || provider.id === "local-evidence" || !provider.enabled) continue;
+    for (const model of provider.models || []) {
+      const snapshot = snapshots.get(String(model.id));
+      const health = modelHealthEntry(provider.id, model.id);
+      if (model.available === false || (snapshot && !ready(snapshot))) continue;
+      if (health ? ["ready", "connected", "configured"].includes(health.status) : ready(snapshot)) add(model);
+    }
+  }
+  for (const model of state.settings?.local_models || []) {
+    if (model.runtime === "builtin" || model.enabled === false || model.runtime_compatible === false) continue;
+    if (ready(snapshots.get(String(model.model_id)))) add(model);
+  }
+  for (const item of installed) {
+    if (!ready(item)) continue;
+    const capabilities = Array.isArray(item.capabilities) ? item.capabilities
+      : ["embedding", "reranking", "vision", "audio", "image"].includes(item.kind) ? [item.kind] : [];
+    add({ ...item, capabilities });
+  }
+  return [...models.values()];
+}
+
+function localServiceModelsMarkup(models, query = "") {
+  const visible = models.filter((model) => !query || `${model.name || ""} ${model.id} 本地模型`.toLocaleLowerCase().includes(query));
+  if (!visible.length) return "";
+  return `<section class="cherry-model-group" data-local-model-group><header><strong>本地模型</strong></header>${visible.map((model) => `<article class="cherry-model-row"><span class="cherry-model-mark">${uiIcon("cpu")}</span><div class="cherry-model-copy"><button type="button" data-action="open-settings" data-settings-panel="local-models">${escapeHtml(model.name || model.id)}</button><small>${escapeHtml(model.id)}${model.context_window ? ` · ${escapeHtml(model.context_window)}` : ""}</small></div>${modelCapabilityChips(model, -1, { readOnly: true })}<button type="button" class="cherry-icon-button" data-action="open-settings" data-settings-panel="local-models" aria-label="管理本地模型">${uiIcon("settings")}</button></article>`).join("")}</section>`;
 }
 
 function renderModelsSettings() {
@@ -11436,9 +12681,10 @@ function renderModelsSettings() {
   if (!provider) return `${settingsHeading("模型服务", "添加并选择用于研究对话的模型提供商。")}<div class="empty-records">还没有可用提供商。</div>`;
   state.selectedProviderId = provider.id;
   const allProviders = state.settings.providers || [];
+  const localServiceModels = provider.id === "scansci-managed" ? verifiedLocalServiceModels() : [];
   const query = state.providerQuery.trim().toLocaleLowerCase();
   const matchesQuery = (item) => !query || `${item.name} ${item.category || ""} ${item.summary || ""}`.toLocaleLowerCase().includes(query);
-  const catalogProviders = allProviders.filter((item) => item.kind !== "local" && matchesQuery(item));
+  const catalogProviders = allProviders.filter((item) => !isLocalModelProvider(item) && matchesQuery(item));
   // ON/OFF is the single source of truth for the provider's enabled state in
   // the catalog. A second health/status label made the row wrap and repeated
   // the same enabled/disabled meaning in a less scannable form.
@@ -11454,15 +12700,50 @@ function renderModelsSettings() {
     if (!groupedModels.has(group)) groupedModels.set(group, []);
     groupedModels.get(group).push({ model, index });
   });
-  const modelRows = [...groupedModels.entries()].map(([group, models]) => `<section class="cherry-model-group"><header><strong>${escapeHtml(group)}</strong></header>${models.map(({ model, index }) => `<article class="cherry-model-row"><span class="cherry-model-mark">${escapeHtml((group || "M").slice(0, 1).toUpperCase())}</span><div class="cherry-model-copy"><button type="button" data-action="edit-model" data-model-index="${index}">${escapeHtml(model.name || model.id)}</button><small>${escapeHtml(model.id)}${model.context_window ? ` · ${escapeHtml(model.context_window)}` : ""}</small></div>${modelCapabilityChips(model, index)}<details class="cherry-model-more"><summary aria-label="编辑模型能力">${uiIcon("settings")}</summary>${modelCapabilityChips(model, index, { showAll: true })}</details><button class="cherry-row-remove" type="button" data-action="remove-model" data-model-index="${index}" aria-label="移除模型">${uiIcon("minus")}</button></article>`).join("")}</section>`).join("");
+  const modelRows = [...groupedModels.entries()].map(([group, models]) => `<section class="cherry-model-group"><header><strong>${escapeHtml(group)}</strong></header>${models.map(({ model, index }) => `<article class="cherry-model-row ${model.available === false ? "is-unavailable" : ""}"><span class="cherry-model-mark">${escapeHtml((group || "M").slice(0, 1).toUpperCase())}</span><div class="cherry-model-copy"><button type="button" data-action="edit-model" data-model-index="${index}">${escapeHtml(model.name || model.id)}</button><small>${escapeHtml(model.id)}${model.context_window ? ` · ${escapeHtml(model.context_window)}` : ""}${model.available === false ? ` · ${escapeHtml(model.unavailable_reason || "模型目录当前不可访问")}` : ""}</small></div>${modelCapabilityChips(model, index)}<details class="cherry-model-more"><summary aria-label="编辑模型能力">${uiIcon("settings")}</summary>${modelCapabilityChips(model, index, { showAll: true })}</details><button class="cherry-row-remove" type="button" data-action="remove-model" data-model-index="${index}" aria-label="移除模型">${uiIcon("minus")}</button></article>`).join("")}</section>`).join("");
   const kindOptions = ["local", "openai-compatible", "anthropic-compatible"].map((kind) => `<option value="${kind}" ${provider.kind === kind ? "selected" : ""}>${kind === "local" ? "本地" : kind}</option>`).join("");
   const customNameField = isBuiltInProvider(provider) ? `<input type="hidden" name="provider-name" value="${escapeHtml(provider.name)}" />` : `<label class="cherry-field"><span>服务商名称</span><input name="provider-name" value="${escapeHtml(provider.name)}" required maxlength="80" /></label>`;
   const kindField = isBuiltInProvider(provider) ? `<input type="hidden" name="provider-kind" value="${escapeHtml(provider.kind)}" />` : `<label class="cherry-field cherry-kind-field"><span>接口类型</span><select name="provider-kind">${kindOptions}</select></label>`;
   const isManaged = provider.auth_mode === "managed";
-  const keyField = isManaged ? `<p class="cherry-field-hint">此模型由 ScanSci 托管提供，使用时无需配置 API 密钥。</p>` : provider.kind !== "local" ? `<div class="cherry-key-row"><label class="cherry-field cherry-secret-field"><span>API 密钥${provider.api_key_configured ? '<em>已保存</em>' : ""}</span><span class="cherry-secret-control"><input name="provider-api-key" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false" placeholder="${provider.api_key_configured ? "••••••••••••••••" : "输入后仅保存在系统凭据管理器"}" /><button type="button" class="cherry-secret-toggle" data-action="toggle-provider-key" aria-label="${provider.api_key_configured ? "显示已保存的 API 密钥" : "显示 API 密钥"}" aria-pressed="false" title="${provider.api_key_configured ? "显示已保存的密钥" : "显示密钥"}">${uiIcon("eye")}</button></span></label><button type="button" class="cherry-detect-button" data-action="test-provider" ${!provider.api_key_configured ? "disabled" : ""}>检 测</button></div><p class="cherry-field-hint">${provider.api_key_configured ? "密钥默认隐藏；仅在点击眼睛时从本机凭据管理器读取。" : "多个密钥可用英文逗号分隔。"}</p>` : `<p class="cherry-field-hint">内置证据引擎不需要 API 密钥。</p>`;
+  const providerUsesEnvironmentKey = provider.api_key_source === "environment";
+  const providerKeyLabel = providerUsesEnvironmentKey ? "环境变量" : "已保存";
+  const providerKeyHint = providerUsesEnvironmentKey
+    ? `当前使用环境变量 <code>${escapeHtml(provider.api_key_env || "")}</code>；设置页不会覆盖它。`
+    : provider.api_key_configured
+      ? "密钥默认隐藏；仅在点击眼睛时从本机凭据管理器读取。"
+      : provider.api_key_env
+        ? `未检测到密钥；也可设置环境变量 <code>${escapeHtml(provider.api_key_env)}</code>。`
+        : "多个密钥可用英文逗号分隔。";
+  const keyField = isManaged ? `<p class="cherry-field-hint">云端模型由 ScanSci 托管提供，无需配置 API 密钥；本地模型通过这台电脑的运行时调用。</p>` : provider.kind !== "local" ? `<div class="cherry-key-row"><label class="cherry-field cherry-secret-field"><span>API 密钥${provider.api_key_configured ? `<em>${providerKeyLabel}</em>` : ""}</span><span class="cherry-secret-control"><input name="provider-api-key" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false" placeholder="${provider.api_key_configured ? "••••••••••••••••" : "输入后仅保存在系统凭据管理器"}" /><button type="button" class="cherry-secret-toggle" data-action="toggle-provider-key" aria-label="${provider.api_key_configured ? "显示已保存的 API 密钥" : "显示 API 密钥"}" aria-pressed="false" title="${provider.api_key_configured ? "显示已保存的密钥" : "显示密钥"}">${uiIcon("eye")}</button></span></label><button type="button" class="cherry-detect-button" data-action="test-provider" ${!provider.api_key_configured ? "disabled" : ""}>检 测</button></div><p class="cherry-field-hint">${providerKeyHint}</p>` : `<p class="cherry-field-hint">内置证据引擎不需要 API 密钥。</p>`;
+  const isZhipu = provider.id === "zhipu";
+  const codingPlanEnabled = isZhipu && Boolean(provider.coding_plan_enabled);
+  const codingPlanField = isZhipu
+    ? `<div class="cherry-endpoint-mode"><div class="cherry-endpoint-mode-copy"><strong>GLM Coding Plan</strong><small>启用智谱 Coding Plan 专用 API 地址</small></div><label class="cherry-toggle cherry-endpoint-toggle"><input name="provider-coding-plan" type="checkbox" ${codingPlanEnabled ? "checked" : ""} aria-label="启用 GLM Coding Plan" /><span aria-hidden="true"></span></label></div>`
+    : "";
+  const endpointLabel = isZhipu
+    ? `API 地址 <i>⌁</i><b class="cherry-endpoint-mode-label">${codingPlanEnabled ? "Coding Plan" : "标准 API"}</b>`
+    : "API 地址 <i>⌁</i>";
   const restoreDefaultButton = isBuiltInProvider(provider) ? '<button type="button" class="cherry-restore-default" data-action="restore-provider-default">恢复默认</button>' : "";
-  const providerHeaderActions = `${restoreDefaultButton}${provider.api_key_configured && !isManaged ? '<button type="button" class="cherry-text-button" data-action="remove-provider-key">移除密钥</button>' : ""}<button type="button" class="cherry-text-button" data-action="refresh-model-health" ${state.modelHealth?.loading ? "disabled" : ""}>${state.modelHealth?.loading ? "检查中…" : "刷新状态"}</button><button type="submit" class="cherry-save-button">保存</button>`;
-  return `<section class="cherry-model-services"><aside class="cherry-provider-catalog"><label class="cherry-provider-search"><svg class="cherry-search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.75" cy="10.75" r="6.75"></circle><path d="m16 16 5 5"></path></svg><input id="modelServiceSearch" type="search" value="${escapeHtml(state.providerQuery)}" placeholder="搜索模型平台..." autocomplete="off" /></label><div class="cherry-provider-scroll">${providerItems || '<div class="cherry-provider-empty">没有匹配的模型平台</div>'}${localRuntimeNotice}</div><button class="cherry-add-provider" type="button" data-action="add-provider">＋&nbsp; 添加</button></aside><main class="cherry-provider-panel"><form id="modelProviderForm"><header class="cherry-provider-header"><div><div class="cherry-provider-name">${providerLogo(provider)}<h1>${escapeHtml(provider.name)}</h1><button type="button" class="cherry-mini-gear" aria-label="服务商设置">⚙</button></div>${kindField}</div><div class="cherry-provider-header-actions">${providerHeaderActions}<span class="cherry-provider-header-divider" aria-hidden="true"></span><label class="cherry-toggle"><input name="provider-enabled" type="checkbox" ${provider.enabled ? "checked" : ""} /><span></span></label></div></header><section class="cherry-connection-section">${customNameField}${keyField}<label class="cherry-field"><span>API 地址 <i>⌁</i></span><input name="provider-base-url" value="${escapeHtml(provider.base_url || "")}" placeholder="https://api.example.com/v1" maxlength="500" ${isManaged ? "readonly" : ""} /></label><p class="cherry-endpoint-preview">预览：${escapeHtml(provider.base_url ? `${provider.base_url.replace(/\/$/, "")}/chat/completions` : "请填写服务商 API 地址")}</p></section><section class="cherry-model-section"><header><div class="cherry-model-section-title"><h2>模型</h2><b>${provider.models.length}</b></div><label class="cherry-model-search"><span>⌕</span><input id="modelListSearch" type="search" value="${escapeHtml(state.modelQuery)}" placeholder="搜索模型..." aria-label="搜索模型" autocomplete="off" /></label><div class="cherry-model-actions"><button type="button" class="cherry-fetch-button" data-action="fetch-provider-models" ${provider.kind === "local" || !provider.model_listing ? "disabled" : ""}>↻&nbsp; 获取模型列表</button><button type="button" class="cherry-plus-button" data-action="add-model" aria-label="添加模型">＋</button></div></header><div class="cherry-model-list">${modelRows || `<div class="cherry-provider-empty">${modelQuery ? "没有匹配的模型" : "尚未添加模型"}</div>`}</div></section><footer class="cherry-provider-footer"><button type="button" class="cherry-remove-provider" data-action="remove-provider" ${isBuiltInProvider(provider) ? "disabled" : ""}>移除服务商</button></footer>${modelEditorMarkup(provider)}</form></main></section>`;
+  const providerHeaderActions = `${restoreDefaultButton}${provider.api_key_configured && !providerUsesEnvironmentKey && !isManaged ? '<button type="button" class="cherry-text-button" data-action="remove-provider-key">移除密钥</button>' : ""}<button type="button" class="cherry-text-button" data-action="refresh-model-health" ${state.modelHealth?.loading ? "disabled" : ""}>${state.modelHealth?.loading ? "检查中…" : "刷新状态"}</button><button type="submit" class="cherry-save-button">保存</button>`;
+  const endpointPreview = provider.id === "jev"
+    ? `POST ${provider.base_url || JEV_DEFAULT_ENDPOINT}`
+    : provider.id === "opencode-go"
+    ? "按所选模型自动选择 /chat/completions、/responses 或 /messages"
+    : provider.id === "paratera" && provider.base_url
+      ? "通义万相：/p003/text2image → /p003/tasks/{task_id}；CogView：/images/generations"
+    : provider.base_url
+      ? `${provider.base_url.replace(/\/$/, "")}/chat/completions`
+      : "请填写服务商 API 地址";
+  const providerGuide = provider.id === "zhipu"
+    ? `<p class="cherry-field-hint cherry-zhipu-guide"><span data-zhipu-guide-copy>${codingPlanEnabled ? "当前使用 Coding Plan 专用地址；该地址仅适用于 GLM Coding Plan。" : "当前使用标准 API 地址；开启 Coding Plan 后会切换到专用地址。"}</span><a href="https://docs.bigmodel.cn/cn/coding-plan/quick-start" target="_blank" rel="noopener noreferrer">查看官方说明 ↗</a></p>`
+    : provider.id === "opencode-go"
+    ? '<p class="cherry-field-hint">先在 OpenCode Zen 开通 Go 套餐并复制 API Key；保存后可直接获取模型列表。<a href="https://dev.opencode.ai/docs/go/" target="_blank" rel="noopener noreferrer">查看官方说明 ↗</a></p>'
+    : provider.id === "jev"
+      ? '<p class="cherry-field-hint">保存 TypeSafe API Key 后点击“检测”，ScanSci 会发送一次最小结构化判断请求验证接入。<a href="https://docs.typesafe.ai/api" target="_blank" rel="noopener noreferrer">查看 API 文档 ↗</a></p>'
+    : provider.id === "paratera"
+      ? '<p class="cherry-field-hint">保存密钥后，可在输入框选择 WanX2.1-T2I-Plus 生图，按服务商计费；也可在“默认能力”中设为图像生成模型。<a href="https://ai.paratera.com/document/llm/modalAbility/image" target="_blank" rel="noopener noreferrer">生图说明与价格 ↗</a></p>'
+    : "";
+  return `<section class="cherry-model-services"><aside class="cherry-provider-catalog"><label class="cherry-provider-search"><svg class="cherry-search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.75" cy="10.75" r="6.75"></circle><path d="m16 16 5 5"></path></svg><input id="modelServiceSearch" type="search" value="${escapeHtml(state.providerQuery)}" placeholder="搜索模型平台..." autocomplete="off" /></label><div class="cherry-provider-scroll">${providerItems || '<div class="cherry-provider-empty">没有匹配的模型平台</div>'}${localRuntimeNotice}</div><button class="cherry-add-provider" type="button" data-action="add-provider">＋&nbsp; 添加</button></aside><main class="cherry-provider-panel"><form id="modelProviderForm"><header class="cherry-provider-header"><div><div class="cherry-provider-name">${providerLogo(provider)}<h1>${escapeHtml(provider.name)}</h1><button type="button" class="cherry-mini-gear" aria-label="服务商设置">⚙</button></div>${kindField}</div><div class="cherry-provider-header-actions">${providerHeaderActions}<span class="cherry-provider-header-divider" aria-hidden="true"></span><label class="cherry-toggle"><input name="provider-enabled" type="checkbox" ${provider.enabled ? "checked" : ""} /><span></span></label></div></header><section class="cherry-connection-section">${customNameField}${keyField}${codingPlanField}<label class="cherry-field"><span>${endpointLabel}</span><input name="provider-base-url" value="${escapeHtml(provider.base_url || "")}" placeholder="https://api.example.com/v1" maxlength="500" ${isManaged ? "readonly" : ""} /></label>${providerGuide}<p class="cherry-endpoint-preview">预览：${escapeHtml(endpointPreview)}</p></section><section class="cherry-model-section"><header><div class="cherry-model-section-title"><h2>模型</h2><b>${provider.models.length + localServiceModels.length}</b></div><label class="cherry-model-search"><span>⌕</span><input id="modelListSearch" type="search" value="${escapeHtml(state.modelQuery)}" placeholder="搜索模型..." aria-label="搜索模型" autocomplete="off" /></label><div class="cherry-model-actions"><button type="button" class="cherry-fetch-button" data-action="fetch-provider-models" ${provider.kind === "local" || !provider.model_listing ? "disabled" : ""}>↻&nbsp; 获取模型列表</button><button type="button" class="cherry-plus-button" data-action="add-model" aria-label="添加模型">＋</button></div></header><div class="cherry-model-list">${(modelRows + localServiceModelsMarkup(localServiceModels, modelQuery)) || `<div class="cherry-provider-empty">${modelQuery ? "没有匹配的模型" : "尚未添加模型"}</div>`}</div></section><footer class="cherry-provider-footer"><button type="button" class="cherry-remove-provider" data-action="remove-provider" ${isBuiltInProvider(provider) ? "disabled" : ""}>移除服务商</button></footer>${modelEditorMarkup(provider)}</form></main></section>`;
 }
 
 function renderLegacyLocalModelsSettings() {
@@ -11535,7 +12816,7 @@ function renderLegacyLocalModelsSettings() {
           : `<button type="button" class="quiet-text-button" data-action="open-local-runtime-setup">查看运行时</button>`;
     const status = isOllama && !ollama.reachable && !installed ? "需要 Ollama" : ready ? "已就绪" : job ? downloadJobStatus(job).label : "未下载";
     return `<article class="quiet-model-row">${item.icon_url ? `<img class="model-market-icon" data-site-icon="true" src="/api/site-icon?url=${encodeURIComponent(item.icon_url)}" alt="" loading="lazy" decoding="async" />` : `<span class="quiet-model-mark is-muted">${isOllama ? "◉" : "↓"}</span>`}<div><strong>${escapeHtml(item.name)}</strong><p>${escapeHtml(item.description || (isOllama ? "本地视觉模型" : "本地模型"))}${item.size_hint ? ` · ${escapeHtml(item.size_hint)}` : ""}</p><div class="local-capability-tags"><span>${capabilityLabel(item.kind)}</span><span>${status}</span></div></div>${action}</article>`;
-  }).join("") || '<div class="quiet-empty">市场目录暂不可用。</div>';
+  }).join("") || `<div class="quiet-empty">${state.localModelMarket?.loading ? "正在读取模型市场…" : "市场目录暂不可用。"}</div>`;
   const runtimeRows = (state.settings.local_models || []).map((item, index) => ({ item, index })).filter(({ item }) => item.runtime !== "builtin").map(({ item, index }) => `<details class="quiet-runtime-row"><summary><span class="quiet-model-mark">◌</span><span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(item.runtime)} · ${item.enabled ? "可用" : "已停用"}</small></span><span class="quiet-row-note">配置</span></summary><div class="quiet-runtime-fields"><label><span>名称</span><input data-local-name="${index}" value="${escapeHtml(item.name)}" /></label><label><span>运行时</span><input data-local-runtime="${index}" value="${escapeHtml(item.runtime)}" /></label><label><span>地址</span><input data-local-url="${index}" value="${escapeHtml(item.base_url || "")}" placeholder="http://127.0.0.1:11434/v1" /></label><label><span>模型 ID</span><input data-local-model="${index}" value="${escapeHtml(item.model_id || "")}" placeholder="例如 qwen3:8b" /></label><label class="quiet-switch"><input type="checkbox" data-local-enabled="${index}" ${item.enabled ? "checked" : ""} /><span>启用</span></label><div><button type="button" class="quiet-text-button" data-action="test-local-model" data-local-id="${escapeHtml(item.id)}">测试连接</button><button type="button" class="quiet-danger-button" data-action="remove-local-model" data-local-index="${index}">移除</button></div></div></details>`).join("") || '<div class="quiet-empty">尚未添加外部本地运行时。</div>';
   const capabilityCards = ONBOARDING_RESOURCE_ORDER
     .map((resourceId) => resourceInstallSnapshot(resourceId))
@@ -11755,10 +13036,13 @@ function stripLegacyLocalAgentRouting(page) {
 
 function renderLocalModelsSettings() {
   const installedItems = state.localModelMarket?.installed || [];
-  const usableInstalledCount = installedItems.filter((item) => item.ready && item.runtime_compatible !== false).length;
-  const incompleteInstalledCount = installedItems.filter((item) => !item.ready).length;
-   const incompatibleInstalledCount = installedItems.filter((item) => item.runtime_compatible === false || item.runtime_probe_state === "failed").length;
-  const installedSummary = `${usableInstalledCount} 可用${incompleteInstalledCount ? ` · ${incompleteInstalledCount} 未完成` : ""}${incompatibleInstalledCount ? ` · ${incompatibleInstalledCount} 不兼容` : ""}`;
+  const isUnavailableInstalledModel = (item) => item.runtime_compatible === false || item.runtime_probe_state === "failed";
+  const usableInstalledCount = installedItems.filter((item) => (
+    item.ready && !isUnavailableInstalledModel(item) && item.runtime_probe_state !== "pending"
+  )).length;
+  const unavailableInstalledCount = installedItems.filter(isUnavailableInstalledModel).length;
+  const incompleteInstalledCount = installedItems.length - usableInstalledCount - unavailableInstalledCount;
+  const installedSummary = `${usableInstalledCount} 可用${incompleteInstalledCount ? ` · ${incompleteInstalledCount} 未完成` : ""}${unavailableInstalledCount ? ` · ${unavailableInstalledCount} 不可用` : ""}`;
   const runtime = state.localRuntime || { installed: false, install_available: false, mode: "missing" };
   const runtimeReady = Boolean(runtime.installed) && !runtime.update_required;
   const ollama = state.ollama || {};
@@ -11769,10 +13053,19 @@ function renderLocalModelsSettings() {
     const incompatible = item.runtime_compatible === false || item.runtime_probe_state === "failed";
     const pendingProbe = item.runtime_probe_state === "pending";
     const status = incompatible ? (unsupportedAudio ? "当前格式不可运行" : "不可用") : pendingProbe ? "待验证" : item.ready ? "可用" : "未完成";
+    const statusClass = incompatible ? "is-unavailable" : pendingProbe || !item.ready ? "is-incomplete" : "is-ready";
     const icon = item.icon_url
       ? `<img class="model-market-icon" data-site-icon="true" src="/api/site-icon?url=${encodeURIComponent(item.icon_url)}" alt="" loading="lazy" decoding="async" />`
       : `<span class="quiet-model-mark">${kind === "chat" ? "◎" : "◇"}</span>`;
-    return `<article class="quiet-model-row">${icon}<div><strong>${escapeHtml(item.name)}</strong><div class="local-capability-tags"><span>${escapeHtml(({ chat: "对话", embedding: "嵌入", reranking: "重排", vision: "视觉", audio: "语音" }[kind] || "通用"))}</span>${item.format ? `<span>${escapeHtml(item.format)}</span>` : ""}</div>${(incompatible || pendingProbe) && item.runtime_message ? `<small class="quiet-model-warning">${escapeHtml(item.runtime_message)}</small>` : ""}</div><span class="quiet-row-note">${status}</span><span class="quiet-row-size">${size}</span><button type="button" class="quiet-danger-button local-installed-remove" data-action="delete-installed-local-model" data-model-id="${escapeHtml(item.id)}" aria-label="删除 ${escapeHtml(item.name)}">删除</button></article>`;
+    const probeable = (kind === "vision" || (kind === "chat" && /ForCausalLM|ForConditionalGeneration/i.test(String(item.architecture || ""))))
+      && item.model_files_present !== false;
+    const probeAction = incompatible && probeable
+      ? `<button type="button" class="quiet-text-button" data-action="retry-local-model-probe" data-model-id="${escapeHtml(item.id)}">重新检测</button>`
+      : "";
+    const warning = (incompatible || pendingProbe) && item.runtime_message
+      ? `<small class="quiet-model-warning" title="${escapeHtml(item.runtime_message)}">${escapeHtml(item.runtime_message)}</small>`
+      : "";
+    return `<article class="quiet-model-row local-installed-model-row">${icon}<div class="local-installed-model-copy"><strong>${escapeHtml(item.name)}</strong><div class="local-capability-tags"><span>${escapeHtml(({ chat: "对话", embedding: "嵌入", reranking: "重排", vision: "视觉", audio: "语音" }[kind] || "通用"))}</span>${item.format ? `<span>${escapeHtml(item.format)}</span>` : ""}</div>${warning}</div><span class="quiet-row-note local-installed-status ${statusClass}">${status}</span><span class="quiet-row-size">${size}</span><div class="local-installed-actions">${probeAction}<button type="button" class="quiet-danger-button local-installed-remove" data-action="delete-installed-local-model" data-model-id="${escapeHtml(item.id)}" title="删除 ${escapeHtml(item.name)}" aria-label="删除 ${escapeHtml(item.name)}">${uiIcon("trash")}</button></div></article>`;
   }).join("") || '<div class="quiet-empty">未发现本地模型快照。</div>';
   const audioRuntimeReady = runtimeReady && ["source", "embedded", "component"].includes(String(state.localRuntime?.mode || ""));
   const marketCatalog = (state.localModelMarket?.catalog || []).map((item) => {
@@ -11803,9 +13096,10 @@ function renderLocalModelsSettings() {
       : `<span class="quiet-model-mark is-muted">${isOllama ? "◉" : "↓"}</span>`;
     return `<article class="quiet-model-row">${icon}<div><strong>${escapeHtml(item.name)}</strong><p>${escapeHtml(item.description || "本地模型")}${item.size_hint ? ` · ${escapeHtml(item.size_hint)}` : ""}</p><div class="local-capability-tags"><span>${escapeHtml(({ chat: "对话", embedding: "嵌入", reranking: "重排", vision: "视觉", audio: "语音" }[item.kind] || "通用"))}</span><span>${status}</span></div></div>${action}</article>`;
   }).join("") || '<div class="quiet-empty">市场目录暂不可用。</div>';
-  return `<section class="quiet-settings-page local-models-page local-models-page--managed"><header class="quiet-page-heading"><div><span>LOCAL MODELS</span><h1>本地模型</h1><p>只在这里查看已安装模型，或从模型市场按需下载。</p></div><button type="button" class="quiet-text-button" data-action="refresh-local-model-market">${state.localModelMarket?.loading ? "检测中…" : "重新检测"}</button></header>
+  return `<section class="quiet-settings-page local-models-page local-models-page--managed">
+    <details class="local-model-disclosure local-model-market-disclosure" open><summary><span>模型市场</span><em>按需下载</em></summary><div class="local-model-disclosure-body"><form id="localModelMarketSearch" class="local-model-market-search"><input name="query" type="search" value="${escapeHtml(state.localModelMarket?.query || "")}" placeholder="搜索模型，例如 embedding、reranker、Qwen" aria-label="搜索模型市场" /><button type="submit" class="quiet-text-button">搜索</button></form><div class="quiet-model-list">${marketCatalog}</div></div></details>
     <section class="local-installed-panel"><header><div><span>INSTALLED</span><h2>已安装模型</h2><p>完成下载并通过校验的模型会出现在这里。</p></div><b>${escapeHtml(installedSummary)}</b></header><div class="quiet-model-list local-installed-model-list">${installed}</div></section>
-    <details class="local-model-disclosure local-model-market-disclosure" open><summary><span>模型市场</span><em>按需下载</em></summary><div class="local-model-disclosure-body"><form id="localModelMarketSearch" class="local-model-market-search"><input name="query" type="search" value="${escapeHtml(state.localModelMarket?.query || "")}" placeholder="搜索模型，例如 embedding、reranker、Qwen" /><button type="submit" class="quiet-text-button">搜索</button></form><div class="quiet-model-list">${marketCatalog}</div></div></details></section>`;
+    </section>`;
 }
 
 // Local model routing is automatic and is already represented by the default
@@ -11816,7 +13110,9 @@ function renderLocalModelsSettingsPage() {
   const installed = Array.isArray(state.localModelMarket?.installed)
     ? state.localModelMarket.installed
     : [];
-  const ready = installed.filter((item) => item?.ready && item?.runtime_compatible !== false);
+  const ready = installed.filter((item) => (
+    item?.ready && item?.runtime_compatible !== false && item?.runtime_probe_state !== "pending"
+  ));
   const conversationReady = ready.filter((item) => {
     const capabilities = Array.isArray(item?.capabilities) ? item.capabilities : [];
     return capabilities.includes("chat") || capabilities.includes("vision") || item?.kind === "vision";
@@ -11826,12 +13122,12 @@ function renderLocalModelsSettingsPage() {
     return capabilities.some((capability) => ["embedding", "reranking", "audio"].includes(String(capability)));
   }).length;
   const detectionNote = installed.length
-    ? `已发现 ${installed.length} 个本地模型快照；${conversationReady} 个可进入对话/视觉入口，${auxiliaryReady} 个用于检索、重排或语音。一个模型可以同时拥有多项能力，聊天下拉框只筛选当前入口可用的模型。`
-    : "尚未发现本地模型快照；下载完成后点击刷新，Agent 会按能力入口自动识别。";
+    ? `已发现 ${installed.length} 个本地模型；${conversationReady} 个可用于对话/视觉，${auxiliaryReady} 个用于检索、重排或语音。不同入口只显示可用模型。`
+    : "尚未发现本地模型；下载完成后重新检测，系统会自动识别模型能力。";
   return stripLegacyLocalAgentRouting(page)
     .replace(
       '<section class="local-installed-panel">',
-      `<section class="local-model-detection-note">${escapeHtml(detectionNote)}</section><section class="local-installed-panel">`,
+      `<section class="local-model-detection-note"><span>${escapeHtml(detectionNote)}</span><button type="button" class="quiet-text-button" data-action="refresh-local-model-market">${state.localModelMarket?.loading ? "检测中…" : `${uiIcon("refresh")}重新检测`}</button></section><section class="local-installed-panel">`,
     );
 }
 
@@ -12025,13 +13321,14 @@ function defaultConversationModelOptions(selected = "") {
     for (const model of provider.models || []) {
       const value = `${provider.id}::${model.id}`;
       if (seen.has(value) || !isConversationModel(model)) continue;
-      const usable = isProviderUsable(provider) && isSelectableConversationModel(model, provider);
-      if (!usable && value !== selected) continue;
+      const availability = conversationModelAvailability(model, provider);
+      if (!availability.visible) continue;
       seen.add(value);
-      const source = provider.kind === "local" ? "本地" : provider.auth_mode === "managed" ? "ScanSci" : "API";
+      const source = isLocalModelProvider(provider) ? "\u672c\u5730" : provider.auth_mode === "managed" ? "ScanSci" : "API";
       const modelName = String(model.name || model.id);
       const modelMeta = modelOptionMeta(provider, source);
-      options.push(`<option value="${escapeHtml(value)}" ${value === selected ? "selected" : ""} ${settingsModelOptionAttributes(modelName, modelMeta)}>${escapeHtml(modelOptionLabel(modelMeta, modelName))}</option>`);
+      const label = `${modelOptionLabel(modelMeta, modelName)}${availability.selectable ? "" : ` · ${availability.label}`}`;
+      options.push(`<option value="${escapeHtml(value)}" ${value === selected ? "selected" : ""} ${availability.selectable ? "" : "disabled"} ${settingsModelOptionAttributes(modelName, modelMeta)}>${escapeHtml(label)}</option>`);
     }
   }
   return options.join("");
@@ -12059,6 +13356,7 @@ function renderDefaultCapabilitiesSettings() {
   const assistantRows = defaultCapabilityRow({ conversation: true, title: "默认助手模型", description: "对话、任务、写作和演示统一使用。" });
   const multimodalRows = [
     { id: "vision", title: "视觉模型", description: "理解图片、图表和扫描页面。", capability: "vision" },
+    { id: "image", title: "图像生成", description: "根据文字生成并保存图片。", capability: "image" },
     { id: "audio", title: "语音模型", description: "把录音转成文字。", capability: "audio" },
   ].map((item) => defaultCapabilityRow(item)).join("");
   const retrievalRows = [
@@ -12069,7 +13367,7 @@ function renderDefaultCapabilitiesSettings() {
   return `<section class="settings-minimal-page default-capabilities-page"><header class="settings-page-heading default-capabilities-heading"><div><h1>默认能力</h1></div><button type="button" class="quiet-text-button" data-action="open-resource-guide">添加本地能力 ${uiIcon("arrow-right")}</button></header>
     <form id="defaultCapabilitiesForm"><div class="settings-minimal-sections">
       ${defaultCapabilityPanel("助手", "默认助手", "对话、任务、写作和演示使用同一个默认模型。", assistantRows)}
-      ${defaultCapabilityPanel("多模态", "视觉与语音", "没有配置时，相关功能会自动使用可用回退。", multimodalRows)}
+      ${defaultCapabilityPanel("多模态", "视觉、图像与语音", "图像理解、图像生成和语音能力可以分别选择模型。", multimodalRows)}
       ${defaultCapabilityPanel("知识库", "语义检索", "嵌入和重排可以独立选择；基础检索始终可用。", retrievalRows)}
     </div><footer class="settings-minimal-actions"><span>配置仅保存在此电脑</span><button type="submit" class="save-button">保存默认能力</button></footer></form>
     <section class="default-tools-section default-tools-disclosure">${renderDocumentProcessingFormMarkup("defaultDocumentProcessingForm", true)}</section>
@@ -12176,10 +13474,15 @@ function renderMcpMarketplaceCards(items, installedIds, loading) {
 
 function renderMyMcpServers(servers) {
   const records = servers.length ? servers.map((server) => {
-    const connector = ({ zotero: "Zotero", obsidian: "Obsidian", general: "通用" })[server.connector_kind] || "通用";
+    const connector = ({ zotero: "Zotero", obsidian: "Obsidian", literature: "文献 provider", general: "通用" })[server.connector_kind] || "通用";
     const update = (state.mcpMarketplace.updates || []).find((item) => String(item.id || "") === String(server.id || ""));
     const updateMarkup = update?.available ? `<button type="button" class="mcp-update-button" data-action="update-mcp-marketplace" data-record-id="${escapeHtml(server.id)}">更新</button>` : "";
-    return `<article class="mcp-owned-record"><span class="mcp-owned-icon">${uiIcon("server")}</span><div><header><h2>${escapeHtml(server.name)}</h2><span>${escapeHtml(server.source || "自定义 MCP")} · ${connector}</span></header><p>${escapeHtml(server.description || "未添加说明")}</p><small>${escapeHtml(server.transport === "streamable-http" ? server.endpoint : [server.command, server.args].filter(Boolean).join(" ") || "等待填写连接信息")}</small><small>${server.allow_write ? "已授权写操作" : "只读工具；写操作未授权"}</small></div><div class="mcp-owned-actions"><button type="button" data-action="test-mcp-server" data-record-id="${escapeHtml(server.id)}">测试</button>${updateMarkup}<label class="mcp-enabled-switch"><input type="checkbox" data-action="toggle-record" data-record-kind="mcp" data-record-id="${escapeHtml(server.id)}" ${server.enabled ? "checked" : ""} /><span>${server.enabled ? "启用" : "停用"}</span></label><button type="button" data-action="remove-record" data-record-kind="mcp" data-record-id="${escapeHtml(server.id)}" aria-label="移除 ${escapeHtml(server.name)}">${uiIcon("x")}</button></div></article>`;
+    const permission = server.allow_write
+      ? "已授权写操作"
+      : server.allow_reversible
+        ? "已授权文献产物写入；普通写操作未授权"
+        : "只读工具；产物写入未授权";
+    return `<article class="mcp-owned-record"><span class="mcp-owned-icon">${uiIcon("server")}</span><div><header><h2>${escapeHtml(server.name)}</h2><span>${escapeHtml(server.source || "自定义 MCP")} · ${connector}</span></header><p>${escapeHtml(server.description || "未添加说明")}</p><small>${escapeHtml(server.transport === "streamable-http" ? server.endpoint : [server.command, server.args].filter(Boolean).join(" ") || "等待填写连接信息")}</small><small>${permission}</small></div><div class="mcp-owned-actions"><button type="button" data-action="test-mcp-server" data-record-id="${escapeHtml(server.id)}">测试</button>${updateMarkup}<label class="mcp-enabled-switch"><input type="checkbox" data-action="toggle-record" data-record-kind="mcp" data-record-id="${escapeHtml(server.id)}" ${server.enabled ? "checked" : ""} /><span>${server.enabled ? "启用" : "停用"}</span></label><button type="button" data-action="remove-record" data-record-kind="mcp" data-record-id="${escapeHtml(server.id)}" aria-label="移除 ${escapeHtml(server.name)}">${uiIcon("x")}</button></div></article>`;
   }).join("") : `<div class="mcp-market-empty is-mine">${uiIcon("server")}<strong>还没有已保存的 MCP</strong><p>从“发现 MCP”添加官方目录中的服务器，或登记自己的本地/远程连接。</p></div>`;
   return `<section class="mcp-owned-list">${records}</section><button type="button" class="mcp-manual-trigger" data-action="open-mcp-manual">${uiIcon("plus")}创建自定义 MCP</button>`;
 }
@@ -12194,7 +13497,7 @@ function renderMcpCreateDialog() {
   const fields = isStdio
     ? `<div class="mcp-create-connection"><span class="mcp-create-connection-label">本地连接</span><label class="is-wide"><span>启动命令</span><input name="mcp-command" required maxlength="500" placeholder="例如：npx" autocomplete="off" /></label><label class="is-wide"><span>参数</span><input name="mcp-args" maxlength="1000" placeholder="例如：-y @scope/server" autocomplete="off" /></label><p>${uiIcon("shield-check")}命令仅作为连接配置保存，搜索科学不会在此时运行它。</p></div>`
     : `<div class="mcp-create-connection"><span class="mcp-create-connection-label">远程连接</span><label><span>传输协议</span><select name="mcp-transport"><option value="streamable-http">Streamable HTTP</option><option value="sse">Server-Sent Events</option></select></label><label class="is-wide"><span>服务端点</span><input name="mcp-endpoint" type="url" required maxlength="500" placeholder="https://example.org/mcp" autocomplete="url" /></label><p>${uiIcon("shield-check")}保存前只校验地址格式，不会向该端点发送请求。</p></div>`;
-  const form = `<form id="mcpManualForm" class="mcp-create-form" data-mcp-create-mode="${escapeHtml(mode)}"><header><button type="button" class="mcp-create-back" data-action="mcp-create-back">${uiIcon("arrow-left")}返回类型</button><div><span>${isStdio ? "本地 stdio MCP" : "远程 MCP 服务"}</span><h2>填写连接信息</h2></div></header><div class="mcp-create-form-grid"><section class="mcp-create-basics"><label><span>名称</span><input name="mcp-name" required maxlength="100" placeholder="例如：Zotero MCP" autofocus /></label><label><span>关联连接器</span><select name="mcp-connector-kind"><option value="general">通用 MCP</option><option value="zotero">Zotero</option><option value="obsidian">Obsidian</option></select></label><label><span>适用学科</span><select name="mcp-discipline">${disciplines.filter((item) => item.id !== "all").map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.label)}</option>`).join("")}</select></label><label class="is-wide"><span>用途说明</span><textarea name="mcp-description" maxlength="400" rows="3" placeholder="它会为研究流程提供什么能力？"></textarea></label><label class="is-wide"><span>标签（可选）</span><input name="mcp-tags" maxlength="200" placeholder="例如：文献、笔记、只读检索（用逗号分隔）" /></label><label class="is-wide mcp-write-permission"><input name="mcp-allow-write" type="checkbox" /><span>允许模型看到新增、修改、删除等写操作（默认关闭）</span></label><label class="is-wide mcp-write-permission"><input name="mcp-deferred" type="checkbox" checked /><span>按需发现工具并延迟连接（推荐，减少上下文和启动等待）</span></label></section>${fields}</div><aside class="mcp-create-review"><span>${uiIcon("lock-keyhole")}执行边界</span><p>保存不会启动连接；启用后，Pi 仅在任务需要时连接并发现工具。默认过滤写操作。</p></aside><footer><button type="button" data-action="close-mcp-manual">取消</button><button type="submit" class="mcp-create-save">${uiIcon("check")}保存到我的服务器</button></footer></form>`;
+  const form = `<form id="mcpManualForm" class="mcp-create-form" data-mcp-create-mode="${escapeHtml(mode)}"><header><button type="button" class="mcp-create-back" data-action="mcp-create-back">${uiIcon("arrow-left")}返回类型</button><div><span>${isStdio ? "本地 stdio MCP" : "远程 MCP 服务"}</span><h2>填写连接信息</h2></div></header><div class="mcp-create-form-grid"><section class="mcp-create-basics"><label><span>名称</span><input name="mcp-name" required maxlength="100" placeholder="例如：Zotero MCP" autofocus /></label><label><span>关联连接器</span><select name="mcp-connector-kind"><option value="general">通用 MCP</option><option value="literature">文献 provider</option><option value="zotero">Zotero</option><option value="obsidian">Obsidian</option></select></label><label><span>适用学科</span><select name="mcp-discipline">${disciplines.filter((item) => item.id !== "all").map((item) => `<option value="${escapeHtml(item.id)}">${escapeHtml(item.label)}</option>`).join("")}</select></label><label class="is-wide"><span>用途说明</span><textarea name="mcp-description" maxlength="400" rows="3" placeholder="它会为研究流程提供什么能力？"></textarea></label><label class="is-wide"><span>标签（可选）</span><input name="mcp-tags" maxlength="200" placeholder="例如：文献、笔记、只读检索（用逗号分隔）" /></label><label class="is-wide mcp-write-permission"><input name="mcp-allow-write" type="checkbox" /><span>允许模型看到新增、修改、删除等写操作（默认关闭）</span></label><label class="is-wide mcp-write-permission"><input name="mcp-allow-reversible" type="checkbox" /><span>文献 provider 允许下载文件等可逆产物（仅 literature 类型）</span></label><label class="is-wide mcp-write-permission"><input name="mcp-deferred" type="checkbox" checked /><span>按需发现工具并延迟连接（推荐，减少上下文和启动等待）</span></label></section>${fields}</div><aside class="mcp-create-review"><span>${uiIcon("lock-keyhole")}执行边界</span><p>保存不会启动连接；启用后，Pi 仅在任务需要时连接并发现工具。文献 provider 只开放已声明的检索和下载语义工具。</p></aside><footer><button type="button" data-action="close-mcp-manual">取消</button><button type="submit" class="mcp-create-save">${uiIcon("check")}保存到我的服务器</button></footer></form>`;
   return `<div class="mcp-create-overlay" role="presentation"><section class="mcp-create-dialog" role="dialog" aria-modal="true" aria-labelledby="mcpCreateTitle"><header class="mcp-create-dialog-top"><div><span>自定义连接</span><h1 id="mcpCreateTitle">创建 MCP</h1></div><button type="button" data-action="close-mcp-manual" aria-label="关闭创建 MCP">${uiIcon("x")}</button></header>${steps}${mode ? form : choose}</section></div>`;
 }
 
@@ -12261,6 +13564,7 @@ async function addManualMcpServer(form) {
     }
   }
   const tags = (form.elements["mcp-tags"]?.value || "").split(/[,，]/).map((tag) => tag.trim()).filter(Boolean).slice(0, 8);
+  const connectorKind = form.elements["mcp-connector-kind"].value || "general";
   state.settings.mcp_servers.push({
     id: `mcp-${Date.now()}`,
     name,
@@ -12270,8 +13574,10 @@ async function addManualMcpServer(form) {
     endpoint,
     transport: mode === "stdio" ? "stdio" : form.elements["mcp-transport"].value,
     discipline: form.elements["mcp-discipline"].value || "general",
-    connector_kind: form.elements["mcp-connector-kind"].value || "general",
+    connector_kind: connectorKind,
+    provider_kind: connectorKind === "literature" ? "literature" : "",
     allow_write: Boolean(form.elements["mcp-allow-write"].checked),
+    allow_reversible: connectorKind === "literature" && Boolean(form.elements["mcp-allow-reversible"]?.checked),
     deferred: Boolean(form.elements["mcp-deferred"].checked),
     tags,
     source: "自定义 MCP",
@@ -12302,6 +13608,17 @@ function collectProviderForm() {
   provider.name = form.elements["provider-name"].value.trim() || provider.name;
   provider.kind = form.elements["provider-kind"].value;
   provider.base_url = form.elements["provider-base-url"].value.trim();
+  if (provider.id === "zhipu" && form.elements["provider-coding-plan"]) {
+    provider.coding_plan_enabled = Boolean(form.elements["provider-coding-plan"].checked);
+    if (provider.coding_plan_enabled) {
+      provider.coding_plan_base_url = provider.base_url || ZHIPU_CODING_PLAN_BASE_URL;
+      provider.standard_base_url = String(provider.standard_base_url || ZHIPU_STANDARD_BASE_URL).trim();
+    } else {
+      provider.standard_base_url = provider.base_url || ZHIPU_STANDARD_BASE_URL;
+      provider.coding_plan_base_url = String(provider.coding_plan_base_url || ZHIPU_CODING_PLAN_BASE_URL).trim();
+    }
+    provider.base_url = provider.coding_plan_enabled ? provider.coding_plan_base_url : provider.standard_base_url;
+  }
   provider.enabled = form.elements["provider-enabled"]?.checked ?? provider.enabled;
   provider.models = provider.models.map((model, index) => {
     const id = form.querySelector(`[data-model-id="${index}"]`)?.value.trim() || model.id;
@@ -12350,21 +13667,27 @@ function renderCudaStatus() {
 
 async function refreshLocalModelMarket() {
   const query = String(state.localModelMarket?.query || "").trim();
-  state.localModelMarket.loading = true;
+  state.localModelMarket = { ...(state.localModelMarket || {}), loading: true };
   refreshCudaStatus();
-  const [installed, catalog, runtime, ollama] = await Promise.all([
-    request("/api/local-models/installed"),
-    request(`/api/local-models/market${query ? `?q=${encodeURIComponent(query)}` : ""}`),
-    request("/api/local-runtime").catch(() => state.localRuntime),
-    request("/api/ollama/status").catch(() => state.ollama),
-  ]);
-  state.localModelMarket = { installed: installed.models || [], catalog: catalog.items || [], source: catalog.source || "", query, loading: false };
-  state.localRuntime = { ...(state.localRuntime || {}), ...(runtime || {}) };
-  state.ollama = ollama || state.ollama;
-  state.settings = await request("/api/settings");
-  await refreshModelHealth({ render: false });
-  renderModelSelectors();
-  if (state.activeView === "settings" && ["local-models", "runtime", "resources"].includes(state.activeSettings)) renderSettings();
+  try {
+    const [installed, catalog, runtime, ollama] = await Promise.all([
+      request("/api/local-models/installed"),
+      request(`/api/local-models/market${query ? `?q=${encodeURIComponent(query)}` : ""}`),
+      request("/api/local-runtime").catch(() => state.localRuntime),
+      request("/api/ollama/status").catch(() => state.ollama),
+    ]);
+    state.localModelMarket = { installed: installed.models || [], catalog: catalog.items || [], source: catalog.source || "", query, loading: false, loaded: true };
+    state.localRuntime = { ...(state.localRuntime || {}), ...(runtime || {}) };
+    state.ollama = ollama || state.ollama;
+    state.settings = await request("/api/settings");
+    await refreshModelHealth({ render: false });
+    renderModelSelectors();
+    if (state.activeView === "settings" && ["models", "local-models", "runtime", "resources"].includes(state.activeSettings)) renderSettings();
+  } catch (error) {
+    state.localModelMarket = { ...(state.localModelMarket || {}), loading: false };
+    if (state.activeView === "settings" && state.activeSettings === "local-models") renderSettings();
+    throw error;
+  }
 }
 
 async function refreshLocalRuntimeStatus() {
@@ -12450,6 +13773,7 @@ async function refreshModelHealth({ render = true } = {}) {
   try {
     const snapshot = await request("/api/model-health");
     state.modelHealth = { ...(snapshot || {}), loading: false };
+    applyModelSelectionCatalog(state.modelHealth);
   } catch (error) {
     state.modelHealth = { ...(state.modelHealth || {}), loading: false, error: error?.message || "无法读取模型状态" };
     if (render) throw error;
@@ -12557,6 +13881,10 @@ async function handleSettingsAction(action, element) {
     openMode("library");
     return;
   }
+  if (action === "finish-first-run") {
+    await finishFirstRun();
+    return;
+  }
   if (action === "onboarding-next") {
     state.onboardingStep = state.onboardingStep === "welcome" ? "models" : "knowledge";
     renderResourceOnboarding();
@@ -12569,7 +13897,7 @@ async function handleSettingsAction(action, element) {
   }
   if (action === "onboarding-open-models") {
     await persistOnboardingPreferences({ welcome_dismissed: true }, "已打开本地能力引导；模型可以按需下载", { close: true });
-    openSettings("local-models");
+    openResourceGuideOverlay();
     return;
   }
   if (action === "onboarding-open-knowledge") {
@@ -12785,6 +14113,10 @@ async function handleSettingsAction(action, element) {
   if (action === "remove-provider-key") {
     const provider = selectedProvider();
     if (!provider || provider.kind === "local") return;
+    if (provider.api_key_source === "environment") {
+      toast(`当前使用环境变量 ${provider.api_key_env || "API_KEY"}，设置页不会覆盖它`, true);
+      return;
+    }
     provider.enabled = false;
     await persistSettings("已移除提供商密钥");
     state.settings = await request(`/api/settings/providers/${encodeURIComponent(provider.id)}/api-key`, { method: "POST", body: JSON.stringify({ api_key: "" }) });
@@ -12934,6 +14266,25 @@ async function handleSettingsAction(action, element) {
     renderSettings();
     if (removed) toast(`${removed.name || "本地连接"} 已移除；点击“保存手动连接”后生效`);
     document.querySelector(".local-manual-runtime-disclosure")?.setAttribute("open", "");
+    return;
+  }
+  if (action === "retry-local-model-probe") {
+    const modelId = String(element.dataset.modelId || "").trim();
+    if (!modelId) return;
+    element.disabled = true;
+    try {
+      const result = await request("/api/local-models/recheck", {
+        method: "POST",
+        body: JSON.stringify({ id: modelId }),
+      });
+      await refreshLocalModelMarket();
+      toast(result.message || "本地模型已重新检测");
+    } catch (error) {
+      await refreshLocalModelMarket();
+      toast(error.message || "本地模型检测失败", true);
+    } finally {
+      if (element.isConnected) element.disabled = false;
+    }
     return;
   }
   if (action === "delete-installed-local-model") {
@@ -13088,11 +14439,12 @@ function showReviewCitation(citationId) {
   const drawer = byId("reviewEvidenceDrawer");
   if (!citation || !drawer) return;
   hideCitationPreview();
-  const sourceMeta = [citation.section, citation.doi, citation.evidence_id].filter(Boolean).join(" · ");
+  const sourceMeta = String(citation.section || "").trim() || "证据来源";
+  const sourceDetails = evidenceDetailsMarkup(citation);
   const readerButton = safeReaderUrl(citation) ? `<button type="button" data-action="open-review-evidence-reader" data-citation-id="${escapeHtml(citation.citation_id)}">在应用中定位原文</button>` : "";
   const externalUrl = citationPublicSourceUrl(citation);
   const externalButton = externalUrl ? `<a class="review-evidence-link" href="${escapeHtml(externalUrl)}" target="_blank" rel="noopener noreferrer">打开原始来源 ${uiIcon("arrow-up-right")}</a>` : "";
-  drawer.innerHTML = `<div class="review-evidence-head"><div><span>Evidence ${escapeHtml(citation.citation_id)}</span><strong>${escapeHtml(citation.paper)}</strong></div><button type="button" class="review-icon-button" data-action="close-review-evidence" aria-label="关闭证据">×</button></div><div class="review-evidence-body"><small>${escapeHtml(sourceMeta)}</small><blockquote>${escapeHtml(compact(citation.exact_quote || "当前引用没有保存原文摘录。", 900))}</blockquote>${readerButton}${externalButton}</div>`;
+  drawer.innerHTML = `<div class="review-evidence-head"><div><span>Evidence ${escapeHtml(citation.citation_id)}</span><strong>${escapeHtml(citation.paper)}</strong></div><button type="button" class="review-icon-button" data-action="close-review-evidence" aria-label="关闭证据">×</button></div><div class="review-evidence-body"><small>${escapeHtml(sourceMeta)}</small>${citationContextMarkup(citation, 900) || `<blockquote>${escapeHtml(compact(citation.exact_quote || "当前引用没有保存原文摘录。", 900))}</blockquote>`}${sourceDetails}${readerButton}${externalButton}</div>`;
   hydrateIcons(drawer);
   drawer.classList.add("is-open");
 }
@@ -13298,8 +14650,10 @@ document.addEventListener("click", (event) => {
   else if (action === "remove-composer-image") removeComposerImage(element.dataset.composerKey === "home" ? "home" : "chat", element.dataset.imageId || "");
   else if (action === "remove-composer-audio") removeComposerAudio(element.dataset.composerKey === "home" ? "home" : "chat", element.dataset.audioId || "");
   else if (action === "remove-composer-source") removeComposerSource(element.dataset.composerKey === "home" ? "home" : "chat", element.dataset.sourceId || "");
-  else if (action === "open-image-preview") openImagePreview(element.dataset.imageSrc || "", element.dataset.imageAlt || "用户图片");
+  else if (action === "open-image-preview") { event.preventDefault(); openImagePreview(element.dataset.imageSrc || "", element.dataset.imageAlt || "用户图片"); }
   else if (action === "close-image-preview") closeImagePreview();
+  else if (action === "reuse-image-prompt") reuseImagePrompt(element.dataset.prompt || "");
+  else if (action === "rename-direct-conversation") renameDirectConversation();
   else if (action === "use-file-suggestion") useFileSuggestion(element.dataset.composerKey === "home" ? "home" : "chat", element.dataset.fileName || "当前文件", element.dataset.suggestion || "总结");
   else if (action === "open-ingestion-source") {
     const url = element.dataset.sourceUrl || "";
@@ -13621,6 +14975,12 @@ document.addEventListener("click", (event) => {
     if (source) openSourceReader(source);
   }
   else if (action === "retry-direct-message") retryDirectMessage(element.dataset.messageIndex || "");
+  else if (action === "edit-last-conversation-message") beginEditingLastConversationMessage(element.dataset.messageIndex || "");
+  else if (action === "save-last-message-edit") saveEditingLastConversationMessage();
+  else if (action === "cancel-last-message-edit") cancelEditingLastConversationMessage();
+  else if (action === "edit-direct-follow-up") beginEditingQueuedDirectTurn(element.dataset.queueId || "");
+  else if (action === "save-direct-queue-edit") saveEditingQueuedDirectTurn();
+  else if (action === "cancel-direct-queue-edit") cancelEditingQueuedDirectTurn();
   else if (action === "set-queued-direct-mode") setQueuedDirectTurnMode(element.dataset.queueId || "", element.dataset.queueMode || "follow-up").catch((error) => toast(error.message, true));
   else if (action === "remove-direct-follow-up") removeQueuedDirectTurn(element.dataset.queueId || "");
   else if (action === "cancel-direct-chat") pauseDirectChatJob().catch((error) => toast(error.message, true));
@@ -13824,6 +15184,31 @@ document.addEventListener("dblclick", (event) => {
 });
 
 document.addEventListener("change", (event) => {
+  if (event.target.name === "provider-coding-plan" && event.target.closest("#modelProviderForm")) {
+    const provider = selectedProvider();
+    const form = event.target.form;
+    const endpointInput = form?.elements["provider-base-url"];
+    if (!provider || provider.id !== "zhipu" || !endpointInput) return;
+    const previousMode = Boolean(provider.coding_plan_enabled);
+    const currentUrl = String(endpointInput.value || "").trim();
+    if (previousMode) {
+      provider.coding_plan_base_url = currentUrl || provider.coding_plan_base_url || ZHIPU_CODING_PLAN_BASE_URL;
+    } else {
+      provider.standard_base_url = currentUrl || provider.standard_base_url || ZHIPU_STANDARD_BASE_URL;
+    }
+    provider.coding_plan_enabled = Boolean(event.target.checked);
+    const nextUrl = zhipuEndpointValue(provider, provider.coding_plan_enabled);
+    endpointInput.value = nextUrl;
+    provider.base_url = nextUrl;
+    form.querySelector(".cherry-endpoint-mode-label")?.replaceChildren(document.createTextNode(provider.coding_plan_enabled ? "Coding Plan" : "标准 API"));
+    const guideCopy = form.querySelector("[data-zhipu-guide-copy]");
+    if (guideCopy) guideCopy.textContent = provider.coding_plan_enabled
+      ? "当前使用 Coding Plan 专用地址；该地址仅适用于 GLM Coding Plan。"
+      : "当前使用标准 API 地址；开启 Coding Plan 后会切换到专用地址。";
+    const preview = form.querySelector(".cherry-endpoint-preview");
+    if (preview) preview.textContent = `预览：${nextUrl ? `${nextUrl.replace(/\/$/, "")}/chat/completions` : "请填写服务商 API 地址"}`;
+    return;
+  }
   if (event.target.closest("#generalPreferencesForm")) {
     collectAppearanceForm();
     renderSettings();
@@ -13913,13 +15298,35 @@ function clearProviderDragFeedback() {
   state.draggedProviderId = "";
 }
 
+function clearDirectQueueDragFeedback() {
+  document.querySelectorAll(".direct-live-queue-item.is-dragging, .direct-live-queue-item.is-drop-before, .direct-live-queue-item.is-drop-after").forEach((item) => {
+    item.classList.remove("is-dragging", "is-drop-before", "is-drop-after");
+  });
+  directQueueDrag = { conversationId: "", queueId: "", targetId: "", position: "" };
+}
+
 document.addEventListener("dragstart", (event) => {
-  const row = event.target.closest?.("[data-provider-drag-id]");
-  if (!row || state.activeSettings !== "models") return;
+  const handle = event.target.closest?.("[data-direct-queue-drag]");
+  const row = handle?.closest("[data-direct-queue-item]");
+  if (handle && row) {
+    const conversationId = row.dataset.queueConversationId || "";
+    const job = directChatJobs.get(conversationId);
+    if (job?.queue.length) {
+      directQueueDrag = { conversationId, queueId: row.dataset.queueId || "", targetId: "", position: "" };
+      row.classList.add("is-dragging");
+      if (event.dataTransfer) {
+        event.dataTransfer.effectAllowed = "move";
+        event.dataTransfer.setData("text/plain", directQueueDrag.queueId);
+      }
+    }
+    return;
+  }
+  const providerRow = event.target.closest?.("[data-provider-drag-id]");
+  if (!providerRow || state.activeSettings !== "models") return;
   collectProviderForm();
-  state.draggedProviderId = row.dataset.providerDragId || "";
+  state.draggedProviderId = providerRow.dataset.providerDragId || "";
   if (!state.draggedProviderId) return;
-  row.classList.add("is-dragging");
+  providerRow.classList.add("is-dragging");
   if (event.dataTransfer) {
     event.dataTransfer.effectAllowed = "move";
     event.dataTransfer.setData("text/plain", state.draggedProviderId);
@@ -13927,6 +15334,18 @@ document.addEventListener("dragstart", (event) => {
 });
 
 document.addEventListener("dragover", (event) => {
+  const queueRow = event.target.closest?.("[data-direct-queue-item]");
+  if (queueRow && directQueueDrag.queueId && queueRow.dataset.queueConversationId === directQueueDrag.conversationId && queueRow.dataset.queueId !== directQueueDrag.queueId) {
+    event.preventDefault();
+    const bounds = queueRow.getBoundingClientRect();
+    const position = event.clientY < bounds.top + bounds.height / 2 ? "before" : "after";
+    document.querySelectorAll(".direct-live-queue-item.is-drop-before, .direct-live-queue-item.is-drop-after").forEach((item) => item.classList.remove("is-drop-before", "is-drop-after"));
+    queueRow.classList.add(position === "before" ? "is-drop-before" : "is-drop-after");
+    directQueueDrag.targetId = queueRow.dataset.queueId || "";
+    directQueueDrag.position = position;
+    if (event.dataTransfer) event.dataTransfer.dropEffect = "move";
+    return;
+  }
   const libraryDropzone = event.target.closest?.("[data-library-dropzone]");
   if (libraryDropzone && Array.from(event.dataTransfer?.types || []).includes("Files")) {
     event.preventDefault();
@@ -13943,14 +15362,45 @@ document.addEventListener("dragover", (event) => {
 });
 
 document.addEventListener("dragleave", (event) => {
+  const queueRow = event.target.closest?.("[data-direct-queue-item]");
+  if (queueRow && !queueRow.contains(event.relatedTarget)) queueRow.classList.remove("is-drop-before", "is-drop-after");
   const libraryDropzone = event.target.closest?.("[data-library-dropzone]");
   if (libraryDropzone && !libraryDropzone.contains(event.relatedTarget)) libraryDropzone.classList.remove("is-drag-over");
   event.target.closest?.("[data-provider-drag-id]")?.classList.remove("is-drop-target");
 });
 
 document.addEventListener("dragend", clearProviderDragFeedback);
+document.addEventListener("dragend", clearDirectQueueDragFeedback);
 
 document.addEventListener("drop", (event) => {
+  const queueRow = event.target.closest?.("[data-direct-queue-item]");
+  if (queueRow && directQueueDrag.queueId && queueRow.dataset.queueConversationId === directQueueDrag.conversationId) {
+    event.preventDefault();
+    const job = directChatJobs.get(directQueueDrag.conversationId);
+    const sourceId = directQueueDrag.queueId;
+    const targetId = queueRow.dataset.queueId || "";
+    if (job && sourceId !== targetId) {
+      const sourceIndex = job.queue.findIndex((turn) => turn.queueId === sourceId);
+      const targetIndexBeforeMove = job.queue.findIndex((turn) => turn.queueId === targetId);
+      if (sourceIndex >= 0 && targetIndexBeforeMove >= 0) {
+        const bounds = queueRow.getBoundingClientRect();
+        const position = directQueueDrag.targetId === targetId && directQueueDrag.position
+          ? directQueueDrag.position
+          : event.clientY < bounds.top + bounds.height / 2 ? "before" : "after";
+        const [moved] = job.queue.splice(sourceIndex, 1);
+        const targetIndex = job.queue.findIndex((turn) => turn.queueId === targetId);
+        const insertIndex = Math.max(0, Math.min(job.queue.length, targetIndex + (position === "after" ? 1 : 0)));
+        job.queue.splice(insertIndex, 0, moved);
+        clearDirectQueueDragFeedback();
+        toast("队列顺序已更新");
+        renderDirectLiveControls();
+        renderTasks();
+        persistDirectChatJob(job).catch((error) => console.warn("Reordered direct chat queue could not be saved", error));
+      }
+    }
+    clearDirectQueueDragFeedback();
+    return;
+  }
   const libraryDropzone = event.target.closest?.("[data-library-dropzone]");
   if (libraryDropzone && event.dataTransfer?.files?.length) {
     event.preventDefault();
@@ -14005,6 +15455,41 @@ document.addEventListener("keydown", (event) => {
     }
     if (trapReviewSaveFocus(event)) return;
   }
+  if (resourceOnboardingDialog()) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      closeResourceGuideOverlay("skip").catch((error) => toast(error.message, true));
+      return;
+    }
+    if (trapResourceOnboardingFocus(event)) return;
+  }
+  const lastMessageEditInput = event.target.closest?.("[data-last-message-edit-input]");
+  if (lastMessageEditInput) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      cancelEditingLastConversationMessage();
+      return;
+    }
+    if (event.key === "Enter" && (event.ctrlKey || event.metaKey) && !event.isComposing) {
+      event.preventDefault();
+      saveEditingLastConversationMessage();
+      return;
+    }
+    return;
+  }
+  const queueEditInput = event.target.closest?.("[data-queue-edit-input]");
+  if (queueEditInput) {
+    if (event.key === "Escape") {
+      event.preventDefault();
+      cancelEditingQueuedDirectTurn();
+      return;
+    }
+    if (event.key === "Enter" && !event.shiftKey && !event.isComposing) {
+      event.preventDefault();
+      saveEditingQueuedDirectTurn();
+      return;
+    }
+  }
   if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "f" && state.activeView === "library") {
     event.preventDefault();
     focusKnowledgeFileSearch();
@@ -14058,6 +15543,27 @@ document.addEventListener("keydown", (event) => {
 });
 
 document.addEventListener("input", (event) => {
+  if (event.target.matches?.("[data-last-message-edit-input]")) {
+    if (directMessageEdit) directMessageEdit.value = String(event.target.value || "");
+    return;
+  }
+  if (event.target.matches?.("[data-queue-edit-input]")) {
+    if (directQueueEdit) directQueueEdit.value = String(event.target.value || "");
+    return;
+  }
+  if (event.target.name === "provider-base-url" && event.target.closest?.("#modelProviderForm")) {
+    const provider = selectedProvider();
+    if (provider?.id === "zhipu") {
+      const value = String(event.target.value || "").trim();
+      const codingPlanEnabled = Boolean(event.target.form?.elements["provider-coding-plan"]?.checked);
+      provider.base_url = value;
+      if (codingPlanEnabled) provider.coding_plan_base_url = value;
+      else provider.standard_base_url = value;
+      const preview = event.target.form?.querySelector(".cherry-endpoint-preview");
+      if (preview) preview.textContent = `预览：${value ? `${value.replace(/\/$/, "")}/chat/completions` : "请填写服务商 API 地址"}`;
+    }
+    return;
+  }
   if (event.target.id === "reviewSaveNewFolderInput") {
     state.reviewSaveDialog.newFolderName = String(event.target.value || "");
     return;
@@ -14136,7 +15642,7 @@ document.addEventListener("paste", (event) => {
   addComposerImages(composerKey(input.id), files).catch((error) => toast(error.message, true));
 });
 
-document.addEventListener("change", (event) => {
+document.addEventListener("change", async (event) => {
   if (event.target.id === "skillSecurityAcknowledge") {
     const button = byId("skillSecurityInstall");
     if (button) button.disabled = !event.target.checked;
@@ -14151,9 +15657,20 @@ document.addEventListener("change", (event) => {
   }
   const toggle = event.target.closest("[data-update-auto-check]");
   if (!toggle) return;
+  const previous = state.autoCheckUpdates;
   state.autoCheckUpdates = Boolean(toggle.checked);
-  window.localStorage.setItem("scansci.update.auto-check", String(state.autoCheckUpdates));
-  toast(state.autoCheckUpdates ? "已开启自动检查更新" : "已关闭自动检查更新");
+  const general = generalPreferences();
+  general.updates.auto_check = state.autoCheckUpdates;
+  state.settings.general = general;
+  try {
+    await persistSettings(state.autoCheckUpdates ? "已开启自动检查更新" : "已关闭自动检查更新");
+  } catch (error) {
+    state.autoCheckUpdates = previous;
+    general.updates.auto_check = previous;
+    state.settings.general = general;
+    renderSettings();
+    toast(`更新设置保存失败：${error.message}`, true);
+  }
 });
 
 byId("skillSecurityDialog")?.addEventListener("cancel", (event) => {
@@ -14666,8 +16183,8 @@ setComposerMode(byId("homeModeSelect")?.value || "general");
 setWebSearchMode(state.webSearchMode, { announce: false });
 initialize();
 renderAppUpdate();
-if (state.autoCheckUpdates) refreshAppUpdate({ quiet: true });
 window.addEventListener("pywebviewready", () => {
   state.updateNative = Boolean(window.pywebview?.api?.install_update);
+  renderRuntimeBadge();
   renderAppUpdate();
 });

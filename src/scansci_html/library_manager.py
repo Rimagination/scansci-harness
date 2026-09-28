@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from contextlib import contextmanager
+from functools import wraps
 import gc
 from hashlib import sha256
 import json
@@ -11,12 +13,23 @@ from pathlib import Path
 import re
 import shutil
 import sqlite3
+from statistics import median
 import time
 from tempfile import TemporaryDirectory
+from threading import RLock
 from typing import Any, Callable, Iterable, Mapping
 from uuid import uuid4
 
-from .evidence_store import build_library_overview, index_evidence_library, index_markdown_library
+from .evidence_store import (
+    _identity_key_from_values,
+    _initialize_schema as _initialize_evidence_schema,
+    _is_page_heading,
+    _record_document_identity_alias,
+    _split_markdown_front_matter,
+    build_library_overview,
+    index_evidence_library,
+    index_markdown_library,
+)
 from .evidence_doctor import assess_evidence_structure
 from .ingestion import SUPPORTED_INGESTION_SUFFIXES, extract_local_document
 from .source_filters import is_ignored_library_path
@@ -42,6 +55,64 @@ _LIBRARY_IMPORTABLE_SUFFIXES = {
 }
 
 ImportProgress = Callable[[dict[str, Any]], None]
+
+# ponytail: imports still serialize process-wide; use per-library RLocks if
+# parallel imports of different notebooks become necessary.
+_IMPORT_LOCK = RLock()
+_ACTIVE_IMPORTS: set[Path] = set()
+
+
+def _serial_library_import(function):
+    @wraps(function)
+    def import_serially(workspace, evidence_db, *, notebook_id, **kwargs):
+        with _IMPORT_LOCK:
+            root = Path(workspace).resolve().parent / ".scansci-library" / _safe_folder_name(notebook_id)
+            # Folder/file imports call each other while building one generation.
+            if root in _ACTIVE_IMPORTS:
+                return function(workspace, evidence_db, notebook_id=notebook_id, **kwargs)
+            with _library_process_lock(root):
+                _ACTIVE_IMPORTS.add(root)
+                try:
+                    return function(workspace, evidence_db, notebook_id=notebook_id, **kwargs)
+                finally:
+                    _ACTIVE_IMPORTS.remove(root)
+    return import_serially
+
+
+@contextmanager
+def _library_process_lock(root: Path):
+    """Use the runtime installer's OS-lock pattern, scoped to one library.
+
+    Keep the lock file in place: unlinking it can let another process lock a
+    different inode. The OS releases the lock even if an importing process dies.
+    """
+
+    root.mkdir(parents=True, exist_ok=True)
+    with (root / ".import.lock").open("a+b") as stream:
+        stream.seek(0, os.SEEK_END)
+        if stream.tell() == 0:
+            stream.write(b"\0")
+            stream.flush()
+        stream.seek(0)
+        try:
+            if os.name == "nt":
+                import msvcrt
+
+                msvcrt.locking(stream.fileno(), msvcrt.LK_NBLCK, 1)
+            else:
+                import fcntl
+
+                fcntl.flock(stream.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as error:
+            raise RuntimeError("另一个 ScanSci 进程正在导入此知识库，请等待导入完成后重试。") from error
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                stream.seek(0)
+                msvcrt.locking(stream.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(stream.fileno(), fcntl.LOCK_UN)
 
 
 def _report_import_progress(
@@ -148,6 +219,7 @@ def notebook_evidence_db(evidence_db: str | Path, notebook_id: str) -> Path:
     return root / f"{_safe_folder_name(notebook_id)}.sqlite"
 
 
+@_serial_library_import
 def import_library_folder(
     workspace: str | Path,
     evidence_db: str | Path,
@@ -276,6 +348,7 @@ def import_library_folder(
                 incremental=True,
             )
         else:
+            _preserve_imported_document_ids(temporary_db, markdown_files)
             indexed = index_markdown_library(
                 folder,
                 db_path=temporary_db,
@@ -386,6 +459,7 @@ def import_library_folder(
     }
 
 
+@_serial_library_import
 def import_library_files(
     workspace: str | Path,
     evidence_db: str | Path,
@@ -408,7 +482,7 @@ def import_library_files(
 
     _report_import_progress(progress, phase="准备解析文件", progress=0.05, detail="正在确认文件格式和读取权限")
     supplied = [_resolved_file(path) for path in file_paths]
-    supported = [path for path in supplied if path.suffix.lower() in _IMPORTABLE_SUFFIXES]
+    supported = list(dict.fromkeys(path for path in supplied if path.suffix.lower() in _IMPORTABLE_SUFFIXES))
     if not supported:
         raise ValueError("请选择 HTML 或 Markdown 文献文件")
     if len(supported) > _MAX_LIBRARY_DOCUMENTS:
@@ -418,6 +492,15 @@ def import_library_files(
     current_summary = load_workspace_summary(workspace_path, notebook_id=notebook_id)
     current_notebooks = list(current_summary.get("notebooks", []) or [])
     current_kind = str(dict(current_notebooks[0]).get("metadata", {}).get("library_kind", "files")) if current_notebooks else "files"
+    current_sources = list(dict(current_notebooks[0]).get("sources", []) or []) if current_notebooks else []
+    sources_by_path: dict[Path, list[dict[str, Any]]] = {}
+    for source in current_sources:
+        paths = {_local_source_path(source.get(key)) for key in ("source_url", "html_path")}
+        for path in paths - {None}:
+            sources_by_path.setdefault(path, []).append(source)
+    for path in supported:
+        if len(sources_by_path.get(path, [])) > 1:
+            raise ValueError(f"原文 {path.name} 已关联多个资料记录；为保留已有引用，请先核对重复记录后重试。")
     display_root = Path(root_path).expanduser().resolve() if root_path else None
     if display_root is None and current_notebooks:
         current_root = str(dict(current_notebooks[0]).get("root_path", "") or "").strip()
@@ -433,13 +516,16 @@ def import_library_files(
     )
     managed.mkdir(parents=True, exist_ok=True)
     legacy_sources: list[Path] = []
+    copied_sources: dict[Path, Path] = {}
     if not replace_existing:
         for existing in _existing_source_paths(workspace_path, notebook_id=notebook_id):
             if not existing.is_file():
                 continue
             if existing.suffix.lower() in _MARKDOWN_SUFFIXES:
-                shutil.copy2(existing, _unique_path(managed, _safe_folder_name(existing.stem), existing.suffix or ".md"))
-            else:
+                copied = _unique_path(managed, _safe_folder_name(existing.stem), existing.suffix or ".md")
+                shutil.copy2(existing, copied)
+                copied_sources[existing] = copied
+            elif existing not in supported:
                 legacy_sources.append(existing)
 
     extracted_sources: list[dict[str, Any]] = []
@@ -500,9 +586,24 @@ def import_library_files(
             continue
         try:
             stem = _safe_folder_name(original.stem)
-            target = _unique_path(managed, stem, ".md")
+            previous = next(iter(sources_by_path.get(original, [])), {})
+            previous_path = _local_source_path(previous.get("html_path"))
+            target = copied_sources.get(previous_path) or _unique_path(managed, stem, ".md")
+            previous_metadata = {}
+            if previous_path and previous_path.is_file() and previous_path.suffix.lower() in _MARKDOWN_SUFFIXES:
+                previous_metadata, _ = _split_markdown_front_matter(previous_path.read_text(encoding="utf-8-sig"))
             supplied_metadata = dict((source_metadata or {}).get(str(original.resolve()), {}) or {})
             embedded_metadata = dict(source.get("metadata", {}) or {})
+            # Preserve catalog and reliable PDF titles. Only enrich the
+            # metadata helper's low-confidence filename fallback.
+            if original.suffix.lower() == ".pdf" and not supplied_metadata.get("title") and (
+                not embedded_metadata.get("title") or embedded_metadata.get("metadata_confidence") == "low"
+            ):
+                page_title = _pdf_first_page_title(original) or _title_from_extracted_text(text)
+                if page_title:
+                    embedded_metadata["title"] = page_title
+                    embedded_metadata["metadata_source"] = f"{embedded_metadata.get('metadata_source', 'filename')}+pdf-first-page"
+                    embedded_metadata["metadata_confidence"] = "medium"
             metadata = {
                 "title": str(
                     supplied_metadata.get("title")
@@ -516,11 +617,16 @@ def import_library_files(
                 "parser": str(source.get("parser", "")),
                 "source_storage": "external-reference",
             }
+            if previous.get("doc_id"):
+                # A better title must keep the source and citation identity.
+                # The temporary index binds this hint to the existing original.
+                metadata["doc_id"] = str(previous["doc_id"])
             for key in ("doi", "date", "year", "author", "metadata_source", "metadata_confidence"):
                 value = _scalar_metadata_value(
                     supplied_metadata.get(key)
                     or (supplied_metadata.get("DOI") if key == "doi" else "")
                     or embedded_metadata.get(key, "")
+                    or previous_metadata.get(key, "")
                 )
                 if value:
                     metadata[key] = value
@@ -528,7 +634,9 @@ def import_library_files(
                 creators = _scalar_metadata_value(supplied_metadata.get("creators"))
                 if creators:
                     metadata["author"] = creators
-            target.write_text(_markdown_document(metadata, text), encoding="utf-8")
+            pending = target.with_suffix(".md.importing")
+            pending.write_text(_markdown_document(metadata, text), encoding="utf-8")
+            pending.replace(target)
             extracted_sources.append(
                 {
                     "source_id": str(source.get("source_id", "")),
@@ -1399,6 +1507,49 @@ def _existing_source_paths(workspace: Path, *, notebook_id: str) -> list[Path]:
     return paths
 
 
+def _local_source_path(value: object) -> Path | None:
+    raw = str(value or "").strip()
+    if not raw or re.match(r"^https?://", raw, re.IGNORECASE):
+        return None
+    path = Path(raw).expanduser()
+    return path.resolve() if path.is_absolute() else None
+
+
+def _preserve_imported_document_ids(db_path: Path, markdown_files: list[Path]) -> None:
+    """Bind regenerated text to its original document in the staged index only."""
+
+    if not db_path.is_file():
+        return
+    with sqlite3.connect(db_path) as connection:
+        _initialize_evidence_schema(connection)
+        for path in markdown_files:
+            content = path.read_bytes()
+            metadata, _ = _split_markdown_front_matter(content.decode("utf-8-sig"))
+            doc_id = metadata.get("doc_id", "")
+            original = _local_source_path(metadata.get("source_url"))
+            if not doc_id or original is None or metadata.get("source_storage") != "external-reference":
+                continue
+            row = connection.execute(
+                "select source_url, html_path from source_documents where doc_id = ?", (doc_id,),
+            ).fetchone()
+            if not row or original not in {_local_source_path(value) for value in row}:
+                continue
+            content_hash = sha256(content).hexdigest()
+            identity_key = _identity_key_from_values(
+                doi=metadata.get("doi", ""), source_url=metadata.get("source_url", ""),
+                content_hash=content_hash, html_path=str(path),
+            )
+            owner = connection.execute(
+                "select doc_id from document_identity_aliases where identity_key = ?", (identity_key,),
+            ).fetchone()
+            if owner and owner[0] != doc_id:
+                raise ValueError("文献身份与已有记录冲突，已保留原索引，请核对重复资料后重试。")
+            _record_document_identity_alias(
+                connection, identity_key=identity_key, doc_id=doc_id,
+                content_hash=content_hash, source_path=path,
+            )
+
+
 def _copy_unique(source: Path, destination: Path) -> Path:
     candidate = destination / source.name
     if candidate.exists() and candidate.read_bytes() == source.read_bytes():
@@ -1446,8 +1597,54 @@ def _title_from_extracted_text(text: str) -> str:
         line = raw_line.strip()
         if line.startswith("#"):
             candidate = line.lstrip("#").strip()
-            if candidate and len(candidate) <= 300:
+            if candidate and len(candidate) <= 300 and not _is_page_heading(candidate):
                 return candidate
+    return ""
+
+
+def _pdf_first_page_title(path: Path) -> str:
+    """Recover a prominent heading with the existing optional local PDF reader.
+
+    Ambiguous layouts retain the existing filename fallback; no OCR, model or
+    network lookup is started to improve a title.
+    """
+
+    try:
+        import fitz
+
+        with fitz.open(str(path)) as document:
+            if not document.page_count:
+                return ""
+            page = document[0]
+            rows = []
+            for block in page.get_text("dict").get("blocks", []):
+                for line in block.get("lines", []):
+                    if tuple(line.get("dir", (1, 0))) != (1, 0):
+                        continue  # Ignore rotated arXiv stamps.
+                    spans = [span for span in line.get("spans", []) if str(span.get("text", "")).strip()]
+                    text = " ".join(str(span["text"]).strip() for span in spans).strip()
+                    if text:
+                        rows.append((line["bbox"], max(float(span["size"]) for span in spans), text))
+            upper_rows = [row for row in rows if row[0][1] < page.rect.height * 0.55]
+            if not upper_rows:
+                return ""
+            largest = max(row[1] for row in upper_rows)
+            if largest < median(row[1] for row in rows) * 1.15:
+                return ""  # Uniform-sized text has no reliable title signal.
+            heading = sorted((row for row in upper_rows if row[1] >= largest * 0.96), key=lambda row: row[0][1])
+            lines = [heading[0][2]]
+            bottom = heading[0][0][3]
+            for bbox, _size, text in heading[1:]:
+                if bbox[1] - bottom > largest:
+                    break
+                lines.append(text)
+                bottom = bbox[3]
+            candidate = " ".join(lines)
+            if 10 <= len(candidate) <= 300 and not re.match(r"^(?:arxiv\b|abstract\b|proceedings\b|journal\b)", candidate, re.I):
+                return candidate
+    except Exception:
+        # Metadata enrichment must never prevent an otherwise readable import.
+        pass
     return ""
 
 

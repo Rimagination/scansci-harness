@@ -16,6 +16,7 @@ from html import escape as html_escape
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ipaddress import ip_address
+import io
 import json
 import mimetypes
 from pathlib import Path
@@ -29,6 +30,7 @@ from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 from urllib.request import Request, urlopen
 from uuid import uuid4
 import webbrowser
+import zipfile
 
 from .app_settings import (
     apply_storage_directories,
@@ -41,6 +43,7 @@ from .app_settings import (
     set_notion_api_token,
     set_document_service_api_key,
     set_provider_api_key,
+    with_discovered_local_runtime_models,
     vector_index_directory,
 )
 from .app_update import AppUpdateService
@@ -49,6 +52,7 @@ from .deep_research_evidence import task_evidence_reader_path
 from .direct_chat_history import DirectChatHistoryStore
 from .audio_attachments import audio_attachment_asset
 from .image_attachments import attachment_asset
+from .image_generation import generated_image_asset
 from .ingestion import ingest_sources, ingestion_source_path, ingestion_source_text
 from .library_manager import (
     connect_local_zotero,
@@ -481,28 +485,88 @@ class NotebookWebApp:
 
         settings = load_settings(self.workspace)
         checks: dict[str, dict[str, Any]] = {}
+        inventories: dict[str, list[object]] = {}
+        endpoint_checks: dict[tuple[str, str], dict[str, Any]] = {}
+        ollama = self._ollama_status()
+        catalog_settings = settings
+        discovery_seed_id = ""
+        configured_ollama = any(
+            str(item.get("runtime", "")).strip().lower() == "ollama"
+            for item in list(settings.get("local_models", []) or [])
+            if isinstance(item, dict)
+        )
+        if ollama.get("reachable") and ollama.get("models") and not configured_ollama:
+            discovery_seed_id = "ollama-runtime-discovery"
+            catalog_settings = deepcopy(settings)
+            catalog_settings["local_models"] = [
+                *list(settings.get("local_models", []) or []),
+                {
+                    "id": discovery_seed_id,
+                    "name": "Ollama",
+                    "runtime": "ollama",
+                    "base_url": f'{str(ollama.get("base_url") or "http://127.0.0.1:11434").rstrip("/")}/v1',
+                    "model_id": "",
+                    "enabled": True,
+                    "capabilities": ["reasoning"],
+                },
+            ]
         # Local loopback providers are cheap to probe, but an unavailable
         # endpoint must never delay the rest of the UI for the full request
         # timeout.  Ollama has its own bounded status probe above; Hugging Face
         # snapshots are checked from the local cache instead of starting a
         # Transformers server during page load.
-        for local_model in list(settings.get("local_models", []) or []):
+        for local_model in list(catalog_settings.get("local_models", []) or []):
             runtime = str(local_model.get("runtime", "")).strip().lower()
-            if runtime in {"builtin", "ollama", "local-huggingface"}:
+            identifier = str(local_model.get("id", "")).strip()
+            if runtime == "ollama":
+                inventories[identifier] = list(ollama.get("models", []) or []) if ollama.get("reachable") else []
+                continue
+            if runtime in {"builtin", "local-huggingface"}:
                 continue
             if not bool(local_model.get("enabled", True)) or not str(local_model.get("base_url", "")).strip():
                 continue
-            identifier = str(local_model.get("id", "")).strip()
-            try:
-                checks[identifier] = test_local_model_connection(dict(local_model), timeout=1.5)
-            except Exception as error:
-                checks[identifier] = {"ok": False, "error": f"{type(error).__name__}: {error}"[:500]}
-        return build_model_health(
-            settings,
+            endpoint = (runtime, str(local_model.get("base_url", "")).strip().rstrip("/"))
+            if endpoint not in endpoint_checks:
+                try:
+                    endpoint_checks[endpoint] = test_local_model_connection(dict(local_model), timeout=1.5)
+                except Exception as error:
+                    endpoint_checks[endpoint] = {"ok": False, "error": f"{type(error).__name__}: {error}"[:500]}
+            checks[identifier] = endpoint_checks[endpoint]
+            inventories[identifier] = list(checks[identifier].get("models", []) or []) if checks[identifier].get("ok") else []
+        catalog = with_discovered_local_runtime_models(catalog_settings, inventories)
+        if discovery_seed_id:
+            catalog["local_models"] = [
+                item
+                for item in list(catalog.get("local_models", []) or [])
+                if str(item.get("id", "")) != discovery_seed_id
+            ]
+        for local_model in list(catalog.get("local_models", []) or []):
+            runtime = str(local_model.get("runtime", "")).strip().lower()
+            if runtime in {"builtin", "ollama", "local-huggingface"}:
+                continue
+            endpoint = (runtime, str(local_model.get("base_url", "")).strip().rstrip("/"))
+            if endpoint in endpoint_checks:
+                checks[str(local_model.get("id", "")).strip()] = endpoint_checks[endpoint]
+        health = build_model_health(
+            catalog,
             installed_models=installed_models(),
-            ollama=self._ollama_status(),
+            ollama=ollama,
             runtime_checks=checks,
         )
+        health["selection_catalog"] = {
+            "providers": [
+                {
+                    key: deepcopy(value)
+                    for key, value in provider.items()
+                    if not any(marker in str(key).casefold() for marker in ("api_key", "token", "secret"))
+                }
+                for provider in list(catalog.get("providers", []) or [])
+                if str(provider.get("id", "")) == "local-huggingface"
+                or str(provider.get("id", "")).startswith("local-runtime-")
+            ],
+            "local_models": deepcopy(list(catalog.get("local_models", []) or [])),
+        }
+        return health
 
     def _extension_updates(self) -> dict[str, Any]:
         """Return one user-facing update snapshot for all extension types.
@@ -947,6 +1011,9 @@ class NotebookWebApp:
             return self._attachment_asset(parts[2])
         if len(parts) == 3 and parts[:2] == ["api", "audio-attachments"]:
             return self._audio_attachment_asset(parts[2])
+        if len(parts) == 3 and parts[:2] == ["api", "generated-images"]:
+            image_path, content_type = generated_image_asset(self.workspace, parts[2])
+            return WebResponse(HTTPStatus.OK, content_type, image_path.read_bytes())
         if len(parts) == 3 and parts[:2] == ["api", "presentations"]:
             requested = Path(parts[2]).name
             root = (self.workspace.parent / "presentations").resolve()
@@ -981,12 +1048,25 @@ class NotebookWebApp:
             return self._ask(payload)
         if path == "/api/audio/transcribe":
             return self._json(HTTPStatus.OK, self.research_agent.transcribe_audio(payload))
+        if path == "/api/chat/attachments/stage":
+            return self._json(HTTPStatus.OK, self.research_agent.stage_direct_attachments(payload))
+        if path == "/api/chat/title":
+            return self._json(HTTPStatus.OK, self.research_agent.generate_conversation_title(payload))
         if path == "/api/chat":
             return self._json(HTTPStatus.OK, self.research_agent.chat(payload))
         if path == "/api/chat/history":
             return self._json(HTTPStatus.OK, self.direct_chat_history.upsert(payload))
         if len(parts) == 5 and parts[:3] == ["api", "chat", "history"]:
             conversation_id, action = parts[3], parts[4]
+            if action == "title":
+                return self._json(
+                    HTTPStatus.OK,
+                    self.direct_chat_history.set_title(
+                        conversation_id,
+                        str(payload.get("title", "") or ""),
+                        source=str(payload.get("title_source", "") or ""),
+                    ),
+                )
             if action == "archive":
                 return self._json(HTTPStatus.OK, self.direct_chat_history.set_archived(conversation_id, True))
             if action == "restore":
@@ -1069,10 +1149,12 @@ class NotebookWebApp:
             requested_mode = payload.get("auto", payload.get("automatic", True))
             automatic = bool(requested_mode) and not bool(payload.get("force", False))
             local_ai = (
+                self.research_agent.local_evidence_status(notebook_id=notebook_id)
+                if automatic
+                else
                 self.research_agent.prepare_local_evidence(
                     notebook_id=notebook_id,
                     quality_profile="precision",
-                    force=bool(payload.get("force", False)),
                 )
                 if install.get("state") == "ready"
                 else {
@@ -1449,6 +1531,8 @@ class NotebookWebApp:
         if path == "/api/local-models/delete":
             model_id = str(payload.get("id", "")).strip()
             return self._json(HTTPStatus.OK, delete_installed_model(model_id))
+        if path == "/api/local-models/recheck":
+            return self._recheck_local_model(str(payload.get("id", "")).strip())
         if path == "/api/local-models/download":
             repo_id = str(payload.get("id", ""))
             runtime = str(payload.get("runtime", "") or "").strip().lower()
@@ -1662,19 +1746,36 @@ class NotebookWebApp:
         return WebResponse(HTTPStatus.OK, content_type, path.read_bytes())
 
     def _download_run_artifact(self, run_id: str) -> WebResponse:
-        """Serve only the PPTX produced by a durable local research run."""
+        """Serve a PPTX or project archive produced by a durable local run."""
 
         run = self.research_agent.store.get_run(run_id)
         artifact = dict(run.get("output_artifact", {}) or {})
-        candidate = Path(str(artifact.get("file_path", "") or "")).resolve()
+        payload = dict(artifact.get("payload", {}) or {})
         presentations = (self.workspace.parent / "presentations").resolve()
-        if candidate.suffix.casefold() != ".pptx" or presentations not in candidate.parents or not candidate.is_file():
-            raise FileNotFoundError("这个任务没有可下载的 PPTX 文件")
-        return WebResponse(
-            HTTPStatus.OK,
-            "application/vnd.openxmlformats-officedocument.presentationml.presentation",
-            candidate.read_bytes(),
-        )
+        candidate = Path(str(artifact.get("file_path", "") or "")).resolve()
+        if candidate.suffix.casefold() == ".pptx" and presentations in candidate.parents and candidate.is_file():
+            return WebResponse(
+                HTTPStatus.OK,
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                candidate.read_bytes(),
+            )
+        if artifact.get("artifact_type") != "slide_deck_project":
+            raise FileNotFoundError("这个任务没有可下载的文件")
+
+        project = Path(str(payload.get("project_path") or artifact.get("file_path") or "")).resolve()
+        if presentations not in project.parents or not project.is_dir():
+            raise FileNotFoundError("这个任务没有可下载的演示项目")
+        files = [
+            path for path in project.rglob("*")
+            if not path.is_symlink() and path.is_file() and project in path.resolve().parents
+        ]
+        if not files:
+            raise FileNotFoundError("演示项目中没有可下载的文件")
+        archive = io.BytesIO()
+        with zipfile.ZipFile(archive, "w", compression=zipfile.ZIP_DEFLATED) as bundle:
+            for path in files:
+                bundle.write(path, (Path(project.name) / path.relative_to(project)).as_posix())
+        return WebResponse(HTTPStatus.OK, "application/zip", archive.getvalue())
 
     def _presentation_preview(self, run_id: str) -> WebResponse:
         """Return a lightweight cover preview for a completed source-to-PPT run.
@@ -2016,14 +2117,14 @@ class NotebookWebApp:
         }
 
     def _with_evidence_index_run(self, result: dict[str, Any], *, notebook_id: str) -> dict[str, Any]:
-        """Start semantic indexing without rebuilding reusable caches automatically."""
+        """Report import readiness without loading optional retrieval models."""
 
         payload = dict(result)
         install = self._ensure_retrieval_models(notebook_id)
         payload["model_install"] = install
         if install.get("state") == "ready":
             try:
-                local_ai = self.research_agent.prepare_local_evidence(
+                local_ai = self.research_agent.local_evidence_status(
                     notebook_id=notebook_id,
                     quality_profile="precision",
                 )
@@ -2124,6 +2225,62 @@ class NotebookWebApp:
             },
         )
 
+    def _recheck_local_model(self, model_id: str) -> WebResponse:
+        """Retry an installed chat/vision snapshot after a transient probe failure."""
+
+        wanted = str(model_id or "").strip()
+        record = next(
+            (item for item in installed_models() if str(item.get("id", "")).strip() == wanted),
+            None,
+        )
+        if not isinstance(record, dict):
+            return self._json(
+                HTTPStatus.NOT_FOUND,
+                {"error": {"code": "local_model_not_found", "message": "没有找到这个本地模型。"}},
+            )
+        capabilities = {str(value).strip().lower() for value in list(record.get("capabilities", []) or [])}
+        kind = str(record.get("kind", "")).strip().lower()
+        if str(record.get("format", "")).strip().lower() != "transformers" or not (
+            kind == "vision" or capabilities.intersection({"chat", "vision"})
+        ):
+            return self._json(
+                HTTPStatus.CONFLICT,
+                {"error": {"code": "local_model_not_probeable", "message": "这个本地模型不支持对话/视觉预检。"}},
+            )
+        if not bool(record.get("model_files_present", record.get("ready"))):
+            return self._json(
+                HTTPStatus.CONFLICT,
+                {"error": {"code": "local_model_incomplete", "message": "模型文件尚未完整下载，暂时不能检测。"}},
+            )
+        try:
+            ensure_local_transformers_runtime(wanted)
+        except Exception as error:  # noqa: BLE001 - surface the actionable loader error to the UI
+            return self._json(
+                HTTPStatus.CONFLICT,
+                {
+                    "error": {
+                        "code": "model_probe_failed",
+                        "message": str(error)[:1200],
+                    },
+                    "model": next(
+                        (item for item in installed_models() if str(item.get("id", "")).strip() == wanted),
+                        record,
+                    ),
+                },
+            )
+        refreshed = next(
+            (item for item in installed_models() if str(item.get("id", "")).strip() == wanted),
+            record,
+        )
+        return self._json(
+            HTTPStatus.OK,
+            {
+                "ok": True,
+                "model": refreshed,
+                "message": "本地模型已重新检测并可用。",
+            },
+        )
+
     def _audio_model_download_requires_runtime(self) -> WebResponse | None:
         """Do not offer Qwen ASR where the desktop cannot execute it."""
 
@@ -2169,7 +2326,7 @@ class NotebookWebApp:
                     continue
                 with self._retrieval_setup_lock:
                     self._retrieval_setup_errors.pop(target_id, None)
-                self.research_agent.start_evidence_index(target_id, automatic=True)
+                self.research_agent.start_evidence_index(target_id)
             except Exception as error:  # one library must not block the others
                 with self._retrieval_setup_lock:
                     self._retrieval_setup_errors[target_id] = f"{type(error).__name__}: {error}"[:1200]
@@ -2934,7 +3091,11 @@ def create_notebook_server(
                     return
                 except (ValueError, RuntimeError) as error:
                     span.record_exception(error)
-                    self._write_sse("error", {"message": str(error)})
+                    payload = {"message": str(error)}
+                    failure = getattr(error, "failure", None)
+                    if isinstance(failure, dict) and failure:
+                        payload["failure"] = dict(failure)
+                    self._write_sse("error", payload)
                 except Exception as error:  # noqa: BLE001 - prevent closing an SSE response without a client event
                     span.record_exception(error)
                     self._write_sse("error", {"message": "The streaming response could not be completed."})

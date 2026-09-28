@@ -181,6 +181,32 @@ def test_search_evidence_store_can_expand_hits_to_parent_block_context(tmp_path:
     ]
 
 
+def test_search_evidence_store_returns_one_hop_sentence_context(tmp_path: Path):
+    library = tmp_path / "library"
+    library.mkdir()
+    (library / "paper.html").write_text(
+        """
+        <article class="paper" data-doi="10.1234/neighbor-context">
+          <h1>Context Paper</h1>
+          <h2>Results</h2>
+          <p id="results-p1">The cohort included 120 participants. Treatment increased cortical activity in language regions. The follow-up assessment found the effect persisted.</p>
+        </article>
+        """,
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "evidence.sqlite"
+    index_evidence_library(library, db_path=db_path, min_sentence_length=10)
+
+    hits = search_evidence_store(db_path, "treatment increased cortical activity", limit=1)
+
+    assert hits[0]["evidence_id"] == "10.1234_neighbor-context.s0002"
+    assert hits[0]["matched_text"] == hits[0]["text"]
+    assert hits[0]["context_before"] == "The cohort included 120 participants."
+    assert hits[0]["context_before_evidence_id"] == "10.1234_neighbor-context.s0001"
+    assert hits[0]["context_after"] == "The follow-up assessment found the effect persisted."
+    assert hits[0]["context_after_evidence_id"] == "10.1234_neighbor-context.s0003"
+
+
 def test_search_evidence_store_applies_per_document_limit_after_reranking(tmp_path: Path):
     library = tmp_path / "library"
     library.mkdir()

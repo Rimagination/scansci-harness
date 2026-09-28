@@ -30,7 +30,7 @@ from .web_search import search_public_web
 
 
 AGENT_REACH_SCHEMA_VERSION = "scansci.agent-reach.v1"
-_USER_AGENT = "ScanSci-Pi/0.2 Agent-Reach-compatible reader"
+_USER_AGENT = "ScanSci-Harness/0.2 Agent-Reach-compatible reader"
 _MAX_RESPONSE_BYTES = 5 * 1024 * 1024
 _MAX_CONTENT_CHARS = 60_000
 _DEFAULT_TIMEOUT = 30.0

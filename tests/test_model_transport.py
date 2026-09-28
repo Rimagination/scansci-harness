@@ -5,11 +5,15 @@ import requests
 
 from scansci_html.llm import OpenAIResponsesJsonClient, complete_chat_text, stream_chat_text
 from scansci_html.model_transport import (
+    ANTHROPIC_MESSAGES,
     CHAT_COMPLETIONS,
     RESPONSES,
     ModelCapabilityError,
     ModelRequest,
+    capabilities_for,
     complete_model,
+    opencode_go_api_surface,
+    provider_request_headers,
     select_api_surface,
     stream_model_events,
 )
@@ -87,6 +91,63 @@ def test_select_api_surface_never_silently_downgrades_generic_gateway():
         )
 
 
+@pytest.mark.parametrize(
+    ("model", "surface"),
+    [
+        ("grok-4.6", RESPONSES),
+        ("gpt-5.6-luna", RESPONSES),
+        ("muse-spark-1.2-contributor", RESPONSES),
+        ("glm-5.3-flash", CHAT_COMPLETIONS),
+        ("deepseek-v4-flash-vision-exp", CHAT_COMPLETIONS),
+        ("minimax-m3", ANTHROPIC_MESSAGES),
+        ("qwen3.8-flash", ANTHROPIC_MESSAGES),
+    ],
+)
+def test_opencode_go_routes_each_model_to_its_documented_api_surface(model, surface):
+    assert opencode_go_api_surface(model) == surface
+    assert select_api_surface(
+        "auto",
+        provider_kind="openai-compatible",
+        provider_id="opencode-go",
+        model=model,
+    ) == surface
+    # Existing callers use Chat Completions as their default argument. Keep
+    # that legacy default safe for OpenCode Go's non-Chat model families.
+    assert select_api_surface(
+        CHAT_COMPLETIONS,
+        provider_kind="openai-compatible",
+        provider_id="opencode-go",
+        model=model,
+    ) == surface
+    assert surface in capabilities_for(
+        "openai-compatible",
+        model,
+        provider_id="opencode-go",
+    ).api_surfaces
+
+
+def test_opencode_go_anthropic_model_posts_messages_payload():
+    response = FakeResponse({"id": "msg_go", "content": [{"type": "text", "text": "ready"}], "usage": {"input_tokens": 3, "output_tokens": 2}})
+    session = FakeSession(response)
+    result = complete_model(
+        ModelRequest(
+            provider_kind="openai-compatible",
+            provider_id="opencode-go",
+            base_url="https://opencode.example/v1",
+            api_key="go-secret",
+            model="minimax-m3",
+            messages=[{"role": "user", "content": "hello"}],
+            api_surface="auto",
+            session=session,
+        )
+    )
+    assert result.text == "ready"
+    assert result.api_surface == ANTHROPIC_MESSAGES
+    assert session.calls[0]["url"] == "https://opencode.example/v1/messages"
+    assert session.calls[0]["headers"]["x-api-key"] == "go-secret"
+    assert "Authorization" not in session.calls[0]["headers"]
+
+
 def test_complete_model_posts_openai_responses_payload():
     response = FakeResponse(
         {
@@ -105,6 +166,36 @@ def test_complete_model_posts_openai_responses_payload():
     assert session.calls[0]["url"] == "https://example.test/v1/responses"
     assert session.calls[0]["json"]["previous_response_id"] == "resp_prev"
     assert session.calls[0]["json"]["reasoning"] == {"effort": "low"}
+
+
+def test_opencode_go_responses_carries_the_same_provider_session_header():
+    response = FakeResponse(
+        {
+            "id": "resp_go",
+            "status": "completed",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "ready"}]}],
+        }
+    )
+    session = FakeSession(response)
+    result = complete_model(
+        ModelRequest(
+            provider_kind="openai-compatible",
+            provider_id="opencode-go",
+            provider_session_id="conversation-42",
+            base_url="https://opencode.ai/zen/go/v1",
+            api_key="go-secret",
+            model="grok-4.6",
+            messages=[{"role": "user", "content": "hello"}],
+            api_surface="auto",
+            session=session,
+        )
+    )
+
+    assert result.text == "ready"
+    assert session.calls[0]["headers"]["x-opencode-session"] == provider_request_headers(
+        "opencode-go", "conversation-42"
+    )["x-opencode-session"]
+    assert session.calls[0]["headers"]["User-Agent"] == "ScanSci"
 
 
 def test_stream_model_events_normalizes_responses_sse():

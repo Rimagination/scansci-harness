@@ -43,6 +43,21 @@ def test_browser_recording_accepts_webm_opus_codec_parameter(tmp_path: Path):
     assert mime_type == "audio/webm"
 
 
+def test_history_audio_metadata_reuses_the_existing_local_attachment(tmp_path: Path):
+    workspace = tmp_path / "workspace.sqlite"
+    original = persist_audio_attachments(
+        workspace,
+        [{"name": "访谈.wav", "data_url": _data_url()}],
+    )[0]
+
+    retried = persist_audio_attachments(
+        workspace,
+        [{"id": original["id"], "name": original["name"], "mime_type": original["mime_type"]}],
+    )
+
+    assert retried == [original]
+
+
 def test_audio_attachment_rejects_non_audio_and_traversal(tmp_path: Path):
     with pytest.raises(ValueError, match="仅支持"):
         persist_audio_attachments(

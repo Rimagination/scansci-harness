@@ -68,6 +68,30 @@ def _env_paths(name: str) -> Iterable[Path]:
             yield Path(value.strip())
 
 
+def missing_configured_model_roots() -> list[str]:
+    """Report explicit model locations that are currently disconnected."""
+
+    candidates = [
+        candidate
+        for name in ("SCANSCI_MODEL_ROOT", "SCANSCI_MODEL_ROOTS", "HF_HOME", "HF_HUB_CACHE", "HUGGINGFACE_HUB_CACHE")
+        for candidate in _env_paths(name)
+    ]
+    missing: list[str] = []
+    seen: set[str] = set()
+    for candidate in candidates:
+        try:
+            resolved = candidate.expanduser().resolve(strict=False)
+            exists = resolved.exists()
+        except OSError:
+            resolved = candidate.expanduser()
+            exists = False
+        key = str(resolved).casefold()
+        if key not in seen and not exists:
+            seen.add(key)
+            missing.append(str(resolved))
+    return missing
+
+
 def discover_model_roots() -> list[Path]:
     """Return existing candidate roots without doing an expensive disk crawl."""
     explicit = os.getenv("SCANSCI_MODEL_ROOT", "").strip()
@@ -139,10 +163,20 @@ def hub_cache_root() -> Path:
 
 def _snapshot(folder: Path) -> Path | None:
     snapshots = folder / "snapshots"
-    if not snapshots.is_dir():
+    try:
+        if not snapshots.is_dir():
+            return None
+        rows_with_times: list[tuple[float, Path]] = []
+        for item in snapshots.iterdir():
+            try:
+                if item.is_dir():
+                    rows_with_times.append((item.stat().st_mtime, item))
+            except OSError:
+                continue
+    except OSError:
         return None
-    rows = [item for item in snapshots.iterdir() if item.is_dir()]
-    return max(rows, key=lambda item: item.stat().st_mtime) if rows else None
+    rows = [item for _, item in sorted(rows_with_times, key=lambda row: row[0], reverse=True)]
+    return next((item for item in rows if _model_weight_files(item)), rows[0] if rows else None)
 
 
 def _read_model_json(path: Path) -> dict[str, Any]:
@@ -249,7 +283,7 @@ def _kind(identifier: str, config: dict[str, Any]) -> str:
         return "reranking"
     if any(token in value for token in ("embedding", "embed", "bge", "gte", "e5-")):
         return "embedding"
-    if any(token in value for token in ("whisper", "asr", "speech")):
+    if any(token in value for token in ("whisper", "asr", "speech", "tts", "text-to-speech", "vocoder")):
         return "audio"
     if any(token in value for token in ("vision", "-vl", "llava", "image", "minicpmv", "minicpm-v")) or isinstance(config.get("vision_config"), dict):
         return "vision"
@@ -275,7 +309,7 @@ def _capabilities(identifier: str, config: dict[str, Any]) -> list[str]:
         "bge" in value and not is_reranker
     ):
         capabilities.append("embedding")
-    if any(token in value for token in ("whisper", "asr", "speech")) or isinstance(config.get("audio_config"), dict):
+    if any(token in value for token in ("whisper", "asr", "speech", "tts", "text-to-speech", "vocoder")) or isinstance(config.get("audio_config"), dict):
         capabilities.append("audio")
     is_vision = (
         any(token in value for token in ("vision", "-vl", "llava", "image", "minicpmv", "minicpm-v"))
@@ -333,7 +367,7 @@ def installed_models() -> list[dict[str, Any]]:
     known: set[str] = set()
     compatibility = ModelCompatibilityStore()
 
-    def add_snapshot(repo_id: str, snapshot: Path) -> None:
+    def add_snapshot(repo_id: str, snapshot: Path, source_root: Path) -> None:
         marker = f"{repo_id}|{snapshot}".casefold()
         if marker in known:
             return
@@ -345,6 +379,7 @@ def installed_models() -> list[dict[str, Any]]:
             "id": repo_id,
             "name": repo_id,
             "path": str(snapshot),
+            "source_root": str(source_root),
             "size_bytes": _bytes(snapshot),
             "ready": bool(weights),
             "kind": kind,
@@ -369,13 +404,13 @@ def installed_models() -> list[dict[str, Any]]:
                 if snapshot is None:
                     continue
                 repo_id = folder.name.removeprefix("models--").replace("--", "/")
-                add_snapshot(repo_id, snapshot)
+                add_snapshot(repo_id, snapshot, configured_root)
         # Also accept a normal model folder selected by another downloader.
         # This scan is limited to known model roots and three directory levels;
         # it never recursively walks an arbitrary drive.
         for folder in _direct_model_directories(configured_root):
             repo_id = _canonical_model_id(folder, _read_model_json(folder / "config.json"))
-            add_snapshot(repo_id, folder)
+            add_snapshot(repo_id, folder, configured_root)
     return sorted(rows, key=lambda item: str(item["name"]).casefold())
 
 

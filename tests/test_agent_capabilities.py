@@ -1,5 +1,9 @@
 from __future__ import annotations
 
+from copy import deepcopy
+
+import pytest
+
 from scansci_html.agent_advisor import classify_failure, review_research_run, run_metrics
 from scansci_html.agent_benchmark import grade_harness_case, grade_harness_records, summarize_harness_results
 from scansci_html.agent_capabilities import (
@@ -117,7 +121,24 @@ def test_contract_advisor_reports_evidence_gaps_without_side_effects() -> None:
     assert classify_failure("403 forbidden") == "permission_denied"
 
 
-def test_contract_advisor_counts_verified_artifact_as_background_tool_completion() -> None:
+@pytest.mark.parametrize(
+    "tool_name,status,has_links,verified,expected",
+    [
+        ("scansci.evidence.ask", "completed", True, True, "passed"),
+        ("scansci.review.write", "completed", True, True, "passed"),
+        ("scansci.evidence.ask", "failed", True, True, "needs_review"),
+        ("scansci.evidence.ask", "running", True, True, "needs_review"),
+        ("scansci.evidence.ask", "cancelled", True, True, "needs_review"),
+        ("inspect_workspace", "completed", True, True, "needs_review"),
+        ("scansci.academic.search", "completed", True, True, "needs_review"),
+        ("", "completed", True, True, "needs_review"),
+        ("scansci.evidence.ask", "completed", False, True, "insufficient"),
+        ("scansci.evidence.ask", "completed", True, False, "needs_review"),
+    ],
+)
+def test_contract_advisor_requires_host_call_and_verified_artifact(
+    tool_name, status, has_links, verified, expected
+) -> None:
     """Durable evidence stages are persisted as one host tool call, not each UI trace step."""
 
     run = {
@@ -125,16 +146,16 @@ def test_contract_advisor_counts_verified_artifact_as_background_tool_completion
         "status": "completed",
         "stage_counts": {"total": 4, "completed": 4},
         "task_contract": {
-            "required_tool_groups": [["build_verified_answer"]],
+            "required_tool_groups": [["search_local_evidence"], ["build_verified_answer"]],
             "task_profile": {"evidence_policy": "required"},
         },
         "tool_calls": [
-            {"tool_name": "scansci.evidence.ask", "status": "completed", "duration_ms": 12},
-        ],
+            {"tool_name": tool_name, "status": status, "duration_ms": 12},
+        ] if tool_name else [],
         "output_artifact": {
             "artifact_type": "evidence_answer",
-            "evidence_links": [{"evidence_id": "doc.s1", "uri": "scansci://evidence/doc.s1"}],
-            "payload": {"citation_verification": {"passed": True}},
+            "evidence_links": [{"evidence_id": "doc.s1", "uri": "scansci://evidence/doc.s1"}] if has_links else [],
+            "payload": {"citation_verification": {"passed": verified}},
         },
         "events": [],
         "error": {},
@@ -142,8 +163,62 @@ def test_contract_advisor_counts_verified_artifact_as_background_tool_completion
 
     report = review_research_run(run)
 
-    assert report["verdict"] == "passed"
-    assert report["findings"] == []
+    assert report["verdict"] == expected
+    missing = [item for item in report["findings"] if item["code"] == "required_tool_group_missing"]
+    assert len(missing) == (0 if expected == "passed" else 2)
+
+
+@pytest.mark.parametrize(
+    "tool_name,status,required_group,evidence_policy,expected",
+    [
+        ("scansci.academic.search", "completed", ["agent_reach", "browser_access", "discover_papers", "search_web"], "assist", "passed"),
+        ("scansci.academic.search", "completed", ["discover_papers"], "assist", "passed"),
+        ("discover_papers", "completed", ["discover_papers"], "assist", "passed"),
+        ("scansci.academic.search", "failed", ["discover_papers"], "assist", "needs_review"),
+        ("scansci.academic.search", "running", ["discover_papers"], "assist", "needs_review"),
+        ("scansci.academic.search", "cancelled", ["discover_papers"], "assist", "needs_review"),
+        ("inspect_workspace", "completed", ["discover_papers"], "assist", "needs_review"),
+        ("", "completed", ["discover_papers"], "assist", "needs_review"),
+        ("scansci.academic.search", "completed", ["browser_access"], "assist", "needs_review"),
+        ("scansci.academic.search", "completed", ["search_web"], "assist", "needs_review"),
+        ("scansci.academic.search", "completed", ["agent_reach"], "assist", "needs_review"),
+        ("scansci.academic.search", "completed", ["discover_papers"], "strict", "insufficient"),
+    ],
+)
+def test_contract_advisor_matches_actual_host_search_calls(
+    tool_name, status, required_group, evidence_policy, expected
+) -> None:
+    # Mirrors the durable 24-candidate academic-search delivery. Candidate
+    # output alone must never supply a missing or unsuccessful tool call.
+    run = {
+        "run_id": "run-academic-search",
+        "status": "completed",
+        "stage_counts": {"total": 3, "completed": 3},
+        "task_contract": {
+            "required_tool_groups": [required_group],
+            "task_profile": {"evidence_policy": evidence_policy},
+        },
+        "tool_calls": [{
+            "tool_name": tool_name, "status": status,
+            "output": {"count": 24, "evidence_status": "discovery_leads"},
+        }] if tool_name else [],
+        "output_artifact": {
+            "artifact_type": "academic_search_result",
+            "payload": {"count": 24, "evidence_status": "discovery_leads"},
+            "evidence_links": [],
+        },
+    }
+    original = deepcopy(run)
+
+    report = review_research_run(run)
+
+    assert report["verdict"] == expected
+    assert report["recommended_next_action"] == {
+        "passed": "none", "needs_review": "resume_required_tools",
+        "insufficient": "run_evidence_verification",
+    }[expected]
+    assert report["metrics"]["tool_calls"]["by_name"] == ({tool_name: 1} if tool_name else {})
+    assert run == original
 
 
 def test_harness_grading_checks_trace_and_evidence_requirements() -> None:

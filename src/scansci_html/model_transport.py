@@ -9,6 +9,7 @@ optional Python harness.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+import hashlib
 import json
 import os
 import time
@@ -105,6 +106,7 @@ class ModelRequest:
     max_requests: int = 2
     session: Any | None = None
     run_id: str = ""
+    provider_session_id: str = ""
     request_id: str = field(default_factory=lambda: f"model-{os.urandom(8).hex()}")
 
 
@@ -122,12 +124,80 @@ def _normalise(value: object) -> str:
     return str(value or "").strip().lower()
 
 
+def provider_request_headers(provider_id: object, session_id: object) -> dict[str, str]:
+    """Return provider-required identity headers without exposing local ids."""
+
+    if _normalise(provider_id) != "opencode-go":
+        return {}
+    stable_id = str(session_id or "").strip()
+    if not stable_id:
+        return {}
+    digest = hashlib.sha256(stable_id.encode("utf-8")).hexdigest()[:32]
+    return {
+        "User-Agent": "ScanSci",
+        "x-opencode-session": f"scansci-{digest}",
+    }
+
+
+def merge_request_headers(
+    base_headers: Mapping[str, str],
+    extra_headers: Mapping[str, str] | None,
+) -> dict[str, str]:
+    """Merge internal provider headers while protecting authentication fields."""
+
+    merged = dict(base_headers)
+    protected = {"authorization", "content-type", "x-api-key", "anthropic-version"}
+    for raw_name, raw_value in dict(extra_headers or {}).items():
+        name = str(raw_name or "").strip()
+        value = str(raw_value or "").strip()
+        if not name or not value or name.casefold() in protected or "\r" in value or "\n" in value:
+            continue
+        merged[name] = value
+    return merged
+
+
 def _responses_models_from_environment() -> set[str]:
     return {
         item.strip()
         for item in str(os.getenv("SCANSCI_RESPONSES_MODELS", "")).split(",")
         if item.strip()
     }
+
+
+_OPENCODE_GO_RESPONSES_MODELS = frozenset(
+    {
+        "grok-4.6",
+        "gpt-5.6-luna",
+        "muse-spark-1.2-contributor",
+    }
+)
+_OPENCODE_GO_ANTHROPIC_MODELS = frozenset(
+    {
+        "minimax-m3",
+        "minimax-m2.7",
+        "minimax-m2.5",
+        "qwen3.8-max",
+        "qwen3.8-flash",
+        "qwen3.7-max",
+        "qwen3.7-plus",
+        "qwen3.6-plus",
+    }
+)
+
+
+def opencode_go_api_surface(model: str) -> str:
+    """Return the endpoint family documented for one OpenCode Go model."""
+
+    model_id = _normalise(model)
+    for prefix in ("opencode-go/", "opencode-go:"):
+        if model_id.startswith(prefix):
+            model_id = model_id[len(prefix) :]
+            break
+    if model_id in _OPENCODE_GO_RESPONSES_MODELS:
+        return RESPONSES
+    if model_id in _OPENCODE_GO_ANTHROPIC_MODELS:
+        return ANTHROPIC_MESSAGES
+    return CHAT_COMPLETIONS
 
 
 def capabilities_for(
@@ -156,6 +226,18 @@ def capabilities_for(
             api_surfaces=frozenset({ANTHROPIC_MESSAGES}),
             supports_reasoning=True,
             supports_structured_output=True,
+        )
+    if identifier == "opencode-go":
+        surface = opencode_go_api_surface(model_name)
+        return ModelCapabilities(
+            provider_id=identifier,
+            provider_kind=kind,
+            model=model_name,
+            api_surfaces=frozenset({surface}),
+            supports_reasoning=True,
+            supports_previous_response_id=surface == RESPONSES,
+            supports_structured_output=True,
+            supports_hosted_tools=surface == RESPONSES,
         )
     can_use_responses = bool(
         responses_enabled
@@ -197,9 +279,16 @@ def select_api_surface(
         responses_enabled=responses_enabled,
     )
     if value == AUTO:
+        if _normalise(provider_id) == "opencode-go":
+            return opencode_go_api_surface(model)
         if _normalise(provider_kind) in {"anthropic", "anthropic-compatible"}:
             return ANTHROPIC_MESSAGES
         return RESPONSES if _normalise(provider_id) == "openai" and RESPONSES in capabilities.api_surfaces else CHAT_COMPLETIONS
+    # The legacy default is Chat Completions. Treat it as an omitted surface
+    # for OpenCode Go so callers that predate the provider still follow the
+    # documented model-specific endpoint automatically.
+    if _normalise(provider_id) == "opencode-go" and value == CHAT_COMPLETIONS:
+        return opencode_go_api_surface(model)
     if value not in capabilities.api_surfaces:
         supported = ", ".join(sorted(capabilities.api_surfaces))
         raise ModelCapabilityError(
@@ -272,6 +361,13 @@ def _request_with_retry(
         headers.update({"x-api-key": request.api_key, "anthropic-version": "2023-06-01"})
     else:
         headers["Authorization"] = f"Bearer {request.api_key}"
+    headers = merge_request_headers(
+        headers,
+        provider_request_headers(
+            request.provider_id,
+            request.provider_session_id or request.run_id or request.request_id,
+        ),
+    )
     last_error: BaseException | None = None
     limit = max(1, min(8, int(request.max_requests)))
     for attempt in range(limit):
@@ -456,6 +552,9 @@ def complete_model(request: ModelRequest) -> ModelResult:
             temperature=request.temperature if request.temperature is not None else 0.4,
             max_requests=request.max_requests,
             api_surface=CHAT_COMPLETIONS,
+            provider_id=request.provider_id,
+            responses_enabled=request.responses_enabled,
+            provider_session_id=request.provider_session_id or request.run_id or request.request_id,
         )
         text, usage = result if isinstance(result, tuple) else (str(result), {})
         return ModelResult(text=str(text), usage=normalize_usage(usage), api_surface=surface, raw_type="chat.completion")
@@ -487,6 +586,9 @@ def _stream_chat_events(request: ModelRequest) -> Iterator[dict[str, Any]]:
         temperature=request.temperature if request.temperature is not None else 0.4,
         max_requests=request.max_requests,
         api_surface=CHAT_COMPLETIONS,
+        provider_id=request.provider_id,
+        responses_enabled=request.responses_enabled,
+        provider_session_id=request.provider_session_id or request.run_id or request.request_id,
     ):
         event_type = str(event.get("type", ""))
         if event_type == "delta":
@@ -604,6 +706,7 @@ __all__ = [
     "SUPPORTED_API_SURFACES",
     "capabilities_for",
     "complete_model",
+    "opencode_go_api_surface",
     "select_api_surface",
     "stream_model_events",
 ]

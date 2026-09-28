@@ -906,6 +906,15 @@ def test_pi_runtime_delegates_sparse_thinking_level_clamp_to_sdk() -> None:
     assert "sort((left, right) => order.indexOf(right)" not in runtime_source
 
 
+def test_pi_runtime_allows_loopback_sse_to_finish_without_terminal_reason() -> None:
+    runtime_source = (
+        Path(__file__).parents[1] / "pi-runtime" / "src" / "main.ts"
+    ).read_text(encoding="utf-8")
+
+    assert '["127.0.0.1", "localhost", "::1"].includes(baseHostname)' in runtime_source
+    assert "supportsFinishReason: false" in runtime_source
+
+
 def test_pause_api_documents_abort_and_resume_not_suspend_semantics() -> None:
     documentation = str(PiAgentClient.pause.__doc__ or "").lower()
     assert "abort-and-resume" in documentation

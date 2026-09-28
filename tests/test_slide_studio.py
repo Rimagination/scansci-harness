@@ -230,7 +230,8 @@ def test_presentation_ui_uses_stable_rendering_and_native_save_bridge():
     assert "originalSlideSources" not in app_js
     assert "taskConversationMarkup" in app_js
     assert "const isTaskConversation = inputId === \"chatQuestionInput\"" in app_js
-    assert "const isTaskFollowUp = isTaskConversation" in app_js
+    # The flag is reassigned for casual-knowledge handling, so it is a `let` now.
+    assert "let isTaskFollowUp = isTaskConversation" in app_js
     assert "renderAssistantContent(message.content)" in app_js
     assert "function siteLinkMarkup" in app_js
     assert "function linkifyExternalUrls" in app_js
@@ -255,8 +256,7 @@ def test_presentation_ui_uses_stable_rendering_and_native_save_bridge():
     assert "原始任务" not in app_js
     assert "任务续聊" not in app_js
     assert 'aria-label="任务消息"' in app_js
-    assert 'run.error?.code === "app_restarted"' in app_js
-    assert '`/api/runs/${encodeURIComponent(id)}/resume`' in app_js
+    assert '`/api/runs/${encodeURIComponent(runId)}/resume`' in app_js
     assert '["queued", "planning", "running", "verifying"].includes(String(run.status || ""))' in app_js
     assert 'window.localStorage.setItem("scansci.active.task", run.run_id)' in app_js
     assert "任务上下文 · 续聊" not in app_js

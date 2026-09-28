@@ -54,7 +54,7 @@ class NotionClient:
             "Authorization": f"Bearer {self.token}",
             "Notion-Version": NOTION_VERSION,
             "Content-Type": "application/json",
-            "User-Agent": "ScanSci-Pi/NotionConnector",
+            "User-Agent": "ScanSci-Harness/NotionConnector",
         }
         for attempt in range(4):
             try:

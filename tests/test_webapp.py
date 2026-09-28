@@ -27,6 +27,12 @@ from scansci_html.research_agent import (
     _numbered_heading_count,
     _numbered_section_check_counts,
     _normalize_direct_chat_output,
+    _apply_direct_chat_profile,
+    _contextual_follow_up_contract,
+    _contextual_follow_up_gap,
+    _contextual_follow_up_instruction,
+    _response_language,
+    _response_language_instruction,
     _requested_section_check_count,
     _repair_scientific_rewrite,
     _safe_good_question_fallback,
@@ -82,7 +88,7 @@ def test_local_ai_status_route_starts_and_reads_background_preparation(tmp_path:
     assert observed == [{"notebook_id": "immunotherapy", "quality_profile": "precision", "force": False}]
 
 
-def test_import_index_waits_for_background_local_ai_preparation(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+def test_import_does_not_load_installed_retrieval_models(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     app, _workspace, _evidence = _build_app(tmp_path)
     monkeypatch.setattr(
         app,
@@ -92,22 +98,45 @@ def test_import_index_waits_for_background_local_ai_preparation(tmp_path: Path, 
     monkeypatch.setattr(
         app.research_agent,
         "prepare_local_evidence",
-        lambda **_kwargs: {
-            "state": "preparing",
-            "phase": "loading_models",
-            "progress": 0.1,
-        },
+        lambda **_kwargs: (_ for _ in ()).throw(AssertionError("import must not load models")),
     )
     monkeypatch.setattr(
         app.research_agent,
         "start_evidence_index",
-        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("index must wait for model preparation")),
+        lambda *_args, automatic=False: None if automatic else pytest.fail("import must not request a build"),
     )
 
     result = app._with_evidence_index_run({"ok": True}, notebook_id="immunotherapy")
 
-    assert result["local_ai"]["state"] == "preparing"
+    assert result["local_ai"]["state"] == "idle"
     assert "index_run" not in result
+
+
+@pytest.mark.parametrize("payload", [{}, {"auto": True}, {"force": True}])
+def test_evidence_index_route_prepares_models_only_on_explicit_request(tmp_path: Path, monkeypatch, payload):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    calls = []
+    monkeypatch.setattr(app, "_ensure_retrieval_models", lambda _id: {"state": "ready"})
+    monkeypatch.setattr(app, "_evidence_index_status", lambda *_args, **_kwargs: {"state": "pending"})
+    monkeypatch.setattr(
+        app.research_agent, "prepare_local_evidence",
+        lambda **kwargs: calls.append(("prepare", kwargs)) or {"state": "ready"},
+    )
+    monkeypatch.setattr(
+        app.research_agent, "start_evidence_index",
+        lambda _id, **kwargs: calls.append(("index", kwargs)),
+    )
+
+    response = app.dispatch("POST", "/api/notebooks/immunotherapy/evidence-index", json.dumps(payload).encode())
+
+    assert response.status == 202
+    if payload.get("force"):
+        assert calls == [
+            ("prepare", {"notebook_id": "immunotherapy", "quality_profile": "precision"}),
+            ("index", {"automatic": False}),
+        ]
+    else:
+        assert calls == [("index", {"automatic": True})]
 
 
 def test_local_ai_status_does_not_prepare_before_retrieval_components_are_ready(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -193,6 +222,7 @@ def test_notebook_webapp_serves_workspace_assets_and_grounded_answer(tmp_path: P
     page = app.dispatch("GET", "/")
     logo = app.dispatch("GET", "/scansci-mark.png")
     provider_icon = app.dispatch("GET", "/provider-icons/deepseek.png")
+    jev_icon = app.dispatch("GET", "/provider-icons/typesafe.png")
     male_avatar = app.dispatch("GET", "/avatar-panda-male.png")
     female_avatar = app.dispatch("GET", "/avatar-panda-female.png")
     health = _payload(app.dispatch("GET", "/api/health"))
@@ -219,6 +249,9 @@ def test_notebook_webapp_serves_workspace_assets_and_grounded_answer(tmp_path: P
     assert provider_icon.status == 200
     assert provider_icon.content_type == "image/png"
     assert provider_icon.body.startswith(b"\x89PNG")
+    assert jev_icon.status == 200
+    assert jev_icon.content_type == "image/png"
+    assert jev_icon.body.startswith(b"\x89PNG")
     assert male_avatar.status == 200
     assert male_avatar.content_type == "image/png"
     assert male_avatar.body.startswith(b"\x89PNG")
@@ -426,6 +459,27 @@ def test_resource_downloads_expose_persistent_progress_and_diagnostics_ui(tmp_pa
     assert ".download-task-section" in styles
 
 
+def test_run_execution_details_stay_secondary_to_the_conversation(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+
+    assert "runSummaryActionsMarkup" in script
+    assert "const summaryTitle" in script
+    assert "const detailsOpen" in script
+    assert 'detailsOpen ? "open" : ""' in script
+    assert '${active ? "open" : ""}' not in script
+    assert "执行详情" not in script
+    assert "最近动态" in script
+    assert "function compactRecentRunEvents(events)" in script
+    assert "class=\"run-event-repeat\"" in script
+    assert "const liveActions" not in script
+    assert ".run-execution-log" in styles
+    assert ".run-shell { width: min(100%, 760px); align-self: flex-start;" in styles
+    assert ".run-event-repeat { margin-left: 6px; color: var(--faint);" in styles
+    assert "background: var(--surface)" in styles
+
+
 def test_local_model_settings_and_first_run_guide_keep_setup_optional(tmp_path: Path) -> None:
     app, _workspace, _evidence = _build_app(tmp_path)
     page = app.dispatch("GET", "/").body.decode("utf-8")
@@ -434,10 +488,16 @@ def test_local_model_settings_and_first_run_guide_keep_setup_optional(tmp_path: 
 
     assert "LOCAL_MODEL_CATEGORY_GROUPS" in script
     assert "local-model-recommendation" in script
-    assert "需要时，再下载模型" in script
-    assert "打开知识库" in script
+    assert "无需先安装本地模型" in script
+    assert "连接知识库" in script
     assert 'onboarding-open-models' in script
     assert 'onboarding-open-knowledge' in script
+    assert 'id="firstRunWelcome"' in page
+    assert 'data-action="finish-first-run"' in script
+    assert 'state.onboardingMode = "welcome";' in script
+    assert "function trapResourceOnboardingFocus" in script
+    assert 'class="resource-guide-close"' in script
+    assert "welcome_dismissed: true, resource_setup_completed: true" in script
     assert 'data-settings-panel="defaults"' in page
     assert 'data-settings-panel="document-processing"' not in page
     assert "defaultCapabilitiesForm" in script
@@ -463,7 +523,8 @@ def test_local_model_settings_and_first_run_guide_keep_setup_optional(tmp_path: 
     assert ".local-installed-panel" in styles
     assert ".settings-content select" in styles
     assert ".settings-select-menu" in styles
-    assert ".guide-onboarding-card" in styles
+    assert ".first-run-welcome" in styles
+    assert ".resource-guide-wizard-body" in styles
     assert "installResourceOnboardingDragHandle" in script
     assert ".resource-onboarding-window-drag" in styles
     assert "isError ? 10000 : 2800" in script
@@ -481,7 +542,46 @@ def test_model_services_preview_keeps_provider_catalog_when_backend_is_unavailab
     assert "function bootstrapProviderCatalogFallback()" in script
     assert 'id: "openai"' in fallback
     assert 'id: "anthropic"' in fallback
+    assert 'id: "paratera"' in fallback
+    assert 'capabilities: ["image"]' in fallback
     assert "providers: bootstrapProviderCatalogFallback()" in script
+
+
+def test_zhipu_coding_plan_endpoint_switch_is_exposed_in_model_settings(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+
+    assert 'name="provider-coding-plan"' in script
+    assert 'https://open.bigmodel.cn/api/coding/paas/v4' in script
+    assert "provider.coding_plan_base_url" in script
+    assert "data-zhipu-guide-copy" in script
+    assert ".cherry-endpoint-mode" in styles
+    assert ".cherry-zhipu-guide a" in styles
+
+
+def test_generated_image_route_and_ui_use_a_same_origin_artifact(tmp_path: Path) -> None:
+    app, workspace, _evidence = _build_app(tmp_path)
+    image_dir = workspace.parent / "artifacts" / "images"
+    image_dir.mkdir(parents=True)
+    png = base64.b64decode(
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAusB9Y9ZnwAAAABJRU5ErkJggg=="
+    )
+    (image_dir / "preview.png").write_bytes(png)
+
+    response = app.dispatch("GET", "/api/generated-images/preview.png")
+    escaped = app.dispatch("GET", "/api/generated-images/..%2Fpreview.png")
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+
+    assert response.status == 200
+    assert response.content_type == "image/png"
+    assert response.body == png
+    assert escaped.status == 404
+    assert "function generatedImageArtifactsMarkup" in script
+    assert 'title: "图像生成"' in script
+    assert ".generated-image-artifact" in styles
+    assert "background: var(--surface-elevated)" in styles
 
 
 def test_settings_compact_model_list_and_multiselect_ocr_languages_are_exposed(tmp_path: Path) -> None:
@@ -496,8 +596,7 @@ def test_settings_compact_model_list_and_multiselect_ocr_languages_are_exposed(t
     assert 'select[name="ocr-language"] option:checked' in script
     assert "settings-select-multi-check" in script
     assert ".local-installed-model-list" in styles
-    assert "max-height: 360px" in styles
-    assert "overflow-y: auto" in styles
+    assert ".local-installed-model-list { max-height: none; overflow: visible; }" in styles
 
 
 def test_general_settings_tabs_are_configurable_and_hide_desktop_system_page(tmp_path: Path) -> None:
@@ -547,7 +646,7 @@ def test_preview_assets_are_cache_busted(tmp_path: Path) -> None:
     page = app.dispatch("GET", "/").body.decode("utf-8")
 
     assert 'href="/styles.css?v=32"' in page
-    assert 'src="/app.js?v=26"' in page
+    assert 'src="/app.js?v=30"' in page
     styles = Path(__file__).parents[1] / "src" / "scansci_html" / "web" / "styles.css"
     assert ".conversation-main:has(#answerArea > .run-shell) > :is(.chat-composer, .conversation-composer-dock) { margin-top: 20px; }" in styles.read_text(encoding="utf-8")
 
@@ -663,6 +762,16 @@ def test_settings_sidebar_labels_the_about_page_as_software_update(tmp_path: Pat
     assert "关于 ScanSci" not in script
 
 
+def test_automatic_update_preference_uses_portable_settings_instead_of_loopback_storage(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+
+    assert 'window.localStorage.getItem("scansci.update.auto-check")' not in script
+    assert 'state.settings?.general?.updates?.auto_check !== false' in script
+    assert "general.updates.auto_check = state.autoCheckUpdates" in script
+    assert 'await persistSettings(state.autoCheckUpdates ? "已开启自动检查更新"' in script
+
+
 def test_settings_navigation_uses_system_group_for_update_archive_storage(tmp_path: Path) -> None:
     app, _workspace, _evidence = _build_app(tmp_path)
     page = app.dispatch("GET", "/").body.decode("utf-8")
@@ -692,8 +801,12 @@ def test_archive_and_storage_settings_pages_share_the_settings_surface(tmp_path:
     assert 'request("/api/chat/history?view=archived&limit=200")' in script
     assert 'class="archive-settings-page settings-minimal-page"' in script
     assert 'class="storage-settings-page settings-minimal-page"' in script
+    storage_page = script[script.index("function renderStorageSettings()"):script.index("function renderSettings()")]
+    assert "安全与兼容" not in storage_page
+    assert "本页只展示当前路径" not in storage_page
     assert ".archive-settings-card" in styles
     assert ".storage-settings-card" in styles
+    assert ".storage-settings-note" not in styles
 
 
 def test_local_models_page_only_contains_installed_and_market_sections(tmp_path: Path) -> None:
@@ -706,8 +819,14 @@ def test_local_models_page_only_contains_installed_and_market_sections(tmp_path:
     assert 'class="local-installed-panel"' in local_models_page
     assert 'class="local-model-disclosure local-model-market-disclosure" open' in local_models_page
     assert 'data-action="delete-installed-local-model"' in local_models_page
+    assert 'data-action="retry-local-model-probe"' in local_models_page
+    assert 'class="local-model-detection-note"' in local_models_page
+    assert 'data-action="refresh-local-model-market"' in local_models_page
+    assert 'class="local-installed-actions"' in local_models_page
+    assert 'class="quiet-row-note local-installed-status ${statusClass}"' in local_models_page
     assert 'data-model-id="${escapeHtml(item.id)}"' in local_models_page
     assert 'request("/api/local-models/delete"' in script
+    assert 'request("/api/local-models/recheck"' in script
     assert 'confirmLabel: "删除模型"' in script
     assert 'class="local-agent-routing-card"' not in local_models_page
     assert 'class="local-model-fallback"' not in local_models_page
@@ -720,7 +839,8 @@ def test_installed_model_delete_control_uses_semantic_theme_tokens(tmp_path: Pat
     assert ".local-installed-model-list .local-installed-remove" in styles
     assert "grid-template-columns: 30px minmax(0, 1fr) auto auto auto;" in styles
     assert "color: var(--danger);" in styles
-    assert "background: var(--surface);" in styles
+    assert ".local-installed-actions" in styles
+    assert "background: transparent;" in styles
 
 
 def test_model_settings_use_flat_shared_hierarchy_for_light_and_dark_themes(tmp_path: Path) -> None:
@@ -758,6 +878,22 @@ def test_model_service_catalog_is_wider_and_has_no_outer_panel(tmp_path: Path) -
     assert "background: transparent;" in styles
 
 
+def test_model_services_put_jev_after_scansci_in_provider_catalog(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+    fallback = script.split("const BOOTSTRAP_PROVIDER_DEFINITIONS =", 1)[1].split(
+        "function bootstrapProviderCatalogFallback()", 1
+    )[0]
+    assert fallback.index('id: "scansci-managed"') < fallback.index('id: "jev"')
+    assert 'logo: "typesafe"' in fallback
+    assert 'definition.logo || definition.id' in script
+    assert 'provider.id === "jev"' in script
+    assert 'provider.id === "jev" || provider.api_surface === "jev_systemone"' in script
+    assert "renderJevAccessCard" not in script
+    assert ".jev-access-card" not in styles
+
+
 def test_model_service_header_hides_duplicate_provider_toggle_and_keeps_actions(tmp_path: Path) -> None:
     app, _workspace, _evidence = _build_app(tmp_path)
     script = app.dispatch("GET", "/app.js").body.decode("utf-8")
@@ -791,6 +927,22 @@ def test_settings_preview_skips_first_run_overlay_for_direct_browser_review(tmp_
         "state.onboardingOpen = !Boolean(state.settings?.onboarding?.welcome_dismissed)"
         " && !previewSettings;"
     ) in script
+    startup = script[script.index("state.onboardingOpen = !Boolean") : script.index("renderWorkspace();", script.index("state.onboardingOpen = !Boolean"))]
+    assert 'state.onboardingMode = "welcome";' in startup
+    assert 'state.onboardingMode = "resources";' not in startup
+
+
+def test_resource_guide_exit_persists_first_run_dismissal(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+
+    start = script.index("async function closeResourceGuideOverlay")
+    end = script.index("function renderLegacyResourceOnboarding", start)
+    close_guide = script[start:end]
+    assert "welcome_dismissed: true" in close_guide
+    assert "resource_setup_completed: true" in close_guide
+    assert "restoreOnboardingFocus" in close_guide
+    assert close_guide.index("restoreOnboardingFocus();") < close_guide.index("await persistence;")
 
 
 def test_evidence_reader_expansion_and_theme_contract_is_exposed(tmp_path: Path):
@@ -894,13 +1046,30 @@ def test_direct_chat_jobs_are_conversation_scoped_and_keep_live_turn_controls(tm
     assert 'payload.name === "agent_queue"' in script
     assert "function pauseDirectChatJob" in script
     assert "function resumeDirectChatJob" in script
-    assert "完成后继续" in script
-    assert "立即调整" in script
+    assert "function beginEditingQueuedDirectTurn" in script
+    assert "function saveEditingQueuedDirectTurn" in script
+    assert "function beginEditingLastConversationMessage" in script
+    assert "function saveEditingLastConversationMessage" in script
+    assert "lastDirectUserMessageIndex" in script
+    assert 'data-direct-queue-drag' in script
+    assert 'data-action="edit-direct-follow-up"' in script
+    assert 'data-action="save-direct-queue-edit"' in script
+    assert 'data-action="edit-last-conversation-message"' in script
+    assert 'data-action="save-last-message-edit"' in script
+    assert 'data-action="cancel-last-message-edit"' in script
     assert 'data-action="remove-direct-follow-up"' in script
     assert 'data-action="cancel-direct-chat"' in script
-    assert "directChatJobs.size - 1" in script
     assert ".direct-live-controls" in styles
     assert ".direct-live-pulse" in styles
+    assert ".direct-live-queue-drag" in styles
+    assert ".direct-live-queue-action.is-immediate" in styles
+    queue_item_style = styles.split(".direct-live-queue-item {", 1)[1].split("}", 1)[0]
+    assert "background: transparent" in queue_item_style
+    assert "min-height: 34px" in queue_item_style
+    controls_style = styles.split(".direct-live-controls {", 1)[1].split("}", 1)[0]
+    assert "background: var(--soft)" in controls_style
+    assert ".message-edit-button" in styles
+    assert ".user-turn-bubble.is-editing" in styles
 
 
 def test_pause_routes_delegate_to_run_and_direct_chat_controls(tmp_path: Path, monkeypatch):
@@ -1121,6 +1290,9 @@ def test_conversation_ui_exposes_identity_time_tokens_files_and_history_context(
     script = app.dispatch("GET", "/app.js").body.decode("utf-8")
     normalized_script = script.replace("\r\n", "\n")
     styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+    direct_turn_body = script.split("async function runDirectChatTurn", 1)[1].split(
+        "async function pauseDirectChatJob", 1,
+    )[0]
 
     assert "function conversationMessageMarkup" in script
     assert "function modelIdentitySnapshot" in script
@@ -1130,6 +1302,7 @@ def test_conversation_ui_exposes_identity_time_tokens_files_and_history_context(
     assert "function openDirectConversation" in script
     assert 'data-action="open-direct-conversation"' in script
     assert "function directFailureMarkup" in script
+    assert "toast(error.message, true)" not in direct_turn_body
     assert "function streamChatWithRecovery" in script
     assert 'data-action="retry-direct-message"' in script
     assert "composerSubmissionInFlight" in script
@@ -1138,6 +1311,10 @@ def test_conversation_ui_exposes_identity_time_tokens_files_and_history_context(
     assert "function messageFooterMarkup" in script
     assert 'data-action="copy-conversation-message"' in script
     assert "function copyConversationMessage" in script
+    assert 'data-action="edit-last-conversation-message"' in script
+    assert "function directTurnFromHistoryMessage" in script
+    assert "state.directMessages = retainedMessages" in script
+    assert "beginDirectChatJob(turn)" in script
     assert 'Tokens: ${formatTokenCount(total)}${detail}' in script
     assert '↑${formatTokenCount(prompt)}' in script
     assert '↓${formatTokenCount(completion)}' in script
@@ -1147,6 +1324,9 @@ def test_conversation_ui_exposes_identity_time_tokens_files_and_history_context(
     assert "<em>估算</em>" not in script
     assert "function runCompletionMessageMarkup" in script
     assert "function localFileLinkMarkup" in script
+    assert "function runArtifactDownloadLinkMarkup" in script
+    assert 'label: "下载项目 ZIP"' in script
+    assert "download=\"${escapeHtml(downloadName)}\"" in script
     assert "function localPathParent" in script
     assert "function localResourceKind" in script
     assert "function localResourceIcon" in script
@@ -1190,6 +1370,61 @@ def test_conversation_ui_exposes_identity_time_tokens_files_and_history_context(
     assert ".local-artifact-icon.is-pdf" in styles
     assert ".local-artifact-icon.is-spreadsheet" in styles
     assert ".local-artifact-icon.is-folder" in styles
+
+
+def test_startup_observes_background_indexes_without_starting_or_resuming_them(tmp_path: Path):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+    initialize_body = script.split("async function initialize()", 1)[1].split(
+        "async function ensureActiveKnowledgeIndex", 1
+    )[0]
+    open_task_body = script.split("async function openTask", 1)[1].split(
+        "const modeDefinitions", 1
+    )[0]
+
+    assert "void refreshKnowledgeIndexStatus();" in initialize_body
+    assert "ensureActiveKnowledgeIndex" not in initialize_body
+    assert 'rememberedTask.workflow_type !== "evidence_index"' in initialize_body
+    assert 'run.workflow_type !== "evidence_index"' in script
+    assert "/resume" not in open_task_body
+    assert "const displayRun = run;" in open_task_body
+
+
+def test_navigation_ignores_stale_conversation_fetches(tmp_path: Path):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+    direct_body = script.split("async function openDirectConversation", 1)[1].split(
+        "async function openTask", 1
+    )[0]
+    task_body = script.split("async function openTask", 1)[1].split(
+        "const modeDefinitions", 1
+    )[0]
+
+    assert "let navigationRequestGeneration = 0;" in script
+    assert "navigationRequestGeneration += 1;" in script
+    assert "const requestGeneration = ++navigationRequestGeneration;" in direct_body
+    assert "if (requestGeneration !== navigationRequestGeneration) return;" in direct_body
+    assert "const requestGeneration = ++navigationRequestGeneration;" in task_body
+    assert "if (requestGeneration !== navigationRequestGeneration) return;" in task_body
+    assert "if (requestGeneration === navigationRequestGeneration) toast(error.message, true);" in task_body
+
+
+def test_startup_defers_model_market_scan_until_local_models_page_opens(tmp_path: Path):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+    initialize_body = script.split("async function initialize()", 1)[1].split(
+        "async function ensureActiveKnowledgeIndex", 1
+    )[0]
+    set_view_body = script.split("function setView", 1)[1].split(
+        "function updateSidebarNavigation", 1
+    )[0]
+
+    assert 'request("/api/local-models/installed")' in initialize_body
+    assert 'request("/api/local-models/market")' not in initialize_body
+    assert "loaded: false" in initialize_body
+    assert 'state.activeSettings === "local-models"' in set_view_body
+    assert "!state.localModelMarket?.loaded" in set_view_body
+    assert "refreshLocalModelMarket()" in set_view_body
 
 
 def test_review_document_workspace_renders_live_stage_progress(tmp_path: Path):
@@ -1250,7 +1485,7 @@ def test_academic_search_and_evidence_qa_are_first_class_home_tools(tmp_path: Pa
     assert page.count('data-mode-value="academic"') == 1
     assert page.count('data-mode-value="knowledge"') == 1
     assert 'data-mode-value="deep-research"' not in page
-    for label in ("学术搜索", "证据问答", "学术写作", "学术 PPT", "文献下载"):
+    for label in ("学术搜索", "证据问答", "学术 PPT", "文献下载"):
         assert label in page
     assert 'academic: {' in script
     assert 'knowledge: {' in script
@@ -1424,7 +1659,8 @@ def test_sidebar_resizer_keeps_the_saved_width_at_desktop_breakpoints(tmp_path: 
 
     assert "function installSidebarResizer" in script
     assert 'const sidebarCollapsedPreference = window.localStorage.getItem("scansci.sidebar.collapsed");' in script
-    assert 'sidebarCollapsedPreference === null && window.innerWidth <= 900' in script
+    assert 'const compactShellDefault = sidebarCollapsedPreference === null;' in script
+    assert 'sidebarCollapsed: sidebarCollapsedPreference === "true" || compactShellDefault' in script
     assert 'const isNarrowWindow = window.innerWidth <= 900;' in script
     assert 'workbench.style.setProperty("--sidebar-width"' in script
     assert 'window.localStorage.setItem("scansci.sidebar.width"' in script
@@ -1433,6 +1669,10 @@ def test_sidebar_resizer_keeps_the_saved_width_at_desktop_breakpoints(tmp_path: 
     assert "grid-template-columns: 242px minmax(0, 1fr)" not in styles
     assert "left: calc(var(--sidebar-width) - 8px)" in styles
     assert "width: 16px; cursor: col-resize" in styles
+    assert 'class="workbench compact-shell"' in app.dispatch("GET", "/").body.decode("utf-8")
+    assert ".compact-shell .home-landing" in styles
+    assert ".compact-shell:not(.is-sidebar-collapsed) .titlebar-new-task" in styles
+    assert ".compact-shell:not(.is-sidebar-collapsed) .titlebar-settings" in styles
 
 
 def test_context_panel_is_task_sensitive_and_keeps_a_header_toggle(tmp_path: Path):
@@ -1550,8 +1790,10 @@ def test_home_modes_include_actionable_paper_download_workbench(tmp_path: Path):
     assert 'writing: {' in script
     assert 'slides: {' in script
     assert 'download: {' in script
-    assert page.count('data-composer-mode-shortcut') == 5
-    assert page.count('data-mode-value=') == 5
+    # The writing shortcut was intentionally removed from the homepage;
+    # the four remaining shortcuts are academic / knowledge / slides / download.
+    assert page.count('data-composer-mode-shortcut') == 4
+    assert page.count('data-mode-value=') == 4
     assert 'data-mode-value="academic"' in page
     assert 'data-mode-value="knowledge"' in page
     assert 'data-mode-value="download"' in page
@@ -1668,7 +1910,7 @@ def test_extensions_download_strategy_and_library_preview_match_desktop_navigati
     assert "const taskEntries = downloadTaskEntries().slice(0, 6);" not in script
     assert "模型下载和本地组件都从这里管理" in script
     assert 'data-action="open-local-models"' in script
-    assert "选择个人知识库后，可在右侧直接链接文件或文件夹。" in script
+    assert "资料连接状态和本轮检索范围会分别显示。" in script
     assert '["academic", "deep-research"].includes(state.researchWorkflow)' in script
     assert 'workflowType === "academic_search" || workflowType === "deep_research"' in script
     assert "联网学术来源" in page
@@ -1956,6 +2198,9 @@ def test_conversation_streaming_preserves_history_and_respects_manual_scroll(tmp
 
     assert 'id="conversationJumpLatest"' in html
     assert 'data-action="jump-conversation-latest"' in html
+    assert '<div class="conversation-composer-dock">' in html
+    assert html.index('id="conversationJumpLatest"') < html.index('id="chatLiveControls"')
+    assert html.index('id="chatLiveControls"') < html.index('id="chatAskForm"')
     jump_button_prefix, jump_button = html.split('id="conversationJumpLatest"', 1)
     jump_button = jump_button.split("</button>", 1)[0]
     assert jump_button_prefix.rsplit("<button", 1)[1].strip().endswith('class="conversation-jump-latest"')
@@ -1982,6 +2227,7 @@ def test_conversation_streaming_preserves_history_and_respects_manual_scroll(tmp
     assert ".conversation-jump-latest" in styles
     jump_rule = styles.split(".conversation-jump-latest {", 1)[1].split("}", 1)[0]
     assert "z-index: 40" in jump_rule
+    assert "top: -19px" in jump_rule
     assert "background: color-mix(in srgb, var(--surface-elevated) 94%, transparent)" in jump_rule
     jump_icon_rule = styles.split(".conversation-jump-latest .ui-icon {", 1)[1].split("}", 1)[0]
     assert "display: block" in jump_icon_rule
@@ -2151,6 +2397,29 @@ def test_provider_secret_reveal_is_explicit_and_kept_out_of_public_settings(
     assert "saved-secret" not in json.dumps(public)
     assert rejected.status == 400
     assert revealed == {"api_key": "saved-secret"}
+
+
+def test_provider_environment_key_is_redacted_and_cannot_be_overwritten(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "environment-secret")
+
+    public = _payload(app.dispatch("GET", "/api/settings"))
+    provider = next(item for item in public["providers"] if item["id"] == "deepseek")
+    rejected = app.dispatch(
+        "POST",
+        "/api/settings/providers/deepseek/api-key",
+        json.dumps({"api_key": "replacement-secret"}).encode("utf-8"),
+    )
+
+    assert provider["api_key_configured"] is True
+    assert provider["api_key_source"] == "environment"
+    assert provider["api_key_env"] == "DEEPSEEK_API_KEY"
+    assert "environment-secret" not in json.dumps(public)
+    assert rejected.status == 400
+    assert "DEEPSEEK_API_KEY" in rejected.body.decode("utf-8")
 
 
 def test_model_settings_render_masked_secret_placeholder_and_eye_control(tmp_path: Path):
@@ -2409,6 +2678,329 @@ def test_notebook_webapp_allows_direct_chat_without_a_library(tmp_path: Path, mo
     assert response["message"] == {"role": "assistant", "content": "Reply: 你是什么模型？"}
 
 
+def test_direct_chat_title_api_uses_model_title_and_chinese_fallback(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    app = NotebookWebApp(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    observed: dict[str, object] = {}
+
+    def fake_completion(_provider: str, **kwargs):
+        observed.update(kwargs)
+        return "标题：人物身份识别。\n"
+
+    monkeypatch.setattr("scansci_html.research_agent.complete_chat_text", fake_completion)
+    generated = _payload(
+        app.dispatch(
+            "POST",
+            "/api/chat/title",
+            json.dumps({"question": "这个人是谁？"}).encode("utf-8"),
+        )
+    )
+
+    assert generated["title"] == "人物身份识别"
+    assert generated["source"] == "model"
+    assert observed["messages"][-1] == {"role": "user", "content": "这个人是谁？"}
+    assert observed["max_tokens"] == 48
+
+    monkeypatch.setattr(
+        "scansci_html.research_agent.complete_chat_text",
+        lambda *_args, **_kwargs: "Here is the answer.",
+    )
+    fallback = _payload(
+        app.dispatch(
+            "POST",
+            "/api/chat/title",
+            json.dumps({"question": "这个人是谁？"}).encode("utf-8"),
+        )
+    )
+
+    assert fallback["title"] == "这个人是谁"
+    assert fallback["source"] == "fallback"
+    assert fallback["fallback"] is True
+
+
+def test_direct_chat_title_update_preserves_messages(tmp_path: Path):
+    app = NotebookWebApp(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    saved = _payload(
+        app.dispatch(
+            "POST",
+            "/api/chat/history",
+            json.dumps({
+                "conversation_id": "direct-title-1",
+                "title": "这个人是谁",
+                "messages": [
+                    {"role": "user", "content": "这个人是谁？"},
+                    {"role": "assistant", "content": "我来帮你判断图片中的人物。"},
+                ],
+            }).encode("utf-8"),
+        )
+    )
+    renamed = _payload(
+        app.dispatch(
+            "POST",
+            "/api/chat/history/direct-title-1/title",
+            json.dumps({"title": "人物身份识别", "title_source": "model"}).encode("utf-8"),
+        )
+    )
+    reopened = _payload(app.dispatch("GET", "/api/chat/history/direct-title-1"))
+
+    assert saved["messages"] == reopened["messages"]
+    assert renamed["title"] == "人物身份识别"
+    assert reopened["title"] == "人物身份识别"
+    assert reopened["title_source"] == "model"
+
+
+def test_direct_chat_history_snapshots_keep_the_first_title(tmp_path: Path):
+    app = NotebookWebApp(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    first = {
+        "conversation_id": "direct-stable-title-1",
+        "title": "今天的科技新闻",
+        "title_source": "provisional",
+        "session_id": "session-1",
+        "messages": [
+            {"role": "user", "content": "你能查一下今天的科技新闻吗？"},
+            {"role": "assistant", "content": "我先整理公开来源。"},
+        ],
+    }
+    _payload(app.dispatch("POST", "/api/chat/history", json.dumps(first).encode("utf-8")))
+    _payload(
+        app.dispatch(
+            "POST",
+            "/api/chat/history/direct-stable-title-1/title",
+            json.dumps({"title": "科技新闻检索", "title_source": "model"}).encode("utf-8"),
+        )
+    )
+
+    follow_up = {
+        **first,
+        "title": "把刚刚的内容用中文回答",
+        "title_source": "provisional",
+        "session_id": "session-1",
+        "messages": [
+            *first["messages"],
+            {"role": "user", "content": "把刚刚的内容用中文回答"},
+            {"role": "assistant", "content": "好的，我会用中文整理。"},
+        ],
+    }
+    saved = _payload(app.dispatch("POST", "/api/chat/history", json.dumps(follow_up).encode("utf-8")))
+    reopened = _payload(app.dispatch("GET", "/api/chat/history/direct-stable-title-1"))
+
+    assert saved["title"] == "科技新闻检索"
+    assert saved["title_source"] == "model"
+    assert reopened["title"] == "科技新闻检索"
+    assert len(reopened["messages"]) == 4
+
+
+def test_direct_chat_ui_generates_title_once_from_first_turn(tmp_path: Path):
+    app = NotebookWebApp(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+
+    assert 'request("/api/chat/title"' in script
+    assert "hasExistingUserMessage" in script
+    assert "hasExistingDirectHistory" in script
+    assert "titleGenerationPending" in script
+    assert "firstQuestion: titleGenerationPending ? String(turn.question || \"\") : \"\"" in script
+    assert 'pi_session_id: job.sessionId || ""' in script
+    assert 'if (!isDirectConversation || !hasDirectUserHistory)' in script
+    assert '"/api/chat/history/" + encodeURIComponent(job.conversationId) + "/title"' in script
+    assert "void generateDirectConversationTitle(job, job.firstQuestion, job.firstQuestionHasImages)" in script
+
+
+@pytest.mark.parametrize(
+    ("messages", "expected_language"),
+    [
+        ([{"role": "user", "content": "请解释一下这个问题"}], "zh"),
+        (
+            [
+                {"role": "user", "content": "请解释一下这个问题"},
+                {"role": "assistant", "content": "好的。"},
+                {"role": "user", "content": "Why did this fail?"},
+            ],
+            "en",
+        ),
+        ([{"role": "user", "content": "请把这段内容翻译成中文"}], "zh"),
+    ],
+)
+def test_direct_chat_response_language_follows_latest_user_message(
+    tmp_path: Path,
+    messages: list[dict[str, str]],
+    expected_language: str,
+):
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    request = runtime._direct_chat_request({
+        "conversation_id": "language-conversation-1",
+        "messages": messages,
+    })
+    system = str(request.messages[0]["content"])
+    compact = _apply_direct_chat_profile(request, {"route": "direct_chat"})
+    compact_system = str(compact.messages[0]["content"])
+
+    assert _response_language(messages[-1]["content"]) == expected_language
+    assert _response_language_instruction(messages[-1]["content"]) in system
+    assert _response_language_instruction(messages[-1]["content"]) in compact_system
+    assert _response_language_instruction(messages[-1]["content"]) in runtime._evidence_writing_prompt(
+        request=messages[-1]["content"],
+        citations=[],
+    )[0]["content"]
+    assert _response_language_instruction(messages[-1]["content"]) in runtime._verified_answer_writing_prompt(
+        request=messages[-1]["content"],
+        citations=[],
+    )[0]["content"]
+    assert request.provider_session_id == "language-conversation-1"
+
+
+@pytest.mark.parametrize(
+    ("follow_up", "kind", "target_language"),
+    [
+        ("说中文", "language", "zh"),
+        ("把刚刚的内容用中文回答", "language", "zh"),
+        ("Answer in Chinese", "language", "zh"),
+        ("说英文", "language", "en"),
+        ("简短点", "rewrite", ""),
+        ("列成表格", "rewrite", ""),
+    ],
+)
+def test_contextual_follow_up_binds_terse_edit_to_previous_answer(
+    follow_up: str,
+    kind: str,
+    target_language: str,
+):
+    messages = [
+        {"role": "user", "content": "今天有什么科技新闻？"},
+        {"role": "assistant", "content": "An English technology-news answer with sources."},
+        {"role": "user", "content": follow_up},
+    ]
+
+    contract = _contextual_follow_up_contract(messages)
+
+    assert contract is not None
+    assert contract["kind"] == kind
+    assert contract["target_language"] == target_language
+    assert "immediately preceding assistant answer" in _contextual_follow_up_instruction(messages)
+
+
+def test_contextual_follow_up_does_not_capture_a_new_language_request():
+    messages = [
+        {"role": "user", "content": "先聊一下天气。"},
+        {"role": "assistant", "content": "今天晴朗。"},
+        {"role": "user", "content": "请用中文解释量子纠缠"},
+    ]
+
+    assert _contextual_follow_up_contract(messages) is None
+    assert _contextual_follow_up_contract([{"role": "user", "content": "说中文"}]) is None
+
+
+def test_contextual_follow_up_instruction_survives_compact_direct_profile(tmp_path: Path):
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    messages = [
+        {"role": "user", "content": "今天有什么科技新闻？"},
+        {"role": "assistant", "content": "English source summary. " * 30},
+        {"role": "user", "content": "说中文"},
+    ]
+    request = runtime._direct_chat_request({"conversation_id": "context-1", "messages": messages})
+    compact = _apply_direct_chat_profile(request, {"route": "direct_chat"})
+
+    instruction = _contextual_follow_up_instruction(messages)
+    assert instruction in str(request.messages[0]["content"])
+    assert instruction in str(compact.messages[0]["content"])
+
+
+def test_contextual_follow_up_rejects_acknowledgement_and_accepts_rewritten_content():
+    previous = "English technology news and source summary. " * 50
+    messages = [
+        {"role": "user", "content": "今天有什么科技新闻？"},
+        {"role": "assistant", "content": previous},
+        {"role": "user", "content": "说中文"},
+    ]
+
+    assert "没有重写" in _contextual_follow_up_gap(
+        messages,
+        "好的，我从现在起用简体中文回答。请问有什么我可以帮你的？",
+    )
+    rewritten = "以下是上一条科技新闻内容的中文版本。" + "这是一条带有来源说明的科技新闻摘要。" * 20
+    assert _contextual_follow_up_gap(messages, rewritten) == ""
+
+
+def test_contextual_follow_up_repairs_one_bad_draft(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    messages = [
+        {"role": "user", "content": "今天有什么科技新闻？"},
+        {"role": "assistant", "content": "English technology news with a source URL. " * 30},
+        {"role": "user", "content": "说中文"},
+    ]
+    request = runtime._direct_chat_request({"conversation_id": "context-repair-1", "messages": messages})
+    observed: dict[str, object] = {}
+    rewritten = "下面重新用中文完整呈现上一条科技新闻。" + "科技新闻正文及来源说明。" * 20
+
+    def complete(_provider_kind, **kwargs):
+        observed.update(kwargs)
+        return rewritten, {"prompt_tokens": 30, "completion_tokens": 80, "total_tokens": 110}
+
+    monkeypatch.setattr("scansci_html.research_agent.complete_chat_text", complete)
+
+    text, usage, repaired = runtime._repair_contextual_follow_up_if_needed(
+        request,
+        "好的，我从现在起用简体中文回答。请问有什么我可以帮你的？",
+    )
+
+    assert repaired is True
+    assert text == rewritten
+    assert usage["total_tokens"] == 110
+    retry_messages = list(observed["messages"])
+    assert retry_messages[-1]["role"] == "user"
+    assert retry_messages[-1]["content"] == "说中文"
+    assert "Do not acknowledge" in retry_messages[-2]["content"]
+    assert observed["max_requests"] == 1
+
+
+def test_contextual_follow_up_stream_hides_bad_draft_and_delivers_repair(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    bad_draft = "好的，我从现在起用简体中文回答。请问有什么我可以帮你的？"
+    rewritten = "下面重新用中文完整呈现上一条内容。" + "科技新闻正文及来源说明。" * 20
+
+    def initial_stream(*_args, **_kwargs):
+        yield {"type": "delta", "content": bad_draft}
+        yield {"type": "done", "usage": {"total_tokens": 20}}
+
+    monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", initial_stream)
+    monkeypatch.setattr(
+        "scansci_html.research_agent.complete_chat_text",
+        lambda *_args, **_kwargs: (rewritten, {"total_tokens": 80}),
+    )
+    monkeypatch.setattr("scansci_html.research_agent._pi_should_run", lambda *_args: False)
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+
+    events = list(runtime.chat_stream({
+        "agent_harness": "legacy",
+        "conversation_id": "context-stream-1",
+        "messages": [
+            {"role": "user", "content": "今天有什么科技新闻？"},
+            {"role": "assistant", "content": "English technology news with source links. " * 30},
+            {"role": "user", "content": "说中文"},
+        ],
+    }))
+
+    delivered = "".join(
+        str(event.get("delta", ""))
+        for event in events
+        if event.get("type") == "TEXT_MESSAGE_CONTENT"
+    )
+    assert events[-1]["type"] == "RUN_FINISHED"
+    assert delivered == rewritten
+    assert bad_draft not in delivered
+    assert events[-1]["result"]["message"]["usage"]["total_tokens"] == 100
+    assert any(
+        item["title"] == "校正上下文续问"
+        for item in events[-1]["result"]["message"]["trace"]
+    )
+
+
 def test_direct_chat_history_api_persists_and_reopens_completed_messages(tmp_path: Path):
     app = NotebookWebApp(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
     payload = {
@@ -2434,6 +3026,27 @@ def test_direct_chat_history_api_persists_and_reopens_completed_messages(tmp_pat
     assert reopened["messages"][0]["images"] == [{"name": "brief.png"}]
     assert "data_url" not in json.dumps(reopened, ensure_ascii=False)
     assert reopened["messages"][1]["model"]["model_name"] == "DeepSeek V4 Flash"
+
+
+def test_direct_chat_attachment_staging_returns_restart_safe_references(tmp_path: Path):
+    app = NotebookWebApp(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    png = base64.b64encode(
+        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89"
+    ).decode("ascii")
+    note = base64.b64encode("可恢复的附件内容".encode("utf-8")).decode("ascii")
+    audio = base64.b64encode(b"RIFF-sample").decode("ascii")
+    staged = _payload(app.dispatch("POST", "/api/chat/attachments/stage", json.dumps({
+        "images": [{"name": "figure.png", "data_url": f"data:image/png;base64,{png}"}],
+        "audio": [{"name": "note.wav", "data_url": f"data:audio/wav;base64,{audio}"}],
+        "source_files": [{"name": "notes.txt", "data_url": f"data:text/plain;base64,{note}"}],
+    }).encode("utf-8")))
+
+    assert staged["images"][0]["id"].startswith("image-")
+    assert staged["audio"][0]["id"].startswith("audio-")
+    assert staged["source_files"][0]["job_id"].startswith("ing-")
+    assert "data_url" not in json.dumps(staged, ensure_ascii=False)
+    ingested = app.research_agent._ingest_direct_attachments({"source_files": staged["source_files"]})
+    assert ingested["status"] == "completed"
 
 
 def test_direct_chat_history_api_preserves_attachment_reference_and_archive_actions(tmp_path: Path):
@@ -2507,7 +3120,10 @@ def test_notebook_server_streams_direct_chat_events(tmp_path: Path, monkeypatch:
 
 
 def test_pi_chat_emits_canonical_terminal_run_events(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    observed: dict[str, object] = {}
+
     def fake_pi_events(*_args, **_kwargs):
+        observed.update(_kwargs)
         yield {"type": "delta", "content": "你"}
         yield {"type": "delta", "content": "好"}
         yield {
@@ -2519,7 +3135,9 @@ def test_pi_chat_emits_canonical_terminal_run_events(tmp_path: Path, monkeypatch
     runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
     events = list(runtime.chat_stream({
         "agent_harness": "legacy",
-        "messages": [{"role": "user", "content": "你好"}],
+        "chat_mode": "knowledge",
+        "messages": [{"role": "user", "content": "请解释这个概念。"}],
+        "session_id": "direct-session-alias",
     }))
 
     event_types = [event["type"] for event in events]
@@ -2538,6 +3156,47 @@ def test_pi_chat_emits_canonical_terminal_run_events(tmp_path: Path, monkeypatch
     assert events[-1]["result"]["message"]["usage"]["total_tokens"] == 4
     assert events[-1]["result"]["message"]["trace"] == []
     assert events[-1]["result"]["agent_runtime"]["harness"] == "pi-agent-sdk"
+    assert observed["session_id"] == "direct-session-alias"
+
+
+def test_pi_chat_surfaces_model_advisory_as_nonblocking_custom_event(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    def fake_pi_events(*_args, **_kwargs):
+        yield {
+            "type": "notice",
+            "code": "local-model-evidence-boundary",
+            "title": "本地模型提示",
+            "message": "请核对文献原文。",
+            "blocking": False,
+        }
+        yield {"type": "delta", "content": "已完成回答"}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 4}}}
+
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", fake_pi_events)
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+
+    events = list(runtime.chat_stream({
+        "chat_mode": "knowledge",
+        "messages": [{"role": "user", "content": "请解释这个概念。"}],
+    }))
+
+    assert events[-1]["type"] == "RUN_FINISHED"
+    notices = [
+        event for event in events
+        if event.get("type") == "CUSTOM" and event.get("name") == "model_notice"
+    ]
+    assert len(notices) == 1
+    assert notices[0]["value"]["blocking"] is False
+    assert notices[0]["value"]["level"] == "warning"
+    result = events[-1]["result"]
+    assert result["message"]["content"] == "已完成回答"
+    assert result["agent_runtime"]["model_advisories"][0]["code"] == "local-model-evidence-boundary"
+    assert result["message"]["trace"][-1]["status"] == "warning"
 
 
 def test_image_question_with_web_tool_uses_pi_native_multimodal_route(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -2666,6 +3325,131 @@ def test_image_question_replaces_scientific_system_prompt_without_dropping_image
     assert isinstance(messages[-1]["content"], list)
 
 
+def test_plain_local_image_question_uses_native_provider_without_pi_context_overhead(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A normal local image question must not fail on Pi's smaller context envelope."""
+
+    workspace = tmp_path / "workspace.sqlite"
+    monkeypatch.setattr(
+        "scansci_html.app_settings.installed_models",
+        lambda: [{
+            "id": "local-vision",
+            "name": "Local vision",
+            "ready": True,
+            "format": "transformers",
+            "architecture": "MiniCPMVForCausalLM",
+            "capabilities": ["chat", "vision"],
+            "kind": "vision",
+        }],
+    )
+    save_settings(
+        workspace,
+        {
+            "active_model": {"provider_id": "local-huggingface", "model_id": "local-vision"},
+            "providers": [{
+                "id": "local-huggingface",
+                "name": "Local vision",
+                "kind": "local",
+                "auth_mode": "local",
+                "base_url": "http://127.0.0.1:17863/v1",
+                "enabled": True,
+                "models": [{"id": "local-vision", "name": "Local vision", "capabilities": ["vision"]}],
+            }],
+        },
+    )
+    monkeypatch.setattr(
+        "scansci_html.research_agent.ensure_local_transformers_runtime",
+        lambda _model: "http://127.0.0.1:17863/v1",
+    )
+    monkeypatch.setattr(
+        "scansci_html.research_agent.persist_image_attachments",
+        lambda *_args: [{"id": "image-1", "name": "figure.png", "mime_type": "image/png"}],
+    )
+    monkeypatch.setattr(
+        "scansci_html.research_agent.vision_image_blocks",
+        lambda *_args: [{"mime_type": "image/png", "data": "aGVsbG8="}],
+    )
+    monkeypatch.setattr(
+        "scansci_html.research_agent.pi_image_blocks",
+        lambda *_args: [{"type": "image", "mimeType": "image/png", "data": "aGVsbG8="}],
+    )
+    observed: dict[str, object] = {}
+
+    def direct_model_stream(*_args, **kwargs):
+        observed["messages"] = kwargs["messages"]
+        yield {"type": "delta", "content": "这是一个界面截图。"}
+        yield {"type": "done", "usage": {"total_tokens": 8}}
+
+    monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", direct_model_stream)
+    monkeypatch.setattr(
+        PiAgentClient,
+        "stream_chat",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("plain image chat must bypass Pi")),
+    )
+    runtime = ResearchAgentRuntime(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+
+    events = list(runtime.chat_stream({
+        "chat_mode": "general",
+        "web_search": "auto",
+        "messages": [{"role": "user", "content": "请识别这张图"}],
+        "images": [{"name": "figure.png", "data_url": "data:image/png;base64,aGVsbG8="}],
+    }))
+
+    assert events[-1]["type"] == "RUN_FINISHED"
+    result = events[-1]["result"]
+    assert result["message"]["content"] == "这是一个界面截图。"
+    assert result["agent_runtime"]["harness"] == "direct-provider"
+    assert result["agent_runtime"]["vision_route"]["route"] == "provider-native"
+    assert isinstance(observed["messages"][-1]["content"], list)
+
+
+def test_plain_ollama_text_chat_checks_the_selected_model_instead_of_minicpm(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "workspace.sqlite"
+    provider_id = "local-runtime-ollama-qwen3.5-4b"
+    settings = {
+        "active_model": {"provider_id": provider_id, "model_id": "qwen3.5:4b"},
+        "providers": [{
+            "id": provider_id,
+            "name": "Ollama Qwen3.5 4B",
+            "kind": "local",
+            "runtime": "ollama",
+            "auth_mode": "local",
+            "logo": "ollama",
+            "base_url": "http://127.0.0.1:11434/v1",
+            "enabled": True,
+            "models": [{"id": "qwen3.5:4b", "name": "Qwen3.5 4B", "capabilities": ["reasoning", "tool"]}],
+        }],
+    }
+    observed: dict[str, str] = {}
+
+    def status(base_url: str, *, model_id: str = "") -> dict[str, object]:
+        observed.update(base_url=base_url, model_id=model_id)
+        return {
+            "reachable": True,
+            "model_ready": model_id == "qwen3.5:4b",
+            "model_id": model_id,
+            "models": [{"name": "qwen3.5:4b"}],
+        }
+
+    monkeypatch.setattr("scansci_html.research_agent.load_settings", lambda _workspace: settings)
+    monkeypatch.setattr("scansci_html.research_agent.ollama_status", status)
+    runtime = ResearchAgentRuntime(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+
+    request = runtime._direct_chat_request({
+        "messages": [{"role": "user", "content": "你好"}],
+        "_skip_run_manifest": True,
+    })
+
+    assert request.provider_id == provider_id
+    assert request.model_id == "qwen3.5:4b"
+    assert observed["model_id"] == "qwen3.5:4b"
+
+
 def test_image_question_falls_back_to_ocr_when_local_vision_cannot_start(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -2673,6 +3457,18 @@ def test_image_question_falls_back_to_ocr_when_local_vision_cannot_start(
     """A present-but-unusable local model must not make image chat unusable."""
 
     workspace = tmp_path / "workspace.sqlite"
+    monkeypatch.setattr(
+        "scansci_html.app_settings.installed_models",
+        lambda: [{
+            "id": "local-vision",
+            "name": "Local vision",
+            "ready": True,
+            "format": "transformers",
+            "architecture": "MiniCPMVForCausalLM",
+            "capabilities": ["chat", "vision"],
+            "kind": "vision",
+        }],
+    )
     save_settings(
         workspace,
         {
@@ -2988,6 +3784,7 @@ def test_pi_chat_cuts_off_terminal_repetition_before_it_reaches_the_ui(
 
     events = list(runtime.chat_stream({
         "agent_harness": "legacy",
+        "chat_mode": "knowledge",
         "messages": [{"role": "user", "content": "用一句话解释这个概念。"}],
     }))
 
@@ -3047,6 +3844,10 @@ def test_direct_knowledge_chat_returns_per_sentence_verified_citations(
     assert "directEvidenceAnswerMarkup" in script
     assert "data-direct-evidence-answer" in script
     assert "bindCitationInteractions({ reader_answer: message.reader_answer }, scope)" in script
+    assert "function citationContextMarkup" in script
+    assert "context_before" in script
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+    assert ".citation-context" in styles
 
 
 def test_task_delivery_reuses_artifact_citations_for_plain_answer_text(tmp_path: Path) -> None:
@@ -3634,18 +4435,23 @@ def test_temporal_delivery_guard_never_labels_old_links_as_today() -> None:
     assert "以下是今天" not in guarded
 
 
-def test_plain_greeting_runs_through_pi_with_empty_domain_lease(
+def test_plain_greeting_uses_direct_chat_fast_lane(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
     observed: dict[str, object] = {}
 
-    def fake_pi_events(_self, chat_request, **_kwargs):
-        observed["messages"] = chat_request.messages
+    def direct_events(*_args, **kwargs):
+        observed.update(kwargs)
         yield {"type": "delta", "content": "你好！"}
-        yield {"type": "done", "stats": {"tokens": {"total_tokens": 3}}}
+        yield {"type": "done", "usage": {"total_tokens": 3}}
 
-    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", fake_pi_events)
+    monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", direct_events)
+    monkeypatch.setattr(
+        ResearchAgentRuntime,
+        "_pi_model_events",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("plain greeting must bypass Pi")),
+    )
     runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
     events = list(runtime.chat_stream({
         "agent_harness": "legacy",
@@ -3659,7 +4465,10 @@ def test_plain_greeting_runs_through_pi_with_empty_domain_lease(
     assert profile["cognitive_complexity"] == "low"
     assert result["agent_runtime"]["task_contract"]["allowed_tools"] == []
     assert result["agent_runtime"]["task_contract"]["initial_tools"] == []
-    assert result["agent_runtime"]["harness"] == "pi-agent-sdk"
+    assert result["agent_runtime"]["harness"] == "direct-provider"
+    assert result["agent_runtime"]["routing"] == "direct-chat-fast"
+    assert observed["max_tokens"] == 256
+    assert observed["thinking_mode"] == "disabled"
     system = observed["messages"][0]["content"]
     assert "ScanSci" in system
 
@@ -3810,12 +4619,23 @@ def test_loaded_web_skill_does_not_expand_host_contract_or_evidence_policy(
             "task_mode": task_mode,
             "skills": [item.get("id") for item in chat_request.selected_skills],
         })
-        if task_mode in {"web", "web-auto"}:
+        if task_mode == "web":
             yield {"type": "tool.completed", "name": "search_web", "result": {"count": 1}}
         yield {"type": "delta", "content": "Argument structure analyzed."}
         yield {"type": "done", "stats": {"tokens": {"total_tokens": 4}}}
 
     monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", fake_pi_events)
+    monkeypatch.setattr(
+        "scansci_html.research_agent.complete_chat_text",
+        lambda *_args, **_kwargs: ("Argument structure analyzed.", {"total_tokens": 4}),
+    )
+    monkeypatch.setattr(
+        "scansci_html.research_agent.stream_chat_text",
+        lambda *_args, **_kwargs: iter([
+            {"type": "delta", "content": "Argument structure analyzed."},
+            {"type": "done", "usage": {"total_tokens": 4}},
+        ]),
+    )
     runtime = ResearchAgentRuntime(
         workspace=tmp_path / "workspace.sqlite",
         evidence_db=tmp_path / "evidence.sqlite",
@@ -4265,7 +5085,7 @@ def test_successful_document_summary_is_delivered_when_model_followup_fails(
     assert any(item["title"] == "直接交付任务文档结果" for item in result["message"]["trace"])
 
 
-def test_synchronous_plain_chat_marks_bounded_direct_transport_as_pi_fallback(
+def test_synchronous_plain_chat_uses_bounded_direct_fast_transport(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -4288,9 +5108,10 @@ def test_synchronous_plain_chat_marks_bounded_direct_transport_as_pi_fallback(
     assert result["message"]["content"] == "Direct synchronous reply"
     assert result["message"]["usage"]["total_tokens"] == 5
     assert result["agent_runtime"]["harness"] == "direct-provider"
-    assert result["agent_runtime"]["compatibility_fallback"] is True
-    assert "pi unavailable" in result["agent_runtime"]["compatibility_error"]
-    assert observed["max_tokens"] == 1024
+    assert result["agent_runtime"]["compatibility_fallback"] is False
+    assert result["agent_runtime"]["compatibility_error"] == ""
+    assert result["agent_runtime"]["routing"] == "direct-chat-fast"
+    assert observed["max_tokens"] == 512
     assert observed["temperature"] == 0.2
     assert observed["thinking_mode"] == "disabled"
 
@@ -4307,7 +5128,7 @@ def test_scientific_rewrite_removes_unsupported_causal_absolutes():
     assert "可能影响因素之一" in repaired
 
 
-def test_streaming_plain_chat_marks_bounded_direct_transport_as_pi_fallback(
+def test_streaming_plain_chat_uses_bounded_direct_fast_transport(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -4332,10 +5153,12 @@ def test_streaming_plain_chat_marks_bounded_direct_transport_as_pi_fallback(
     result = events[-1]["result"]
     assert result["message"]["content"] == "Direct compatibility reply"
     assert result["agent_runtime"]["harness"] == "direct-provider"
-    assert result["agent_runtime"]["compatibility_fallback"] is True
-    assert "pi unavailable" in result["agent_runtime"]["compatibility_error"]
-    assert observed["max_tokens"] == 1024
+    assert result["agent_runtime"]["compatibility_fallback"] is False
+    assert result["agent_runtime"]["compatibility_error"] == ""
+    assert result["agent_runtime"]["routing"] == "direct-chat-fast"
+    assert observed["max_tokens"] == 512
     assert observed["max_continuations"] == 0
+    assert observed["max_requests"] == 1
     assert observed["temperature"] == 0.2
     assert observed["thinking_mode"] == "disabled"
 
@@ -4399,6 +5222,7 @@ def test_explicit_structured_writing_receives_a_completion_budget_and_safe_conti
 
     assert _direct_output_budget(request) == 4_096
     assert _direct_max_continuations(request) == 1
+    assert _direct_output_budget("你好") == 256
     assert _direct_output_budget("用一句话概括。") == 384
     assert _direct_max_continuations("用一句话概括。") == 0
     assert _direct_output_budget("请审查这篇稿件", [{"id": "nature-reviewer"}]) == 4_096
@@ -4475,7 +5299,7 @@ def test_structured_pi_stream_buffers_and_delivers_only_the_validated_answer(
     runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
 
     events = list(runtime.chat_stream({
-        "chat_mode": "writing",
+        "chat_mode": "knowledge",
         "messages": [{"role": "user", "content": (
             "请写一份结构完整的科研写作质量检查指南，共六个编号部分。"
             "最后一行必须单独写【回答完毕】。"
@@ -4515,7 +5339,7 @@ def test_structured_pi_stream_retries_an_unrelated_gateway_reply_before_delivery
     runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
 
     events = list(runtime.chat_stream({
-        "chat_mode": "writing",
+        "chat_mode": "knowledge",
         "messages": [{"role": "user", "content": (
             "请写一份结构完整的科研写作质量检查指南，共六个编号部分。"
             "每部分至少包含三条可执行检查；最后一行必须单独写【回答完毕】。"
@@ -4556,7 +5380,7 @@ def test_structured_pi_stream_can_repair_twice_before_delivery(
     runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
 
     events = list(runtime.chat_stream({
-        "chat_mode": "writing",
+        "chat_mode": "knowledge",
         "messages": [{"role": "user", "content": (
             "请写一份结构完整的科研写作质量检查指南，共六个编号部分。"
             "每部分至少包含三条可执行检查；最后一行必须单独写【回答完毕】。"
@@ -4601,7 +5425,7 @@ def test_structured_pi_stream_repairs_prose_checks_into_explicit_checklist_items
     runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
 
     events = list(runtime.chat_stream({
-        "chat_mode": "writing",
+        "chat_mode": "knowledge",
         "messages": [{"role": "user", "content": request}],
     }))
 
@@ -4753,6 +5577,7 @@ def test_auto_web_mode_routes_model_conversation_through_pi(
     monkeypatch: pytest.MonkeyPatch,
 ):
     def pi_events(*_args, **_kwargs):
+        yield {"type": "tool.completed", "name": "search_web", "result": {"count": 1}}
         yield {"type": "delta", "content": "这是普通回答。"}
         yield {"type": "done", "stats": {"tokens": {"total_tokens": 5}}}
 
@@ -4762,7 +5587,7 @@ def test_auto_web_mode_routes_model_conversation_through_pi(
     events = list(runtime.chat_stream({
         "agent_harness": "legacy",
         "web_search": "auto",
-        "messages": [{"role": "user", "content": "解释一下什么是向量。"}],
+        "messages": [{"role": "user", "content": "看看天气预报。"}],
     }))
 
     assert events[-1]["type"] == "RUN_FINISHED"
@@ -4827,7 +5652,8 @@ def test_pi_fallback_failure_emits_explicit_trace_and_run_error_instead_of_hangi
     runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
     events = list(runtime.chat_stream({
         "agent_harness": "legacy",
-        "messages": [{"role": "user", "content": "你好"}],
+        "chat_mode": "knowledge",
+        "messages": [{"role": "user", "content": "请解释这个概念。"}],
     }))
 
     assert events[-1]["type"] == "RUN_ERROR"
@@ -5056,6 +5882,105 @@ def test_notebook_webapp_exposes_credential_free_model_health_snapshot(tmp_path:
     assert "api_key" not in json.dumps(health)
 
 
+def test_clean_install_without_models_or_local_runtime_keeps_managed_chat_available(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    app, workspace, _evidence = _build_app(tmp_path)
+    monkeypatch.setattr("scansci_html.app_settings.installed_models", lambda: [])
+    monkeypatch.setattr("scansci_html.webapp.installed_models", lambda: [])
+    monkeypatch.setattr(
+        app,
+        "_ollama_status",
+        lambda **_kwargs: {
+            "reachable": False,
+            "installed": False,
+            "base_url": "http://127.0.0.1:11434",
+            "models": [],
+            "error": "Ollama 未运行",
+        },
+    )
+    monkeypatch.setattr(
+        "scansci_html.webapp.test_local_model_connection",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("clean install must not probe an unconfigured runtime")),
+    )
+
+    settings = load_settings(workspace)
+    health = _payload(app.dispatch("GET", "/api/model-health"))
+
+    assert settings["active_model"] == {"provider_id": "scansci-managed", "model_id": "glm-4.7-flash"}
+    assert health["providers"]["scansci-managed"]["status"] == "configured"
+    assert health["selection_catalog"]["providers"] == []
+    assert not any(item["id"].startswith("local-runtime-") for item in settings["providers"])
+
+
+def test_model_health_exposes_models_discovered_from_ollama(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    app, workspace, _evidence = _build_app(tmp_path)
+    monkeypatch.setattr(
+        app,
+        "_ollama_status",
+        lambda **_kwargs: {
+            "reachable": True,
+            "base_url": "http://127.0.0.1:11434",
+            "models": [
+                {"name": "qwen3.8-4b-distill:latest"},
+            ],
+        },
+    )
+    monkeypatch.setattr("scansci_html.webapp.installed_models", lambda: [])
+
+    health = _payload(app.dispatch("GET", "/api/model-health"))
+    providers = health["selection_catalog"]["providers"]
+    discovered = next(
+        provider
+        for provider in providers
+        if provider.get("models", [{}])[0].get("id") == "qwen3.8-4b-distill:latest"
+    )
+
+    assert health["models"][f'{discovered["id"]}::qwen3.8-4b-distill:latest']["status"] == "ready"
+    assert all(item["id"] != "ollama-runtime-discovery" for item in health["selection_catalog"]["local_models"])
+    assert "api_key" not in json.dumps(health)
+
+
+def test_model_health_reuses_one_generic_runtime_probe_for_discovered_models(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    app, workspace, _evidence = _build_app(tmp_path)
+    settings = load_settings(workspace)
+    settings["local_models"].extend(
+        [
+            {
+                "id": f"lm-studio-seed-{index}",
+                "name": f"LM Studio seed {index}",
+                "runtime": "lm-studio",
+                "base_url": "http://127.0.0.1:1234/v1",
+                "model_id": f"seed-{index}",
+                "enabled": True,
+                "capabilities": ["reasoning"],
+            }
+            for index in (1, 2)
+        ]
+    )
+    save_settings(workspace, settings)
+    calls = []
+
+    def probe(local_model, *, timeout):
+        calls.append((local_model["base_url"], timeout))
+        return {"ok": True, "models": ["seed-1", "seed-2", "qwen-local"]}
+
+    monkeypatch.setattr("scansci_html.webapp.test_local_model_connection", probe)
+    monkeypatch.setattr(app, "_ollama_status", lambda **_kwargs: {"reachable": False, "models": []})
+    monkeypatch.setattr("scansci_html.webapp.installed_models", lambda: [])
+
+    health = _payload(app.dispatch("GET", "/api/model-health"))
+    provider = next(
+        item
+        for item in health["selection_catalog"]["providers"]
+        if item.get("models", [{}])[0].get("id") == "qwen-local"
+    )
+
+    assert calls == [("http://127.0.0.1:1234/v1", 1.5)]
+    assert health["models"][f'{provider["id"]}::qwen-local']["status"] == "ready"
+
+
 def test_notebook_webapp_fetches_models_through_a_redacted_provider_route(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     app, workspace, _evidence = _build_app(tmp_path)
     captured: dict[str, object] = {}
@@ -5165,6 +6090,81 @@ def test_webapp_paper_download_batch_rejects_empty_identifiers(tmp_path: Path):
         json.dumps({"workflow_type": "paper_download_batch", "identifiers": []}).encode("utf-8"),
     )
     assert response.status == 400
+
+
+def test_webapp_downloads_slide_project_as_zip_and_rejects_external_paths(tmp_path: Path):
+    from io import BytesIO
+    from zipfile import ZipFile
+
+    app, _workspace, _evidence = _build_app(tmp_path)
+    project = tmp_path / "presentations" / "demo-project"
+    project.mkdir(parents=True)
+    (project / "deck-plan.json").write_text('{"title":"Demo"}', encoding="utf-8")
+    run = app.research_agent.store.create_run(
+        notebook_id="",
+        workflow_type="ppt_project",
+        title="Demo project",
+        input_payload={},
+        stages=[StageSpec("deliver", "Deliver", "delivery")],
+    )
+    artifact = app.research_agent.store.create_artifact(
+        run["run_id"],
+        artifact_type="slide_deck_project",
+        title="Demo project",
+        summary="",
+        payload={"project_path": str(project)},
+        file_path=str(project),
+    )
+    app.research_agent.store.complete_run(run["run_id"], output_artifact_id=artifact["artifact_id"])
+
+    response = app.dispatch("GET", f"/api/runs/{run['run_id']}/download")
+    assert response.status == 200
+    assert response.content_type == "application/zip"
+    with ZipFile(BytesIO(response.body)) as archive:
+        assert archive.read("demo-project/deck-plan.json") == b'{"title":"Demo"}'
+
+    pptx = tmp_path / "presentations" / "demo.pptx"
+    pptx.write_bytes(b"pptx-content")
+    pptx_run = app.research_agent.store.create_run(
+        notebook_id="",
+        workflow_type="pdf_to_ppt",
+        title="Demo PPTX",
+        input_payload={},
+        stages=[StageSpec("deliver", "Deliver", "delivery")],
+    )
+    pptx_artifact = app.research_agent.store.create_artifact(
+        pptx_run["run_id"],
+        artifact_type="presentation_deck",
+        title="Demo PPTX",
+        summary="",
+        payload={},
+        file_path=str(pptx),
+    )
+    app.research_agent.store.complete_run(pptx_run["run_id"], output_artifact_id=pptx_artifact["artifact_id"])
+    pptx_response = app.dispatch("GET", f"/api/runs/{pptx_run['run_id']}/download")
+    assert pptx_response.status == 200
+    assert pptx_response.content_type == "application/vnd.openxmlformats-officedocument.presentationml.presentation"
+    assert pptx_response.body == b"pptx-content"
+
+    outside = tmp_path / "private-project"
+    outside.mkdir()
+    blocked = app.research_agent.store.create_run(
+        notebook_id="",
+        workflow_type="ppt_project",
+        title="External project",
+        input_payload={},
+        stages=[StageSpec("deliver", "Deliver", "delivery")],
+    )
+    artifact = app.research_agent.store.create_artifact(
+        blocked["run_id"],
+        artifact_type="slide_deck_project",
+        title="External project",
+        summary="",
+        payload={"project_path": str(outside)},
+        file_path=str(outside),
+    )
+    app.research_agent.store.complete_run(blocked["run_id"], output_artifact_id=artifact["artifact_id"])
+    assert app.dispatch("GET", f"/api/runs/{blocked['run_id']}/download").status == 404
 
 
 
@@ -5421,6 +6421,45 @@ def test_downloaded_generation_model_is_connected_to_local_runtime(tmp_path: Pat
     app._connect_downloaded_local_models({"models": [model_id]})
 
     assert connected.wait(2)
+    assert calls == [model_id]
+
+
+def test_local_model_recheck_retries_a_failed_installed_vision_model(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    model_id = "openbmb/MiniCPM-V-4.6-BNB"
+    record = {
+        "id": model_id,
+        "name": model_id,
+        "path": str(tmp_path / "model"),
+        "ready": False,
+        "model_files_present": True,
+        "runtime_probe_state": "failed",
+        "runtime_compatible": False,
+        "kind": "vision",
+        "format": "transformers",
+        "capabilities": ["chat", "vision"],
+        "architecture": "MiniCPMV4_6ForConditionalGeneration",
+    }
+    calls: list[str] = []
+    monkeypatch.setattr("scansci_html.webapp.installed_models", lambda: [record])
+    monkeypatch.setattr(
+        "scansci_html.webapp.ensure_local_transformers_runtime",
+        lambda selected: (calls.append(selected), "http://127.0.0.1:17863/v1")[1],
+    )
+
+    response = app.dispatch(
+        "POST",
+        "/api/local-models/recheck",
+        json.dumps({"id": model_id}).encode("utf-8"),
+    )
+    payload = _payload(response)
+
+    assert response.status == 200
+    assert payload["ok"] is True
+    assert payload["model"]["id"] == model_id
     assert calls == [model_id]
 
 

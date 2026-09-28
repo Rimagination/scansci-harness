@@ -49,6 +49,30 @@ def test_web_access_is_packaged_as_builtin_skill(tmp_path: Path):
     assert Path(web_access["skill_file"]).read_text(encoding="utf-8").startswith("---\nname: web-access")
 
 
+def test_typesafe_is_packaged_as_builtin_skill(tmp_path: Path):
+    records = {record["id"]: record for record in default_skill_records()}
+    assert records["typesafe-ai"]["path"] == "builtin:typesafe-ai"
+    assert "Jev" in records["typesafe-ai"]["description"]
+
+    asset_path = builtin_skill_asset_path("typesafe-ai")
+    assert (asset_path / "SKILL.md").is_file()
+    assert (asset_path / "LICENSE").is_file()
+
+    rows = {item["id"]: item for item in installed_skills(tmp_path / "workspace.sqlite")}
+    typesafe = rows["typesafe-ai"]
+    assert typesafe["builtin"] is True
+    assert typesafe["available"] is True
+    assert "Jev" in Path(typesafe["skill_file"]).read_text(encoding="utf-8")
+
+    from scansci_html.agent_skill_tools import ProgressiveSkillRuntime
+
+    loaded = ProgressiveSkillRuntime(tmp_path / "workspace.sqlite").load_skill(
+        "typesafe-ai", provenance="explicit"
+    )
+    assert loaded["source"] == "builtin:typesafe-ai"
+    assert "ScanSci Harness" in loaded["content"]
+
+
 def test_research_skill_bundle_is_packaged_and_available(tmp_path: Path):
     expected = {
         "scientific-brainstorming",

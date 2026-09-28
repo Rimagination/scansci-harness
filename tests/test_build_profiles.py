@@ -8,18 +8,22 @@ def test_desktop_build_defaults_to_lightweight_core_and_reuses_dependency_keyed_
     script = (ROOT / "scripts" / "build_desktop.ps1").read_text(encoding="utf-8-sig")
 
     assert '[string]$PackageProfile = "core"' in script
+    assert '[string]$UpdateManifestUrl = "https://github.com/Rimagination/scansci-pi/releases/latest/download/stable.json"' in script
     assert 'https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.0/local-transformers.json' in script
     assert '[string]$NodeComponentManifestUrl' in script
     assert '[string]$TectonicComponentManifestUrl' in script
+    assert '[string]$ReleasePublicKey = ""' in script
     assert 'Slim channel: do not embed node.exe or tectonic.exe in the bundle.' in script
     assert 'build\\desktop-cache\\$cacheName' in script
-    assert '$ExcludeRuntimes|$RuntimeManifestUrl|$NodeComponentManifestUrl|$TectonicComponentManifestUrl' in script
+    assert '$ExcludeRuntimes|$UpdateManifestUrl|$RuntimeManifestUrl|$NodeComponentManifestUrl|$TectonicComponentManifestUrl' in script
     assert '$sourceTreeHash' in script
     assert 'source_tree_sha256 = $sourceTreeHash' in script
     assert 'release_source_sha256 = $ReleaseSourceSha256.ToLowerInvariant()' in script
     assert 'exclude_runtimes = [bool]$ExcludeRuntimes' in script
+    assert 'update_manifest_url = $UpdateManifestUrl' in script
     assert 'node_component_manifest_url = $NodeComponentManifestUrl' in script
     assert 'tectonic_component_manifest_url = $TectonicComponentManifestUrl' in script
+    assert 'release_public_key = $ReleasePublicKey' in script
     assert '"--additional-hooks-dir", $pyInstallerHooks' in script
     assert 'scripts\\pyinstaller_hooks' in script
     assert '(Join-Path $pyInstallerHooks "hook-litellm.py")' in script
@@ -63,7 +67,7 @@ def test_desktop_build_defaults_to_lightweight_core_and_reuses_dependency_keyed_
 def test_local_runtime_has_an_independent_versioned_build() -> None:
     script = (ROOT / "scripts" / "build_local_runtime.ps1").read_text(encoding="utf-8-sig")
 
-    assert '[string]$Version = "1.0.0"' in script
+    assert '[string]$Version = "1.0.4"' in script
     assert 'ScanSciLocalRuntime' in script
     assert '"--additional-hooks-dir", $pyInstallerHooks' in script
     assert 'build\\component-cache\\$cacheName' in script

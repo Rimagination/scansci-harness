@@ -547,15 +547,20 @@ def _compact_deep_value(value: Any, *, depth: int) -> Any:
 
 
 def _compact_evidence_hit(hit: dict[str, Any]) -> dict[str, Any]:
-    text = " ".join(str(hit.get("text", "")).split())
+    text = " ".join(str(hit.get("matched_text", hit.get("text", ""))).split())
     return {
         "evidence_id": str(hit.get("evidence_id", "")),
         "doc_id": str(hit.get("doc_id", "")),
-        "paper": str(hit.get("paper", "")),
+        "paper": str(hit.get("paper") or hit.get("title") or hit.get("doc_id") or ""),
         "doi": str(hit.get("doi", "")),
         "section": str(hit.get("section", "")),
         "html_anchor": str(hit.get("html_anchor", "")),
         "text": text[:1600],
+        "matched_text": text[:1600],
+        "context_before": " ".join(str(hit.get("context_before", "")).split())[:700],
+        "context_before_evidence_id": str(hit.get("context_before_evidence_id", "")),
+        "context_after": " ".join(str(hit.get("context_after", "")).split())[:700],
+        "context_after_evidence_id": str(hit.get("context_after_evidence_id", "")),
         "score": round(float(hit.get("score", 0.0) or 0.0), 6),
     }
 
@@ -587,6 +592,11 @@ def _compact_verified_answer_for_model(payload: dict[str, Any]) -> dict[str, Any
                 "doi": str(item.get("doi", "")),
                 "section": str(item.get("section", "")),
                 "exact_quote": " ".join(str(item.get("exact_quote", "")).split())[:700],
+                "matched_text": " ".join(str(item.get("matched_text", "")).split())[:1200],
+                "context_before": " ".join(str(item.get("context_before", "")).split())[:700],
+                "context_before_evidence_id": str(item.get("context_before_evidence_id", "")),
+                "context_after": " ".join(str(item.get("context_after", "")).split())[:700],
+                "context_after_evidence_id": str(item.get("context_after_evidence_id", "")),
                 "source_href": str(item.get("source_href", "")),
             }
         )

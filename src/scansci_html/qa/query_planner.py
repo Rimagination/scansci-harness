@@ -217,6 +217,13 @@ _FACET_CUES = re.compile(
     re.IGNORECASE,
 )
 _FACET_SPLIT = re.compile(r"(?:、|，|,|;|；|\band\b|\bor\b|和|与|及|以及)", re.IGNORECASE)
+# Interrogative scaffolding inside a candidate CJK run marks the run as part
+# of the question sentence rather than a concrete research dimension
+# (“机制的核心思想是什么”“请依据资料回答”).  A real facet is a noun phrase such
+# as “微气候” or “土壤碳储量”, so such runs are dropped entirely.
+_FACET_SCAFFOLDING_RE = re.compile(
+    r"是什么|为什么|为何|如何|哪些|有什么|怎么样|请|依据|回答|说明|介绍|列出"
+)
 _ENGLISH_FACET_CUE = re.compile(
     r"\b(?:affect|affects|affected|impact|impacts|impacted|influence|influences|influenced|change|changes|changed|vary|varies|varied)\b",
     re.IGNORECASE,
@@ -282,9 +289,18 @@ def _required_facets(question: str, *, question_type: str) -> list[dict[str, obj
         flags=re.IGNORECASE,
     )
     value = re.sub(r"^(?:effects?|impact|influence)\s+(?:of|on)\s+", "", value, flags=re.IGNORECASE)
+    has_cjk = bool(re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", value))
     cue_matches = list(_FACET_CUES.finditer(value))
     if cue_matches:
         value = value[cue_matches[-1].end() :]
+    elif has_cjk:
+        # A Chinese question without a dimension cue (“影响”“对比”“对”…) is a
+        # single-dimension question.  Splitting its remaining sentences into
+        # facets previously promoted ordinary scaffolding such as “机制的核
+        # 心思想是什么” and “请依据资料回答” to mandatory research dimensions,
+        # and the failed facet coverage then withheld an otherwise supported
+        # verified answer.
+        return []
     # A leading preposition can remain after the cue (for example, “对微气候”).
     value = re.sub(r"^\s*(?:对|于|在|与|和|及|以及|the|the effects? of|on|in)\s*", "", value, flags=re.I)
     pieces = [piece.strip(" \t,，、;；:：") for piece in _FACET_SPLIT.split(value) if piece.strip()]
@@ -307,7 +323,11 @@ def _required_facets(question: str, *, question_type: str) -> list[dict[str, obj
         ).strip()
         if not piece:
             continue
-        cjk_parts = re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]{2,}", piece)
+        cjk_parts = [
+            part
+            for part in re.findall(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]{2,}", piece)
+            if not _FACET_SCAFFOLDING_RE.search(part)
+        ]
         if cjk_parts:
             candidates.extend(cjk_parts)
             continue

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+import json
 from pathlib import Path
 from urllib.request import urlopen
 
@@ -44,6 +45,50 @@ def test_desktop_launches_native_shell_against_ephemeral_loopback_server(tmp_pat
     assert fake.window["options"]["frameless"] is True
     assert fake.window["options"]["easy_drag"] is False
     assert fake.window["options"]["js_api"].__class__.__name__ == "ScanSciDesktopApi"
+
+
+def test_desktop_confirms_transactional_update_after_window_creation(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    local_app_data = tmp_path / "LocalAppData"
+    marker = local_app_data / "ScanSciPi" / "updates" / "0.4.2" / "startup-ready.json"
+    expected_version = str(desktop.current_build_info()["version"])
+    token = "a" * 32
+    monkeypatch.setenv("LOCALAPPDATA", str(local_app_data))
+    monkeypatch.setenv("SCANSCI_UPDATE_READY_FILE", str(marker))
+    monkeypatch.setenv("SCANSCI_UPDATE_READY_TOKEN", token)
+    monkeypatch.setenv("SCANSCI_UPDATE_EXPECTED_VERSION", expected_version)
+    fake = _FakeWebView()
+
+    launch_desktop(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+        title="ScanSci Update Check",
+        webview_module=fake,
+    )
+
+    payload = json.loads(marker.read_text(encoding="utf-8"))
+    assert payload["pid"] > 0
+    assert payload["token"] == token
+    assert payload["version"] == expected_version
+
+
+def test_desktop_rejects_update_marker_outside_private_update_root(tmp_path: Path, monkeypatch) -> None:
+    marker = tmp_path / "outside" / "startup-ready.json"
+    monkeypatch.setenv("LOCALAPPDATA", str(tmp_path / "LocalAppData"))
+    monkeypatch.setenv("SCANSCI_UPDATE_READY_FILE", str(marker))
+    monkeypatch.setenv("SCANSCI_UPDATE_READY_TOKEN", "b" * 32)
+    monkeypatch.setenv("SCANSCI_UPDATE_EXPECTED_VERSION", str(desktop.current_build_info()["version"]))
+
+    launch_desktop(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+        title="ScanSci Update Check",
+        webview_module=_FakeWebView(),
+    )
+
+    assert not marker.exists()
 
 
 class _FakeUser32:

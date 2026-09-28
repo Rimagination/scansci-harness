@@ -4,6 +4,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import threading
+from urllib.request import urlopen
 
 import pytest
 
@@ -113,7 +114,7 @@ def test_download_differential_requests_only_changed_range(
     old_map = build_blockmap(old, block_size=4)
     new_map = build_blockmap_from_bytes(handler.payload, block_size=4)
 
-    result = download_differential(old, old_map, url, new_map, destination)
+    result = download_differential(old, old_map, url, new_map, destination, opener=urlopen)
 
     assert result["used_differential"] is True
     assert result["bytes_downloaded"] == 4
@@ -140,6 +141,7 @@ def test_download_differential_rejects_server_without_range_support(
                 url,
                 build_blockmap_from_bytes(handler.payload, block_size=4),
                 destination,
+                opener=urlopen,
             )
     finally:
         handler.support_ranges = True

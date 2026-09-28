@@ -427,7 +427,7 @@ class _ShapeHandler(BaseHTTPRequestHandler):
 
 
 def _provider_payload(tmp_path: Path, *, provider_kind: str, api_surface: str) -> tuple[list[dict[str, object]], list[dict[str, object]]]:
-    _ShapeHandler.mode = "anthropic" if provider_kind == "anthropic-compatible" else ("responses" if api_surface == "responses" else "openai")
+    _ShapeHandler.mode = "anthropic" if provider_kind == "anthropic-compatible" or api_surface == "anthropic_messages" else ("responses" if api_surface == "responses" else "openai")
     _ShapeHandler.payloads = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), _ShapeHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -469,6 +469,7 @@ def _provider_payload(tmp_path: Path, *, provider_kind: str, api_surface: str) -
     [
         ("openai-compatible", "chat_completions"),
         ("openai-compatible", "responses"),
+        ("openai-compatible", "anthropic_messages"),
         ("anthropic-compatible", "chat_completions"),
     ],
 )
@@ -482,7 +483,7 @@ def test_pi_sdk_serializes_real_provider_multimodal_shapes(
     assert "".join(str(event.get("content", "")) for event in events if event.get("type") == "delta") == "ok"
     payload = payloads[0]
     encoded = json.dumps(payload, ensure_ascii=False)
-    if provider_kind == "anthropic-compatible":
+    if provider_kind == "anthropic-compatible" or api_surface == "anthropic_messages":
         assert '"type": "image"' in encoded
         assert '"source": {"type": "base64", "media_type": "image/png"' in encoded
     elif api_surface == "responses":

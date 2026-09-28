@@ -491,15 +491,25 @@ def _insufficient_adequacy_answer(question: str, adequacy: dict[str, object]) ->
     min_quotes = adequacy.get("min_quotes", 0)
     document_count = adequacy.get("document_count", 0)
     min_documents = adequacy.get("min_documents", 0)
+    if re.search(r"[\u4e00-\u9fff]", question):
+        reason_label = {
+            "no validated quotes": "没有找到可核验引文",
+            "not enough validated quotes": "可核验引文数量不足",
+            "not enough source-document diversity": "来源文档数量不足",
+        }.get(reason, "当前资料不足")
+        limitation = (
+            f"证据不足：{reason_label}（引文 {quote_count}/{min_quotes}，"
+            f"文档 {document_count}/{min_documents}）。"
+        )
+    else:
+        limitation = (
+            "No answer was generated because the evidence adequacy gate failed: "
+            f"{reason} (quotes {quote_count}/{min_quotes}, documents {document_count}/{min_documents})."
+        )
     return {
         "question": question,
         "answer": [],
-        "limitations": [
-            (
-                "No answer was generated because the evidence adequacy gate failed: "
-                f"{reason} (quotes {quote_count}/{min_quotes}, documents {document_count}/{min_documents})."
-            )
-        ],
+        "limitations": [limitation],
         "insufficient_evidence": True,
         "answerability": str(adequacy.get("answerability", "not_enough_information")),
     }
@@ -1028,6 +1038,38 @@ def _apply_topical_relevance_gate(
                     "semantic_score": round(semantic_score, 6),
                     "domain_terms": domain_terms[:12],
                     "matched_terms": matched_chinese[:8],
+                    "checked_quotes": len(evidence_table),
+                },
+            }
+        matched_latin = [
+            term
+            for term in matched
+            if not all("\u4e00" <= char <= "\u9fff" for char in term)
+        ]
+        if matched_latin:
+            # Mixed-language question (e.g. “Attention 机制的核心思想”) against
+            # an English-language library: the CJK topic n-grams cannot match
+            # the source text, but the question's own Latin technical
+            # vocabulary did match the evidence.  That topical connection is
+            # real, so deliver the answer with a review flag instead of
+            # withholding it as unrelated material.
+            lexical_score = min(1.0, len(matched_latin) / max(1, len(domain_terms)))
+            return {
+                **adequacy,
+                "is_sufficient": False,
+                "answerability": "needs_review",
+                "retryable": True,
+                "followup_reason": (
+                    "the question matched the evidence through its embedded technical terms "
+                    "(mixed-language query); treat the answer as review-ready"
+                ),
+                "topical_relevance": {
+                    "status": "review",
+                    "score": round(max(0.4, semantic_score * 0.8), 6),
+                    "lexical_score": round(lexical_score, 6),
+                    "semantic_score": round(semantic_score, 6),
+                    "domain_terms": domain_terms[:12],
+                    "matched_terms": matched_latin[:8],
                     "checked_quotes": len(evidence_table),
                 },
             }
@@ -2082,7 +2124,11 @@ def _reader_limited_claims_for_question_type(
     *,
     query_plan: dict[str, Any] | None,
 ) -> list[dict[str, Any]]:
-    if not claims or not query_plan:
+    if not claims:
+        return claims
+    if _is_focused_sentence_question(question):
+        return _reader_ranked_claims(question, claims, rows_by_quote_id)[:1]
+    if not query_plan:
         return claims
     answer_type = str(query_plan.get("answer_type", "")).strip().lower()
     expected_count = query_plan.get("expected_answer_count")
@@ -2091,6 +2137,14 @@ def _reader_limited_claims_for_question_type(
     if _reader_claim_best_relevance(question, claims[0], rows_by_quote_id) >= 0.8:
         return claims[:1]
     return claims
+
+
+def _is_focused_sentence_question(question: str) -> bool:
+    value = " ".join(str(question or "").split())
+    return bool(
+        re.search(r"\b(?:which|what)\s+sentence\b", value, flags=re.IGNORECASE)
+        or re.search(r"(?:哪一句|哪一条(?:原文|句子)?|哪段(?:原文|话)?)", value)
+    )
 
 
 def _reader_claim_best_relevance(
@@ -2174,6 +2228,11 @@ def _reader_citation(citation_id: str, quote_id: str, row: dict[str, Any]) -> di
         "source_href": source_href,
         "html_path": html_path,
         "html_anchor": html_anchor,
+        "matched_text": str(row.get("matched_text", row.get("exact_quote", ""))),
+        "context_before": str(row.get("context_before", "")),
+        "context_before_evidence_id": str(row.get("context_before_evidence_id", "")),
+        "context_after": str(row.get("context_after", "")),
+        "context_after_evidence_id": str(row.get("context_after_evidence_id", "")),
         "support_status": str(row.get("support_status", "")),
     }
 

@@ -20,6 +20,7 @@ from urllib.parse import urlencode
 from urllib.request import Request, urlopen
 
 from .app_settings import load_settings, save_settings
+from .external_capabilities import host_policy_defaults
 
 
 OFFICIAL_REGISTRY_URL = "https://registry.modelcontextprotocol.io/v0.1/servers"
@@ -67,6 +68,11 @@ def _catalogue_item(
     endpoint: str = "",
     repository_url: str = "",
     rank: int = 0,
+    provider_kind: str = "",
+    connector_kind: str = "general",
+    allow_reversible: bool = False,
+    deferred: bool = True,
+    provider_manifest: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     return {
         "id": identifier,
@@ -84,6 +90,11 @@ def _catalogue_item(
         "rank": rank,
         "updated_at": "",
         "curated": True,
+        "provider_kind": provider_kind,
+        "connector_kind": connector_kind,
+        "allow_reversible": bool(allow_reversible),
+        "deferred": bool(deferred),
+        "provider_manifest": deepcopy(provider_manifest or {}),
     }
 
 
@@ -91,6 +102,23 @@ def _catalogue_item(
 # obtained from published official-registry entries.  They provide an offline
 # research-first catalogue before a user asks to synchronise current data.
 _CURATED_ITEMS: tuple[dict[str, Any], ...] = (
+    _catalogue_item(
+        identifier="io.github.Rimagination/scansci-pdf",
+        title="ScanSci PDF · 文献下载",
+        description="连接独立维护的 scansci-pdf MCP 插件，提供论文检索、标识符核验和可审计全文下载。",
+        version="1.16.0",
+        disciplines=["general", "information"],
+        tags=["文献下载", "PDF", "DOI", "可插拔 provider"],
+        command="scansci-pdf",
+        args="run",
+        repository_url="https://github.com/Rimagination/scansci-pdf",
+        rank=110,
+        provider_kind="literature",
+        connector_kind="literature",
+        allow_reversible=True,
+        deferred=True,
+        provider_manifest=host_policy_defaults({"provider_kind": "literature"})["provider_manifest"],
+    ),
     _catalogue_item(
         identifier="io.github.cyanheads/pubmed-mcp-server",
         title="PubMed / Europe PMC",
@@ -285,6 +313,11 @@ def install_marketplace_server(workspace: str | Path, identifier: str) -> dict[s
         "discipline": (item.get("disciplines") or ["general"])[0],
         "tags": item.get("tags", []),
         "version": item.get("version", ""),
+        "provider_kind": item.get("provider_kind", ""),
+        "connector_kind": item.get("connector_kind", "general"),
+        "allow_reversible": bool(item.get("allow_reversible", False)),
+        "deferred": bool(item.get("deferred", True)),
+        "provider_manifest": item.get("provider_manifest", {}),
         "enabled": True,
     }
     servers.append(record)
@@ -347,6 +380,11 @@ def update_marketplace_server(workspace: str | Path, identifier: str) -> dict[st
         "discipline": (item.get("disciplines") or [server.get("discipline", "general")])[0],
         "tags": item.get("tags", server.get("tags", [])),
         "version": latest_version,
+        "provider_kind": item.get("provider_kind", server.get("provider_kind", "")),
+        "connector_kind": item.get("connector_kind", server.get("connector_kind", "general")),
+        "allow_reversible": bool(item.get("allow_reversible", server.get("allow_reversible", False))),
+        "deferred": bool(item.get("deferred", server.get("deferred", True))),
+        "provider_manifest": item.get("provider_manifest", server.get("provider_manifest", {})),
         "updated_at": datetime.now(UTC).isoformat(timespec="seconds"),
     }
     servers[index] = replacement

@@ -134,6 +134,16 @@ def _deterministic_cross_language_queries(topic: str, *, max_queries: int) -> li
         ][:max_queries]
     if has_rag:
         return ["retrieval augmented generation", "RAG"][:max_queries]
+    has_mountain = any(term in normalized for term in ("山地", "高山", "mountain", "alpine", "montane"))
+    has_soil = "土壤" in normalized or "soil" in normalized
+    has_carbon = "碳" in normalized or "carbon" in normalized
+    has_fractions = any(term in normalized for term in ("组分", "fraction"))
+    if has_mountain and has_soil and has_carbon and has_fractions:
+        return [
+            "soil organic carbon fractions mountain soils",
+            "alpine soil organic carbon fractions",
+            "soil organic carbon fractions alpine meadow",
+        ][:max_queries]
     return []
 
 

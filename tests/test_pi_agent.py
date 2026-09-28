@@ -15,6 +15,7 @@ import pytest
 
 import scansci_html.pi_agent as pi_agent
 from scansci_html.app_settings import load_settings, save_settings
+from scansci_html.evidence_store import index_evidence_library
 from scansci_html.pi_agent import (
     PiAgentClient,
     _ManagedGatewayAdapter,
@@ -363,6 +364,12 @@ def test_pi_search_local_evidence_federates_selected_knowledge_bases(tmp_path: P
                 "doc_id": f"doc-{resolved.stem}",
                 "title": resolved.stem,
                 "text": f"{query} from {resolved.stem}",
+                "matched_text": f"{query} from {resolved.stem}",
+                "html_anchor": "results-p1-s0002",
+                "context_before": "The preceding sentence.",
+                "context_before_evidence_id": "evidence-before",
+                "context_after": "The following sentence.",
+                "context_after_evidence_id": "evidence-after",
                 "score": 0.9 if resolved == second.resolve() else 0.6,
             }
         ]
@@ -380,6 +387,105 @@ def test_pi_search_local_evidence_federates_selected_knowledge_bases(tmp_path: P
     assert result["library_count"] == 2
     assert result["count"] == 2
     assert [hit["library_index"] for hit in result["hits"]] == [1, 0]
+    assert result["hits"][0]["matched_text"] == "shared claim from second"
+    assert result["hits"][0]["context_before"] == "The preceding sentence."
+    assert result["hits"][0]["context_after"] == "The following sentence."
+
+
+def test_pi_search_local_evidence_uses_jev_only_as_an_optional_reranking_stage(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    evidence_db = tmp_path / "evidence.sqlite"
+    evidence_db.touch()
+    captured: dict[str, object] = {}
+    hits = [
+        {
+            "evidence_id": "evidence-a",
+            "doc_id": "doc-a",
+            "title": "Paper A",
+            "matched_text": "First passage.",
+            "html_anchor": "results-p1-s0001",
+            "score": 0.9,
+        },
+        {
+            "evidence_id": "evidence-b",
+            "doc_id": "doc-b",
+            "title": "Paper B",
+            "matched_text": "Second passage.",
+            "html_anchor": "results-p1-s0002",
+            "score": 0.5,
+        },
+    ]
+
+    monkeypatch.setattr(
+        pi_agent,
+        "load_settings",
+        lambda _workspace: {
+            "plugins": [],
+            "providers": [
+                {
+                    "id": "jev",
+                    "enabled": True,
+                    "api_key_configured": True,
+                    "base_url": "https://api.typesafe.ai/v1/systemone",
+                }
+            ],
+        },
+    )
+
+    def fake_search(_path: str | Path, _query: str, **kwargs: object) -> list[dict[str, object]]:
+        captured["search_limit"] = kwargs["limit"]
+        return list(hits)
+
+    def fake_review(**kwargs: object) -> dict[str, object]:
+        captured["review_hits"] = kwargs["hits"]
+        return {
+            "hits": list(reversed(kwargs["hits"])),
+            "review": {"status": "applied", "reviewed_count": 2},
+        }
+
+    monkeypatch.setattr(pi_agent, "search_evidence_store", fake_search)
+    monkeypatch.setattr(pi_agent, "review_evidence_candidates", fake_review)
+    client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=evidence_db)
+
+    result = client._execute_tool("search_local_evidence", {"query": "second passage", "result_limit": 8})
+
+    assert captured["search_limit"] == 16
+    assert len(captured["review_hits"]) == 2
+    assert [item["evidence_id"] for item in result["hits"]] == ["evidence-b", "evidence-a"]
+    assert result["jev_review"]["status"] == "applied"
+
+
+def test_pi_search_local_evidence_runs_real_sentence_context_recall(tmp_path: Path) -> None:
+    library = tmp_path / "library"
+    library.mkdir()
+    (library / "paper.html").write_text(
+        """
+        <article class="paper" data-doi="10.1234/pi-context">
+          <h1>Pi Context Paper</h1>
+          <h2>Results</h2>
+          <p id="results-p1">The cohort included 120 participants. Treatment increased cortical activity in language regions. The follow-up assessment found the effect persisted.</p>
+        </article>
+        """,
+        encoding="utf-8",
+    )
+    evidence_db = tmp_path / "evidence.sqlite"
+    index_evidence_library(library, db_path=evidence_db, min_sentence_length=10)
+    client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=evidence_db)
+
+    result = client._execute_tool(
+        "search_local_evidence",
+        {"query": "treatment increased cortical activity", "result_limit": 1},
+    )
+
+    assert result["count"] == 1
+    hit = result["hits"][0]
+    assert hit["paper"] == "Pi Context Paper"
+    assert hit["matched_text"] == "Treatment increased cortical activity in language regions."
+    assert hit["context_before"] == "The cohort included 120 participants."
+    assert hit["context_after"] == "The follow-up assessment found the effect persisted."
+    assert hit["html_anchor"] == "results-p1-s0002"
 
 
 def test_pi_build_verified_answer_federates_all_selected_evidence_stores(tmp_path: Path, monkeypatch) -> None:
@@ -793,6 +899,72 @@ def test_managed_gateway_honors_bounded_upstream_retry_after(monkeypatch) -> Non
     assert waits == [60.0]
 
 
+@pytest.mark.parametrize("retry_after", ["90", "Wed, 09 Sep 2026 00:01:30 GMT"])
+def test_pi_gateway_leaves_retries_to_session_and_shares_full_cooldown(monkeypatch, retry_after) -> None:
+    posts = []
+    cooldowns = []
+    monkeypatch.setattr(pi_agent.requests, "post", lambda *args, **kwargs: (
+        posts.append(kwargs) or SimpleNamespace(status_code=429, headers={"Retry-After": retry_after})
+    ))
+    monkeypatch.setattr(pi_agent.time, "time", lambda: 1788912000.0)
+    monkeypatch.setattr(pi_agent, "_stream_set_cooldown", lambda key, delay: cooldowns.append((key, delay)))
+    adapter = _ManagedGatewayAdapter(upstream_base_url="https://gateway.example/v1", api_key="fixture", transport_attempts=1)
+    try:
+        assert adapter._post_with_transport_retry({"model": "fixture-model"}).status_code == 429
+        assert len(posts) == 1
+        assert cooldowns == [(adapter._rate_key, 90.0)]
+    finally:
+        adapter.close()
+
+
+def test_pi_gateway_cooldown_is_cancellable_without_a_provider_request(monkeypatch) -> None:
+    adapter = _ManagedGatewayAdapter(upstream_base_url="https://gateway.example/v1", api_key="fixture", transport_attempts=1)
+    monkeypatch.setattr(pi_agent, "_stream_cooldown_remaining", lambda _key: 86400.0)
+    try:
+        adapter._closed.set()
+        with pytest.raises(pi_agent.requests.RequestException, match="cancelled"):
+            adapter._await_rate_slot()
+    finally:
+        adapter.close()
+
+
+@pytest.mark.parametrize("state", ["disconnected", "expired", "closed"])
+def test_pi_gateway_rejects_abandoned_queued_requests(state) -> None:
+    server_socket, client_socket = pi_agent.socket.socketpair()
+    adapter = _ManagedGatewayAdapter(upstream_base_url="https://queue.example/v1", api_key="fixture", transport_attempts=1)
+    try:
+        started = pi_agent.time.perf_counter()
+        if state == "disconnected":
+            client_socket.close()
+        elif state == "expired":
+            started -= 211
+        else:
+            adapter._closed.set()
+        with pytest.raises(pi_agent.requests.RequestException):
+            adapter._assert_request_active(SimpleNamespace(connection=server_socket), started)
+    finally:
+        server_socket.close()
+        client_socket.close()
+        adapter.close()
+
+
+def test_managed_gateway_forwards_only_safe_recovery_headers() -> None:
+    response = SimpleNamespace(
+        headers={
+            "Retry-After": "12",
+            "x-scansci-error-class": "upstream_rate_limited",
+            "x-ratelimit-remaining": "0",
+            "Authorization": "secret-value",
+        }
+    )
+
+    assert _ManagedGatewayAdapter._recovery_headers(response) == {
+        "Retry-After": "12",
+        "x-scansci-error-class": "upstream_rate_limited",
+        "x-ratelimit-remaining": "0",
+    }
+
+
 def test_managed_gateway_labels_input_limit_for_pi_auto_compaction(monkeypatch) -> None:
     error_text = json.dumps(
         {
@@ -831,10 +1003,12 @@ def test_managed_gateway_labels_input_limit_for_pi_auto_compaction(monkeypatch) 
 
 class _OpenAIStreamHandler(BaseHTTPRequestHandler):
     request_payload: dict[str, object] = {}
+    request_headers: dict[str, str] = {}
 
     def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
         length = int(self.headers.get("Content-Length", "0"))
         type(self).request_payload = json.loads(self.rfile.read(length))
+        type(self).request_headers = dict(self.headers.items())
         chunks = [
             {
                 "id": "chatcmpl-scanscipi",
@@ -1491,7 +1665,7 @@ def test_pi_sidecar_responds_to_runtime_probe() -> None:
 
     assert status["ready"] is True
     assert status["runtime"] == "pi"
-    assert status["version"] == "0.80.10"
+    assert status["version"] == "0.84.3"
     assert status["protocol"] == 7
     assert {
         "multi_session",
@@ -1720,6 +1894,60 @@ def test_pi_stream_forwards_host_owned_task_contract(tmp_path: Path, monkeypatch
     assert "host_tool_authorization" in captured["required_features"]
     assert "ephemeral_sessions" in captured["required_features"]
     assert captured["ephemeral_session"] is True
+
+
+def test_pi_direct_stream_infers_runtime_metadata_from_matching_saved_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    workspace = tmp_path / "workspace.sqlite"
+    save_settings(workspace, {
+        "active_model": {"provider_id": "local-qwen", "model_id": "qwen3.5:4b"},
+        "providers": [{
+            "id": "local-qwen",
+            "name": "Local Qwen",
+            "kind": "openai-compatible",
+            "base_url": "http://127.0.0.1:11434/v1",
+            "models": [{
+                "id": "qwen3.5:4b",
+                "name": "Qwen3.5 4B",
+                "context_window": "32K",
+                "capabilities": ["reasoning", "tool", "coding"],
+            }],
+        }],
+    })
+    client = PiAgentClient(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+    captured: dict[str, object] = {}
+
+    def fake_run_request(start_message, *, api_key, timeout_seconds):
+        captured.update(start_message)
+        yield {"type": "done", "stats": {}, "truncated": False}
+
+    monkeypatch.setattr(client, "_run_request", fake_run_request)
+    events = list(client.stream_chat(
+        provider_kind="ollama",
+        base_url="http://127.0.0.1:11434/v1",
+        api_key="",
+        model_id="qwen3.5:4b",
+        messages=[{"role": "user", "content": "download one paper"}],
+        task_mode="general",
+        task_contract={
+            **_TASK_CONTRACT_V2,
+            "contract_id": "runtime-inference",
+            "risk_level": "read_only",
+            "allowed_tools": [],
+        },
+        timeout_seconds=30,
+        session_id="runtime-inference-session",
+    ))
+
+    assert events[-1]["type"] == "done"
+    runtime = captured["model_runtime"]
+    assert isinstance(runtime, dict)
+    assert runtime["provider_id"] == "local-qwen"
+    assert runtime["context_window_tokens"] == 32 * 1024
+    assert runtime["capabilities"] == ["reasoning", "tool", "coding"]
+    assert runtime["degraded"] is False
 
 
 def test_pi_stream_forwards_compact_skill_catalog_without_expanding_domain_lease(
@@ -3022,6 +3250,11 @@ def test_compact_verified_answer_preserves_reader_location_fields() -> None:
                         "doc_id": "doc-1",
                         "html_anchor": "sentence-1",
                         "exact_quote": "quote",
+                        "matched_text": "Matched sentence.",
+                        "context_before": "Previous sentence.",
+                        "context_before_evidence_id": "evidence-before",
+                        "context_after": "Next sentence.",
+                        "context_after_evidence_id": "evidence-after",
                     }
                 ],
             },
@@ -3032,10 +3265,13 @@ def test_compact_verified_answer_preserves_reader_location_fields() -> None:
     citation = compact["reader_answer"]["citations"][0]
     assert citation["doc_id"] == "doc-1"
     assert citation["html_anchor"] == "sentence-1"
+    assert citation["context_before"] == "Previous sentence."
+    assert citation["context_after"] == "Next sentence."
     assert _parse_text_tool_intents('The tool has a field named "name": "inspect_workspace".') == []
 
 
 def test_pi_sdk_streams_through_the_python_bridge(tmp_path: Path) -> None:
+    _OpenAIStreamHandler.request_headers = {}
     server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIStreamHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
@@ -3044,6 +3280,7 @@ def test_pi_sdk_streams_through_the_python_bridge(tmp_path: Path) -> None:
         events = list(
             client.stream_chat(
                 provider_kind="openai-compatible",
+                provider_id="opencode-go",
                 base_url=f"http://127.0.0.1:{server.server_port}/v1",
                 api_key="fixture-key",
                 model_id="fixture-model",
@@ -3054,6 +3291,7 @@ def test_pi_sdk_streams_through_the_python_bridge(tmp_path: Path) -> None:
                 thinking_level="off",
                 task_mode="knowledge",
                 timeout_seconds=30,
+                session_id="pi-opencode-session",
             )
         )
     finally:
@@ -3072,6 +3310,8 @@ def test_pi_sdk_streams_through_the_python_bridge(tmp_path: Path) -> None:
     assert _OpenAIStreamHandler.request_payload["model"] == "fixture-model"
     assert _OpenAIStreamHandler.request_payload["stream"] is True
     assert _OpenAIStreamHandler.request_payload["tools"]
+    assert _OpenAIStreamHandler.request_headers["x-opencode-session"] == "pi-opencode-session"
+    assert _OpenAIStreamHandler.request_headers["User-Agent"] == "ScanSci"
     lifecycle = {
         str(item.get("event", ""))
         for item in events
@@ -3161,10 +3401,11 @@ def test_plan_approval_defaults_to_deny_without_explicit_approve(tmp_path: Path)
     client._execute_tool = lambda name, _arguments: dispatched.append(name) or {"ok": True}  # type: ignore[method-assign]
     events: list[dict[str, object]] = []
     errors: list[BaseException] = []
+    interaction_or_terminal = threading.Event()
 
     def consume() -> None:
         try:
-            events.extend(client.stream_chat(
+            for event in client.stream_chat(
                 provider_kind="openai-compatible",
                 base_url=f"http://127.0.0.1:{server.server_port}/v1",
                 api_key="fixture-key",
@@ -3180,29 +3421,29 @@ def test_plan_approval_defaults_to_deny_without_explicit_approve(tmp_path: Path)
                     "initial_tool_budget": 2,
                     "max_tool_budget": 4,
                 },
-                timeout_seconds=30,
+                timeout_seconds=45,
                 session_id="default-deny-plan",
-            ))
+            ):
+                events.append(event)
+                if event.get("type") == "interaction":
+                    interaction_or_terminal.set()
         except BaseException as error:  # noqa: BLE001 - asserted below
             errors.append(error)
+        finally:
+            interaction_or_terminal.set()
 
     consumer = threading.Thread(target=consume, daemon=True)
     consumer.start()
     try:
-        deadline = time.monotonic() + 10
-        interaction: dict[str, object] | None = None
-        while time.monotonic() < deadline:
-            interaction = next((item for item in events if item.get("type") == "interaction"), None)
-            if interaction is not None:
-                break
-            time.sleep(0.01)
-        assert interaction is not None
+        assert interaction_or_terminal.wait(timeout=30), "Pi did not request plan approval within 30 seconds"
+        interaction = next((item for item in events if item.get("type") == "interaction"), None)
+        assert interaction is not None, f"Pi ended before requesting plan approval: {errors or events[-3:]}"
         assert client.respond_interaction(
             str(interaction["interaction_id"]),
             {},
             request_id=str(interaction["request_id"]),
         ) is True
-        consumer.join(timeout=10)
+        consumer.join(timeout=30)
     finally:
         client.close()
         server.shutdown()

@@ -624,7 +624,7 @@ class DblpAcademicProvider:
             self.session,
             "https://dblp.org/search/publ/api",
             params={"q": query, "format": "json", "h": int(limit), "f": 0},
-            headers={"User-Agent": "ScanSci-Pi/1.0 (academic discovery)"},
+            headers={"User-Agent": "ScanSci-Harness/1.0 (academic discovery)"},
             timeout=self.timeout,
         )
         response.raise_for_status()

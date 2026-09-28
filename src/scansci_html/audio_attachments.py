@@ -62,21 +62,29 @@ def persist_audio_attachments(workspace: str | Path, audio: object) -> list[dict
     for index, item in enumerate(audio, start=1):
         if not isinstance(item, dict):
             raise ValueError("音频附件格式无效")
-        mime_type, raw = _decode_data_url(str(item.get("data_url", "")))
+        attachment_id = str(item.get("id", "")).strip()
+        if attachment_id and not str(item.get("data_url", "")).strip():
+            path, mime_type = audio_attachment_asset(workspace, attachment_id)
+            raw = path.read_bytes()
+            reused_id = attachment_id
+        else:
+            mime_type, raw = _decode_data_url(str(item.get("data_url", "")))
+            reused_id = ""
         if len(raw) > _MAX_AUDIO_BYTES:
             raise ValueError("单个音频文件不能超过 50 MB")
         total += len(raw)
         if total > _MAX_TOTAL_BYTES:
             raise ValueError("本次音频附件总大小不能超过 100 MB")
-        attachment_id = f"audio-{uuid.uuid4().hex}"
-        target = root / f"{attachment_id}{_AUDIO_TYPES[mime_type]}"
-        target.write_bytes(raw)
+        attachment_id = reused_id or f"audio-{uuid.uuid4().hex}"
+        if not reused_id:
+            target = root / f"{attachment_id}{_AUDIO_TYPES[mime_type]}"
+            target.write_bytes(raw)
         name = _display_name(str(item.get("name", "")), index, _AUDIO_TYPES[mime_type])
         records.append(
             {
                 "id": attachment_id,
                 "name": name,
-                "mime_type": mime_type,
+                "mime_type": _canonical_mime_type(mime_type),
                 "size": len(raw),
                 "audio_url": f"/api/audio-attachments/{attachment_id}",
             }
@@ -132,13 +140,17 @@ def audio_attachment_asset(workspace: str | Path, attachment_id: str) -> tuple[P
         raise FileNotFoundError("音频附件不存在")
     # Prefer the canonical media type in responses even when the browser sent
     # audio/x-wav or audio/mp3.
+    return path, _canonical_mime_type(mime_type)
+
+
+def _canonical_mime_type(mime_type: str) -> str:
     canonical = {
         "audio/wave": "audio/wav",
         "audio/x-wav": "audio/wav",
         "audio/mp3": "audio/mpeg",
         "audio/x-m4a": "audio/mp4",
     }
-    return path, canonical.get(mime_type, mime_type)
+    return canonical.get(mime_type, mime_type)
 
 
 def _attachments_root(workspace: str | Path) -> Path:

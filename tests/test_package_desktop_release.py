@@ -1,8 +1,14 @@
 from __future__ import annotations
 
+import base64
 import json
 from pathlib import Path
 import subprocess
+
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+from scansci_html.manifest_trust import verify_manifest_signature
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -38,6 +44,24 @@ def test_desktop_release_preserves_multipart_runtime_contract(tmp_path: Path) ->
         encoding="utf-8",
     )
     output = tmp_path / "release"
+    private = Ed25519PrivateKey.generate()
+    private_path = tmp_path / "release.key"
+    private_path.write_text(
+        base64.b64encode(
+            private.private_bytes(
+                encoding=serialization.Encoding.Raw,
+                format=serialization.PrivateFormat.Raw,
+                encryption_algorithm=serialization.NoEncryption(),
+            )
+        ).decode("ascii"),
+        encoding="utf-8",
+    )
+    public = base64.b64encode(
+        private.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+    ).decode("ascii")
 
     subprocess.run(
         [
@@ -59,6 +83,10 @@ def test_desktop_release_preserves_multipart_runtime_contract(tmp_path: Path) ->
             "beta",
             "-LocalRuntimeManifest",
             str(runtime),
+            "-ManifestPrivateKey",
+            str(private_path),
+            "-ManifestKeyId",
+            "package-test",
         ],
         check=True,
         capture_output=True,
@@ -70,6 +98,9 @@ def test_desktop_release_preserves_multipart_runtime_contract(tmp_path: Path) ->
     blockmap_path = output / "ScanSci-0.2.0-beta.1-windows-x64.zip.blockmap"
     blockmap = json.loads(blockmap_path.read_text(encoding="utf-8-sig"))
     windows = stable["windows"]
+    assert stable["schema_version"] == 1
+    assert stable["signature"]["key_id"] == "package-test"
+    assert verify_manifest_signature(stable, public, required=True) is True
     assert archive.exists()
     assert blockmap["schema_version"] == 1
     assert blockmap["algorithm"] == "sha256"

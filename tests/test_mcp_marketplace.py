@@ -34,6 +34,25 @@ def test_academic_catalogue_is_available_offline_and_installs_as_configuration(t
     assert len(duplicate["settings"]["mcp_servers"]) == 1
 
 
+def test_scansci_pdf_plugin_is_curated_at_latest_release_and_installs_as_literature_provider(tmp_path: Path):
+    workspace = tmp_path / "workspace.sqlite"
+    workspace.touch()
+
+    catalog = marketplace_catalog(workspace)
+    scansci_pdf = next(item for item in catalog["items"] if item["id"] == "io.github.Rimagination/scansci-pdf")
+
+    assert scansci_pdf["version"] == "1.16.0"
+    installed = install_marketplace_server(workspace, scansci_pdf["id"])
+    record = installed["record"]
+
+    assert installed["created"] is True
+    assert record["command"] == "scansci-pdf"
+    assert record["args"] == "run"
+    assert record["connector_kind"] == "literature"
+    assert record["provider_kind"] == "literature"
+    assert record["allow_reversible"] is True
+
+
 def test_sync_official_registry_caches_and_classifies_public_records(tmp_path: Path, monkeypatch):
     workspace = tmp_path / "workspace.sqlite"
     workspace.touch()

@@ -42,7 +42,7 @@ def _load_frontend_verifier():
 def _write_complete_pi_junit(path: Path) -> Path:
     node_ids = [
         *[
-            f"tests.test_pi_capability_matrix::test_every_bilingual_model_turn_is_pi_reachable_with_full_read_inventory[case-{index}]"
+            f"tests.test_pi_capability_matrix::test_bilingual_turns_use_pi_only_when_the_task_profile_requires_it[case-{index}]"
             for index in range(40)
         ],
         *[
@@ -277,6 +277,45 @@ def test_frontend_release_verifier_rejects_serialized_parallel_streams() -> None
 
     with pytest.raises(AssertionError, match="overlap"):
         verifier.verify()
+
+
+def test_frontend_release_verifier_uses_an_installed_browser_channel_when_bundle_is_missing() -> None:
+    verifier = _load_frontend_verifier()
+
+    class FakeChromium:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def launch(self, **options: object) -> str:
+            self.calls.append(dict(options))
+            if "channel" not in options:
+                raise RuntimeError("Executable doesn't exist at managed browser path")
+            return str(options["channel"])
+
+    chromium = FakeChromium()
+
+    assert verifier._launch_chromium(chromium) == "chrome"
+    assert chromium.calls == [{"headless": True}, {"headless": True, "channel": "chrome"}]
+
+
+def test_frontend_release_verifier_does_not_hide_a_real_channel_launch_error() -> None:
+    verifier = _load_frontend_verifier()
+
+    class FakeChromium:
+        def __init__(self) -> None:
+            self.calls: list[dict[str, object]] = []
+
+        def launch(self, **options: object) -> str:
+            self.calls.append(dict(options))
+            if "channel" not in options:
+                raise RuntimeError("Executable doesn't exist at managed browser path")
+            raise RuntimeError("Browser launch blocked by enterprise policy")
+
+    chromium = FakeChromium()
+
+    with pytest.raises(RuntimeError, match="enterprise policy"):
+        verifier._launch_chromium(chromium)
+    assert chromium.calls == [{"headless": True}, {"headless": True, "channel": "chrome"}]
 
 
 def test_frontend_release_verifier_rejects_non_fifo_follow_up_events() -> None:

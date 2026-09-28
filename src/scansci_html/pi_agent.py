@@ -12,14 +12,18 @@ from collections.abc import Iterator
 from concurrent.futures import Future, ThreadPoolExecutor
 from dataclasses import dataclass, field
 import hashlib
+from email.utils import parsedate_to_datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
+import math
 import os
 from pathlib import Path
 from queue import Empty, Full, Queue
 import re
 import requests
+import select
 import shutil
+import socket
 import subprocess
 import sys
 from tempfile import NamedTemporaryFile
@@ -38,10 +42,22 @@ from .app_settings import load_settings
 from .artifact_plugins import execute_artifact_tool
 from .checkpoints import CheckpointError, CheckpointStore
 from .context_policy import build_token_envelope, prune_stale_tool_results
+from .external_capabilities import (
+    normalize_external_tool_result,
+    semantic_capability_for_tool,
+    semantic_tool_aliases,
+)
 from .image_attachments import validate_pi_image_blocks
+from .image_generation import generate_image_artifact
 from .ingestion import SUPPORTED_INGESTION_SUFFIXES, extract_local_document
+from .jev_evidence import review_evidence_candidates
 from .library_manager import import_library_files
-from .model_metadata import ModelRuntimeDescriptor, descriptor_from_model_record
+from .llm import _stream_cooldown_remaining, _stream_rate_key, _stream_request_gate, _stream_set_cooldown
+from .model_metadata import (
+    ModelRuntimeDescriptor,
+    descriptor_from_model_record,
+    descriptor_from_settings,
+)
 from .qa.agent import answer_question
 from .research_runs import ResearchRunStore, StageSpec
 from .research_tools import (
@@ -101,7 +117,10 @@ _MANAGED_GATEWAY_HOST = "scansci-glm-gateway.932196440.workers.dev"
 _MAX_MODEL_TOOL_RESULT_BYTES = 16_000
 _MAX_GATEWAY_REQUEST_BYTES = 2_000_000
 _MAX_GATEWAY_RESPONSE_BYTES = 8_000_000
-_GATEWAY_TRANSPORT_ATTEMPTS = 3
+# One original request plus one bounded transport retry is enough for a
+# transient upstream failure.  More attempts multiply provider quota usage and
+# can turn one user turn into a rate-limit storm.
+_GATEWAY_TRANSPORT_ATTEMPTS = 2
 _GATEWAY_MAX_RETRY_AFTER_SECONDS = 60.0
 _SESSION_REGISTRY_LOCK = threading.Lock()
 _PI_PROTOCOL_VERSION = 7
@@ -218,6 +237,7 @@ class _RunContext:
     session_id: str
     generation: int
     supports_images: bool = False
+    semantic_tool_aliases: dict[str, str] = field(default_factory=dict)
     cancel_event: threading.Event = field(default_factory=threading.Event)
     history: list[dict[str, Any]] = field(default_factory=list)
     history_lock: threading.Lock = field(default_factory=threading.Lock)
@@ -572,10 +592,13 @@ def _presentation_arguments_from_result(result: dict[str, Any], user_request: st
 class _ManagedGatewayAdapter:
     """Normalize ScanSci's text-only managed gateway to OpenAI tool-call SSE."""
 
-    def __init__(self, *, upstream_base_url: str, api_key: str, minimum_interval_seconds: float = 0.0) -> None:
+    def __init__(self, *, upstream_base_url: str, api_key: str, minimum_interval_seconds: float = 0.0, transport_attempts: int = _GATEWAY_TRANSPORT_ATTEMPTS) -> None:
         self.upstream_base_url = upstream_base_url.rstrip("/")
         self.api_key = api_key
         self.minimum_interval_seconds = max(0.0, float(minimum_interval_seconds))
+        self.transport_attempts = max(1, int(transport_attempts))
+        self._rate_key = _stream_rate_key("openai-compatible", self.upstream_base_url)
+        self._closed = threading.Event()
         self._rate_lock = threading.Lock()
         self._last_request_started = 0.0
         self.records: list[dict[str, Any]] = []
@@ -598,6 +621,7 @@ class _ManagedGatewayAdapter:
         return f"http://127.0.0.1:{self.server.server_port}/v1"
 
     def close(self) -> None:
+        self._closed.set()
         self.server.shutdown()
         self.thread.join(timeout=3)
         self.server.server_close()
@@ -656,8 +680,21 @@ class _ManagedGatewayAdapter:
                     stream=expects_stream,
                 )
                 return
-            self._await_rate_slot()
-            response = self._post_with_transport_retry(payload)
+            # Share admission with other turns/children using this endpoint.
+            gate = _stream_request_gate(self._rate_key)
+            while not gate.acquire(timeout=0.2):
+                self._assert_request_active(handler, started)
+            try:
+                self._await_rate_slot(check_active=lambda: self._assert_request_active(handler, started))
+                self._assert_request_active(handler, started)
+                if self.transport_attempts == 1:
+                    response = self._post_with_transport_retry(
+                        payload, timeout_seconds=min(180.0, 210.0 - (time.perf_counter() - started)),
+                    )
+                else:
+                    response = self._post_with_transport_retry(payload)
+            finally:
+                gate.release()
             response_content = bytes(getattr(response, "content", b"") or b"")
             if len(response_content) > _MAX_GATEWAY_RESPONSE_BYTES:
                 raise RuntimeError("Managed gateway response exceeded the local output byte limit")
@@ -695,21 +732,29 @@ class _ManagedGatewayAdapter:
                         ensure_ascii=False,
                     )
                 elif rate_type or retry_after:
+                    error_code = "rate_limit_exceeded"
                     try:
                         error_payload = response.json()
-                        message = str(dict(error_payload.get("error", {}) or {}).get("message", response.text))
+                        error_details = dict(error_payload.get("error", {}) or {})
+                        message = str(error_details.get("message", response.text))
+                        error_code = str(error_details.get("code", "") or error_code)
                     except (ValueError, TypeError):
                         message = response.text.strip()
                     error_body = json.dumps(
                         {
                             "error": {
                                 "message": f"{message} [rate_limit_type={rate_type}; retry_after={retry_after}]",
-                                "code": "rate_limit_exceeded",
+                                "code": error_code,
                             }
                         },
                         ensure_ascii=False,
                     )
-                self._write_json(handler, response.status_code, error_body)
+                self._write_json(
+                    handler,
+                    response.status_code,
+                    error_body,
+                    headers=self._recovery_headers(response),
+                )
                 return
             body = response.json()
             self._record_transport(
@@ -737,7 +782,7 @@ class _ManagedGatewayAdapter:
                 json.dumps({"error": {"message": f"Managed gateway adapter failed: {type(error).__name__}: {error}"}}),
             )
 
-    def _post_with_transport_retry(self, payload: dict[str, Any]) -> requests.Response:
+    def _post_with_transport_retry(self, payload: dict[str, Any], *, timeout_seconds: float = 180.0) -> requests.Response:
         """Retry transient gateway failures before Pi sees an empty turn.
 
         The managed gateway forwards the upstream provider's ``Retry-After``
@@ -749,7 +794,7 @@ class _ManagedGatewayAdapter:
 
         retryable_statuses = {429, 500, 502, 503, 504}
         last_error: Exception | None = None
-        for attempt in range(_GATEWAY_TRANSPORT_ATTEMPTS):
+        for attempt in range(self.transport_attempts):
             try:
                 response = requests.post(
                     f"{self.upstream_base_url}/chat/completions",
@@ -760,9 +805,24 @@ class _ManagedGatewayAdapter:
                         "User-Agent": "OpenAI/Python 2.8.1",
                     },
                     json=payload,
-                    timeout=(15, 150),
+                    timeout=(15, max(0.1, timeout_seconds)),
                 )
-                if response.status_code not in retryable_statuses or attempt == _GATEWAY_TRANSPORT_ATTEMPTS - 1:
+                if response.status_code in retryable_statuses and self.transport_attempts == 1:
+                    # The Pi session owns retry attempts; share server cooldowns
+                    # with other turns without replaying tools or shortening them.
+                    retry_after = response.headers.get("Retry-After", "")
+                    try:
+                        delay = float(retry_after)
+                    except ValueError:
+                        try:
+                            delay = parsedate_to_datetime(retry_after).timestamp() - time.time()
+                        except (ValueError, TypeError, OverflowError):
+                            delay = 15.0
+                    if not math.isfinite(delay):
+                        delay = 15.0
+                    if delay > 0:
+                        _stream_set_cooldown(self._rate_key, delay)
+                if response.status_code not in retryable_statuses or attempt == self.transport_attempts - 1:
                     return response
                 retry_after = response.headers.get("Retry-After", "")
                 try:
@@ -775,7 +835,7 @@ class _ManagedGatewayAdapter:
                     delay = float(2**attempt)
             except requests.RequestException as error:
                 last_error = error
-                if attempt == _GATEWAY_TRANSPORT_ATTEMPTS - 1:
+                if attempt == self.transport_attempts - 1:
                     raise
                 delay = float(2**attempt)
             time.sleep(delay)
@@ -783,7 +843,39 @@ class _ManagedGatewayAdapter:
             raise last_error
         raise RuntimeError("Managed gateway retry loop ended unexpectedly")
 
-    def _await_rate_slot(self) -> None:
+    @staticmethod
+    def _recovery_headers(response: Any) -> dict[str, str]:
+        """Forward safe retry metadata through the local Pi adapter."""
+
+        headers = getattr(response, "headers", {}) or {}
+        forwarded: dict[str, str] = {}
+        for key, value in headers.items():
+            normalized = str(key).casefold()
+            if (
+                normalized == "retry-after"
+                or normalized.startswith("x-scansci-")
+                or normalized.startswith("x-ratelimit-")
+            ):
+                forwarded[str(key)] = str(value)
+        return forwarded
+
+    def _assert_request_active(self, handler: BaseHTTPRequestHandler, started: float) -> None:
+        # Leave time for connect/read to finish before Pi's 240 s HTTP deadline.
+        if self._closed.is_set() or time.perf_counter() - started >= 210.0:
+            raise requests.RequestException("Managed model request cancelled or expired")
+        readable, _, _ = select.select([handler.connection], [], [], 0)
+        if readable and not handler.connection.recv(1, socket.MSG_PEEK):
+            raise requests.RequestException("Managed model client disconnected")
+
+    def _await_rate_slot(self, *, check_active: Callable[[], None] | None = None) -> None:
+        if self.transport_attempts == 1:
+            while (delay := _stream_cooldown_remaining(self._rate_key)) > 0:
+                if check_active:
+                    check_active()
+                if self._closed.wait(min(delay, 0.2) if check_active else delay):
+                    raise requests.RequestException("Managed model wait cancelled")
+            if self._closed.is_set():
+                raise requests.RequestException("Managed model wait cancelled")
         if self.minimum_interval_seconds <= 0:
             return
         with self._rate_lock:
@@ -1127,11 +1219,21 @@ class _ManagedGatewayAdapter:
         return normalized
 
     @staticmethod
-    def _write_json(handler: BaseHTTPRequestHandler, status: int, body: str) -> None:
+    def _write_json(
+        handler: BaseHTTPRequestHandler,
+        status: int,
+        body: str,
+        *,
+        headers: dict[str, str] | None = None,
+    ) -> None:
         encoded = body.encode("utf-8")
         handler.send_response(status)
         handler.send_header("Content-Type", "application/json; charset=utf-8")
         handler.send_header("Content-Length", str(len(encoded)))
+        for key, value in (headers or {}).items():
+            if str(key).casefold() in {"content-length", "content-type", "connection"}:
+                continue
+            handler.send_header(str(key), str(value))
         handler.end_headers()
         handler.wfile.write(encoded)
 
@@ -1370,6 +1472,57 @@ def _final_user_value(messages: list[dict[str, Any]]) -> str:
     return ""
 
 
+def _configured_model_descriptor(
+    workspace: Path,
+    *,
+    provider_id: str,
+    provider_kind: str,
+    base_url: str,
+    model_id: str,
+    api_surface: str,
+) -> ModelRuntimeDescriptor | None:
+    """Resolve trusted model metadata for a direct transport caller.
+
+    The normal web path already passes a descriptor.  Lower-level callers may
+    omit it, so only reuse settings when the selected model and provider route
+    identify the same configured record; otherwise the conservative fallback
+    remains in force.
+    """
+
+    requested_provider_id = str(provider_id or "").strip()
+    requested_model_id = str(model_id or "").strip()
+    requested_base_url = str(base_url or "").strip().rstrip("/").lower()
+    if not requested_model_id or not requested_base_url:
+        return None
+
+    settings = load_settings(workspace)
+    providers = [
+        item
+        for item in list(settings.get("providers", []) or [])
+        if isinstance(item, dict)
+    ]
+    for provider in providers:
+        configured_provider_id = str(provider.get("id", "")).strip()
+        if requested_provider_id and configured_provider_id != requested_provider_id:
+            continue
+        configured_base_url = str(provider.get("base_url", "")).strip().rstrip("/").lower()
+        if configured_base_url != requested_base_url:
+            continue
+        if not any(
+            isinstance(model, dict) and str(model.get("id", "")).strip() == requested_model_id
+            for model in list(provider.get("models", []) or [])
+        ):
+            continue
+        return descriptor_from_settings(
+            settings,
+            provider_id=configured_provider_id,
+            model_id=requested_model_id,
+            provider_kind=str(provider_kind or ""),
+            api_surface=str(api_surface or "chat_completions"),
+        )
+    return None
+
+
 class PiAgentClient:
     """Own a persistent Pi sidecar and bridge approved ScanSci tools."""
 
@@ -1472,9 +1625,9 @@ class PiAgentClient:
         node_path = next((path for path in node_candidates if path.is_file()), None)
         script_path = next((path for path in script_candidates if path.is_file()), None)
         if node_path is None:
-            raise PiRuntimeUnavailable("The ScanSci Pi Node runtime is unavailable")
+            raise PiRuntimeUnavailable("The ScanSci Harness Pi Node runtime is unavailable")
         if script_path is None:
-            raise PiRuntimeUnavailable("The ScanSci Pi sidecar bundle is unavailable")
+            raise PiRuntimeUnavailable("The ScanSci Harness Pi sidecar bundle is unavailable")
         return node_path, script_path
 
     @staticmethod
@@ -1522,9 +1675,9 @@ class PiAgentClient:
             try:
                 line = output.get(timeout=timeout_seconds)
             except Empty as error:
-                raise PiRuntimeUnavailable("The ScanSci Pi sidecar did not respond") from error
+                raise PiRuntimeUnavailable("The ScanSci Harness Pi sidecar did not respond") from error
             if not line:
-                raise PiRuntimeUnavailable("The ScanSci Pi sidecar exited before responding")
+                raise PiRuntimeUnavailable("The ScanSci Harness Pi sidecar exited before responding")
             response = json.loads(line)
             if response.get("type") != "pong":
                 raise PiRuntimeUnavailable(f"Unexpected Pi sidecar response: {response.get('type', '')}")
@@ -1533,7 +1686,7 @@ class PiAgentClient:
             missing_features = [feature for feature in _PI_REQUIRED_FEATURES if feature not in capabilities]
             if protocol != _PI_PROTOCOL_VERSION or missing_features:
                 detail = f"protocol={protocol}, missing={','.join(missing_features) or 'none'}"
-                raise PiRuntimeUnavailable(f"The ScanSci Pi sidecar protocol is incompatible ({detail})")
+                raise PiRuntimeUnavailable(f"The ScanSci Harness Pi sidecar protocol is incompatible ({detail})")
             return {
                 "ready": True,
                 "runtime": str(response.get("runtime", "pi")),
@@ -1860,6 +2013,7 @@ class PiAgentClient:
         self,
         *,
         provider_kind: str,
+        provider_id: str = "",
         base_url: str,
         api_key: str,
         model_id: str,
@@ -1882,7 +2036,14 @@ class PiAgentClient:
         elif isinstance(model_runtime, dict):
             descriptor = ModelRuntimeDescriptor.from_payload(model_runtime)
         else:
-            descriptor = descriptor_from_model_record(
+            descriptor = _configured_model_descriptor(
+                self.workspace,
+                provider_id=provider_id,
+                provider_kind=provider_kind,
+                base_url=base_url,
+                model_id=model_id,
+                api_surface=str(api_surface or "chat_completions"),
+            ) or descriptor_from_model_record(
                 provider_id="runtime",
                 provider_kind=provider_kind,
                 model_id=model_id,
@@ -1950,6 +2111,7 @@ class PiAgentClient:
             ),
             prompt,
         )
+        enabled_mcp_servers = self._enabled_mcp_servers()
         if task_contract is None:
             # A direct transport caller still goes through the trusted host
             # compiler.  In contrast, a supplied payload that omits
@@ -1957,6 +2119,11 @@ class PiAgentClient:
             effective_contract = compile_host_task_contract(
                 task_mode=task_mode,
                 user_text=final_request,
+                allowed_mcp_servers=[
+                    str(item.get("id", "")).strip()
+                    for item in enabled_mcp_servers
+                    if isinstance(item, dict) and str(item.get("id", "")).strip()
+                ],
             )
         else:
             effective_contract = TaskContract.from_payload(
@@ -2072,7 +2239,7 @@ class PiAgentClient:
             *required_initial,
         } & set(registered_tools))
         tool_set = {
-            "mcp_servers": [str(item.get("id", "")) for item in self._enabled_mcp_servers() if isinstance(item, dict)],
+            "mcp_servers": [str(item.get("id", "")) for item in enabled_mcp_servers if isinstance(item, dict)],
             "disabled_tools": self._disabled_artifact_tools(),
             "registered_tools": registered_tools,
             "active_tools": active_tools,
@@ -2081,7 +2248,7 @@ class PiAgentClient:
             key: effective_contract.get(key)
             for key in (
                 "schema_version", "output_format", "constraints", "required_evidence",
-                "allowed_tools", "pause_policy", "success_criteria",
+                "allowed_tools", "pause_policy", "success_criteria", "capability_profile",
             )
         }
         contract_shape["model_runtime"] = descriptor.to_dict()
@@ -2105,6 +2272,7 @@ class PiAgentClient:
             "cwd": str(self.workspace.parent),
             "agent_dir": str(self.agent_dir),
             "provider_kind": provider_kind,
+            "provider_id": str(provider_id or ""),
             "base_url": effective_base_url,
             "model_id": model_id,
             "api_surface": str(api_surface or "chat_completions"),
@@ -2115,7 +2283,7 @@ class PiAgentClient:
             "images": validated_images,
             "model_runtime": descriptor.to_dict(),
             "task_mode": task_mode,
-            "mcp_servers": self._enabled_mcp_servers(),
+            "mcp_servers": enabled_mcp_servers,
             "disabled_tools": self._disabled_artifact_tools(),
             "task_contract": effective_contract,
             "tool_set": tool_set,
@@ -2307,20 +2475,20 @@ class PiAgentClient:
             )
         except Exception as error:
             raise PiRuntimeUnavailable(
-                f"The ScanSci Pi sidecar protocol handshake failed: {error}"
+                f"The ScanSci Harness Pi sidecar protocol handshake failed: {error}"
             ) from error
         protocol = int(event.get("protocol", 0) or 0)
         capabilities = {str(value) for value in list(event.get("capabilities", []) or [])}
         missing_features = [feature for feature in _PI_REQUIRED_FEATURES if feature not in capabilities]
         if protocol != _PI_PROTOCOL_VERSION or missing_features:
             detail = f"protocol={protocol}, missing={','.join(missing_features) or 'none'}"
-            raise PiRuntimeUnavailable(f"The ScanSci Pi sidecar protocol is incompatible ({detail})")
+            raise PiRuntimeUnavailable(f"The ScanSci Harness Pi sidecar protocol is incompatible ({detail})")
         self._protocol_generation = self._process_generation
 
     def _write(self, message: dict[str, Any]) -> None:
         process = self._process
         if process is None or process.poll() is not None or process.stdin is None:
-            raise PiRuntimeUnavailable("The ScanSci Pi sidecar is not running")
+            raise PiRuntimeUnavailable("The ScanSci Harness Pi sidecar is not running")
         with self._stdin_lock:
             encoded = json.dumps(message, ensure_ascii=False, separators=(",", ":"))
             if len(encoded.encode("utf-8")) > _MAX_JSONL_LINE_BYTES:
@@ -2535,6 +2703,11 @@ class PiAgentClient:
             return None
         if completion.error_type:
             public_error = str(_redact_tool_value(completion.error))[:500]
+            semantic_capability = semantic_capability_for_tool(
+                completion.name,
+                context.semantic_tool_aliases,
+                completion.arguments,
+            )
             self._tool_result_commit_checkpoint("before_error_wire", context, completion)
             with context.result_commit_lock:
                 if not self._context_is_active(context) or context.cancel_event.is_set():
@@ -2559,9 +2732,19 @@ class PiAgentClient:
                         "error": public_error[:200],
                     })
                 self._tool_result_commit_checkpoint("after_error_wire", context, completion)
-            return {"type": "tool.failed", "name": completion.name, "error": public_error}
+            return {
+                "type": "tool.failed",
+                "name": completion.name,
+                "error": public_error,
+                **({"capability_id": semantic_capability} if semantic_capability else {}),
+            }
 
         safe_result = _redact_tool_value(_json_safe(completion.result))
+        semantic_capability = semantic_capability_for_tool(
+            completion.name,
+            context.semantic_tool_aliases,
+            completion.arguments,
+        )
         prepared: _PreparedToolResult | None = None
         wire_committed = False
         try:
@@ -2600,6 +2783,18 @@ class PiAgentClient:
                     )
                     model_result["_full_result_reference"] = prepared.reference
                     model_result["_persisted_bytes"] = prepared.encoded_bytes
+            if semantic_capability:
+                model_result["_scansci_capability"] = semantic_capability
+                external_preview = normalize_external_tool_result(
+                    safe_result,
+                    workspace=self.workspace,
+                )
+                if external_preview.get("status") != "unstructured":
+                    model_result["_scansci_external_result"] = external_preview
+                model_bytes = len(json.dumps(model_result, ensure_ascii=False).encode("utf-8"))
+                if model_bytes > _MAX_MODEL_TOOL_RESULT_BYTES:
+                    model_result.pop("_scansci_external_result", None)
+                result_meta["model_bytes"] = len(json.dumps(model_result, ensure_ascii=False).encode("utf-8"))
             if prepared is not None:
                 self._tool_result_commit_checkpoint("persist_prepared", context, completion)
                 if not self._context_is_active(context) or context.cancel_event.is_set():
@@ -2662,6 +2857,7 @@ class PiAgentClient:
         return {
             "type": "tool.completed",
             "name": completion.name,
+            **({"capability_id": semantic_capability} if semantic_capability else {}),
             "result": model_result,
             "result_bytes": result_meta["original_bytes"],
             "model_result_bytes": result_meta["model_bytes"],
@@ -2773,6 +2969,7 @@ class PiAgentClient:
                 supports_images="image" in set(
                     dict(start_message.get("model_runtime", {}) or {}).get("input_modalities", [])
                 ),
+                semantic_tool_aliases=semantic_tool_aliases(start_message.get("mcp_servers", [])),
             )
             with self._contexts_lock:
                 self._run_contexts[request_id] = context
@@ -2977,6 +3174,7 @@ class PiAgentClient:
                         "status": str(event.get("status", "")),
                         "name": str(event.get("name", "")),
                         "attempt": event.get("attempt"),
+                        "delay_ms": event.get("delay_ms"),
                         "error": str(event.get("error", "")),
                         "duration_ms": event.get("duration_ms"),
                         "details": dict(event.get("details", {}) or {}),
@@ -3413,6 +3611,7 @@ class PiAgentClient:
         session_id: str,
         *,
         provider_kind: str,
+        provider_id: str = "",
         base_url: str,
         api_key: str,
         model_id: str,
@@ -3435,7 +3634,14 @@ class PiAgentClient:
         elif isinstance(model_runtime, dict):
             descriptor = ModelRuntimeDescriptor.from_payload(model_runtime)
         else:
-            descriptor = descriptor_from_model_record(
+            descriptor = _configured_model_descriptor(
+                self.workspace,
+                provider_id=provider_id,
+                provider_kind=provider_kind,
+                base_url=base_url,
+                model_id=model_id,
+                api_surface=api_surface,
+            ) or descriptor_from_model_record(
                 provider_id="runtime",
                 provider_kind=provider_kind,
                 model_id=model_id,
@@ -3463,6 +3669,7 @@ class PiAgentClient:
                     "cwd": str(self.workspace.parent),
                     "agent_dir": str(self.agent_dir),
                     "provider_kind": provider_kind,
+                    "provider_id": str(provider_id or ""),
                     "base_url": base_url,
                     "model_id": model_id,
                     "api_surface": api_surface,
@@ -3609,7 +3816,8 @@ class PiAgentClient:
 
         Saving a record never launches it.  The Pi sidecar connects these
         records only while creating a task session, and write-like tools stay
-        hidden unless the user explicitly enabled ``allow_write``.
+        hidden unless the user explicitly enabled ``allow_write``; literature
+        artifact tools additionally require ``allow_reversible``.
         """
 
         settings = load_settings(self.workspace)
@@ -3634,7 +3842,10 @@ class PiAgentClient:
                         "args",
                         "endpoint",
                         "connector_kind",
+                        "provider_kind",
+                        "provider_manifest",
                         "allow_write",
+                        "allow_reversible",
                         "tool_effects",
                         "tool_policies",
                         "call_timeout_ms",
@@ -3678,7 +3889,7 @@ class PiAgentClient:
             return self._gateway_adapter.base_url
         if self._gateway_adapter is not None:
             self._gateway_adapter.close()
-        self._gateway_adapter = _ManagedGatewayAdapter(upstream_base_url=base_url, api_key=api_key)
+        self._gateway_adapter = _ManagedGatewayAdapter(upstream_base_url=base_url, api_key=api_key, transport_attempts=1)
         self._gateway_adapter_signature = signature
         return self._gateway_adapter.base_url
 
@@ -4606,6 +4817,8 @@ class PiAgentClient:
             if not plugin or not plugin.get("enabled") or plugin.get("uninstalled"):
                 raise PermissionError(f"Built-in plugin is disabled: {plugin_id}")
             return execute_artifact_tool(name, arguments, workspace=self.workspace)
+        if name == "generate_image":
+            return generate_image_artifact(arguments, workspace=self.workspace)
         if name in {
             "zotero_search",
             "zotero_fulltext",
@@ -4676,7 +4889,22 @@ class PiAgentClient:
             limit = _bounded_limit(arguments.get("result_limit"), default=8)
             hits: list[dict[str, Any]] = []
             selected_notebooks = self._selected_notebooks()
-            plugins = list(load_settings(self.workspace).get("plugins", []) or [])
+            settings = load_settings(self.workspace)
+            plugins = list(settings.get("plugins", []) or [])
+            jev_provider = next(
+                (
+                    dict(item)
+                    for item in list(settings.get("providers", []) or [])
+                    if isinstance(item, dict) and str(item.get("id", "")).strip().lower() == "jev"
+                ),
+                None,
+            )
+            jev_review_enabled = bool(
+                jev_provider
+                and jev_provider.get("enabled")
+                and jev_provider.get("api_key_configured")
+            )
+            retrieval_limit = min(20, max(limit, limit * 2)) if jev_review_enabled else limit
             zotero_plugin = next((item for item in plugins if str(item.get("id", "")) == "zotero"), None)
             zotero_enabled = bool(zotero_plugin and zotero_plugin.get("enabled") and not zotero_plugin.get("uninstalled"))
             zotero_notebooks = [
@@ -4697,7 +4925,7 @@ class PiAgentClient:
                     library_hits = search_evidence_store(
                         evidence_db,
                         query_text,
-                        limit=limit,
+                        limit=retrieval_limit,
                         context_mode="sentence",
                         embedding_provider=self.embedding_provider,
                         reranker=self.reranker,
@@ -4706,7 +4934,14 @@ class PiAgentClient:
                     for hit in library_hits:
                         hits.append({**hit, "library_index": library_index})
             hits.sort(key=lambda hit: float(hit.get("score", 0.0) or 0.0), reverse=True)
-            hits = hits[:limit]
+            hits = hits[:retrieval_limit]
+            jev_review = review_evidence_candidates(
+                workspace=str(self.workspace),
+                provider=jev_provider,
+                question=query_text,
+                hits=hits,
+            ) if search_evidence else {"hits": hits, "review": {"status": "not_run", "reason": "tool_scope"}}
+            hits = list(jev_review.get("hits", hits) or hits)[:limit]
             zotero_results = []
             if zotero_enabled and (name in {"kb_search", "zotero_search"} or zotero_notebooks):
                 collection_key = str(arguments.get("collection_key", ""))
@@ -4731,6 +4966,7 @@ class PiAgentClient:
                     for hit in hits
                 ],
                 "zotero": zotero_results,
+                "jev_review": dict(jev_review.get("review", {}) or {}),
             }
             scope_summary = self._knowledge_scope_summary(query_text)
             if scope_summary is not None:
@@ -4906,7 +5142,7 @@ class PiAgentClient:
                     return _build_self_assessment(list(context.history))
             with self._tool_history_lock:
                 return _build_self_assessment(list(self._tool_history))
-        raise ValueError(f"Unsupported ScanSci Pi tool: {name}")
+        raise ValueError(f"Unsupported ScanSci Harness Pi tool: {name}")
 
     def _selected_notebooks(self) -> list[dict[str, Any]]:
         if not self.notebook_ids:
@@ -5119,16 +5355,30 @@ def _compact_academic_search_result_for_model(
 
 
 def _compact_evidence_hit(hit: dict[str, Any]) -> dict[str, Any]:
-    return {
+    matched_text = " ".join(
+        str(hit.get("matched_text", hit.get("text", ""))).split()
+    )
+    compact = {
         "evidence_id": str(hit.get("evidence_id", "")),
         "doc_id": str(hit.get("doc_id", "")),
-        "paper": str(hit.get("paper", "")),
+        "paper": str(hit.get("paper") or hit.get("title") or hit.get("doc_id") or ""),
         "doi": str(hit.get("doi", "")),
         "section": str(hit.get("section", "")),
         "html_anchor": str(hit.get("html_anchor", "")),
-        "text": " ".join(str(hit.get("text", "")).split())[:1600],
+        "text": matched_text[:1600],
+        "matched_text": matched_text[:1600],
+        "context_before": " ".join(str(hit.get("context_before", "")).split())[:700],
+        "context_before_evidence_id": str(hit.get("context_before_evidence_id", "")),
+        "context_after": " ".join(str(hit.get("context_after", "")).split())[:700],
+        "context_after_evidence_id": str(hit.get("context_after_evidence_id", "")),
         "score": round(float(hit.get("score", 0.0) or 0.0), 6),
     }
+    if "jev_support_probability" in hit:
+        try:
+            compact["jev_support_probability"] = round(float(hit["jev_support_probability"]), 4)
+        except (TypeError, ValueError):
+            pass
+    return compact
 
 
 def _compact_verified_answer_for_model(payload: dict[str, Any]) -> dict[str, Any]:
@@ -5147,6 +5397,11 @@ def _compact_verified_answer_for_model(payload: dict[str, Any]) -> dict[str, Any
                 "section": str(item.get("section", "")),
                 "html_anchor": str(item.get("html_anchor", "")),
                 "exact_quote": " ".join(str(item.get("exact_quote", "")).split())[:700],
+                "matched_text": " ".join(str(item.get("matched_text", "")).split())[:1200],
+                "context_before": " ".join(str(item.get("context_before", "")).split())[:700],
+                "context_before_evidence_id": str(item.get("context_before_evidence_id", "")),
+                "context_after": " ".join(str(item.get("context_after", "")).split())[:700],
+                "context_after_evidence_id": str(item.get("context_after_evidence_id", "")),
                 "source_href": str(item.get("source_href", "")),
             }
         )

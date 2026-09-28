@@ -242,6 +242,18 @@ def test_academic_plan_does_not_duplicate_a_topic_with_only_a_generic_papers_suf
     assert all("papers" not in query for query in plan["query_variants"])
 
 
+def test_academic_plan_adds_precise_english_variants_for_mountain_soil_carbon_fractions() -> None:
+    plan = plan_academic_search("山地土壤碳组分")
+
+    assert plan["planner"] == "deterministic"
+    assert plan["query_variants"] == [
+        "soil organic carbon fractions mountain soils",
+        "alpine soil organic carbon fractions",
+        "soil organic carbon fractions alpine meadow",
+    ]
+    assert plan["required_terms"][-3:] == plan["query_variants"]
+
+
 def test_academic_plan_turns_a_quoted_chinese_request_into_time_scoped_english_metadata_queries() -> None:
     request = (
         "\u8bf7\u68c0\u7d22 2022 \u5e74\u4ee5\u6765\u5173\u4e8e\u300c"
@@ -514,7 +526,7 @@ def test_dblp_provider_normalizes_authors_doi_and_year_filter() -> None:
     assert papers[0].doi == "10.1000/dblp"
     assert papers[0].authors == ["Grace Hopper"]
     assert papers[0].source_id == "conf/sigir/example"
-    assert session.calls[0]["headers"]["User-Agent"].startswith("ScanSci-Pi/")
+    assert session.calls[0]["headers"]["User-Agent"].startswith("ScanSci-Harness/")
 
 
 def test_provider_retries_a_rate_limit_before_returning_semantic_scholar_results(monkeypatch) -> None:
@@ -582,3 +594,49 @@ def test_zero_result_search_tries_a_bounded_transparent_query_expansion() -> Non
     assert result["query_expansions"] == ["retrieval augmented generation faithfulness"]
     assert provider.queries == ["RAG factuality", "retrieval augmented generation faithfulness"]
     assert result["count"] == 1
+
+
+def test_writing_chat_client_bounds_interactive_cloud_timeouts(tmp_path, monkeypatch):
+    """The plan preview must not inherit the long managed-model budget."""
+
+    import scansci_html.research_agent as research_agent_module
+    from scansci_html.research_agent import ResearchAgentRuntime
+
+    settings = {
+        "model_roles": {"writing": "provider:glm:glm-4.7-flash"},
+        "providers": [
+            {
+                "id": "glm",
+                "name": "GLM",
+                "kind": "openai-compatible",
+                "auth_mode": "managed",
+                "enabled": True,
+                "base_url": "https://gateway.example",
+                "models": [{"id": "glm-4.7-flash"}, {"id": "glm-4.6"}],
+            }
+        ],
+    }
+    captured: list[dict[str, object]] = []
+    sentinel = object()
+
+    def fake_role_client(self, **kwargs):
+        captured.append(kwargs)
+        return sentinel
+
+    monkeypatch.setattr(research_agent_module, "load_settings", lambda _workspace: settings)
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_role_chat_client", fake_role_client)
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+
+    runtime._writing_chat_client(cloud_timeout_seconds=10.0)
+    runtime._writing_chat_client()
+
+    # Each managed call builds a primary and a fallback client; compare the
+    # primary (writing model) invocations across the two budgets.
+    primary_calls = [item for item in captured if item["model_id"] == "glm-4.7-flash"]
+    assert [item["timeout_seconds"] for item in primary_calls] == [10.0, 35.0]
+    # The bounded preview client must not replace the default long-timeout
+    # cascade in the managed cache.
+    assert len(runtime._managed_writing_clients) == 2

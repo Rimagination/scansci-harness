@@ -21,6 +21,7 @@ from .skill_security import scan_skill_packages
 
 
 SKILL_STATE_SCHEMA = "scansci.skill-state.v1"
+DISCOVERY_DECISION_SCHEMA = "scansci.discovery-decision.v1"
 MAX_SKILL_CATALOG_ITEMS = 64
 MAX_SKILL_CATALOG_BYTES = 16 * 1024
 MAX_SKILL_RESOURCE_BYTES = 64 * 1024
@@ -314,11 +315,30 @@ class ProgressiveSkillRuntime:
         matches = [item for item in matches if int(item["score"]) > 0]
         matches.sort(key=lambda item: (-int(item["score"]), str(item["id"])))
         selected = matches[:safe_limit]
+        for item in selected:
+            score_value = int(item["score"])
+            item["confidence"] = (
+                0.99 if score_value >= 1000 else
+                0.95 if score_value >= 500 else
+                0.72 if score_value >= 200 else
+                0.58 if score_value >= 100 else
+                0.0
+            )
         return {
+            "schema_version": "scansci.skill-discovery.v1",
             "query": needle,
             "limit": safe_limit,
             "count": len(selected),
             "skills": selected,
+            "decision": {
+                "schema_version": DISCOVERY_DECISION_SCHEMA,
+                "kind": "skill_selection",
+                "source": "local_heuristic",
+                "semantic_provider": "not_configured",
+                "fallback_used": True,
+                "candidate_count": len(matches),
+                "selected": [str(item["id"]) for item in selected],
+            },
         }
 
     def _assert_current_snapshot(self, record: Mapping[str, Any]) -> None:

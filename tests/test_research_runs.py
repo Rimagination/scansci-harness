@@ -16,6 +16,24 @@ from scansci_html.research_runs import RESEARCH_SCHEMA_NAME, RESEARCH_SCHEMA_VER
 from scansci_html.workspace import initialize_notebook, sync_sources_from_evidence_store
 
 
+@pytest.mark.parametrize("prior_events", [0, 81])
+def test_run_read_refreshes_advisor_without_rewriting_historical_events(tmp_path: Path, monkeypatch, prior_events):
+    import scansci_html.agent_advisor as advisor
+
+    store = ResearchRunStore(tmp_path / "workspace.sqlite")
+    run = store.create_run(notebook_id="", workflow_type="ask", title="Saved research", input_payload={}, stages=[StageSpec("deliver", "Deliver", "delivery")])
+    for index in range(prior_events):
+        store.append_event(run["run_id"], event_type="progress", summary=str(index))
+    store.append_event(run["run_id"], event_type="advisor.reviewed", summary="Original review", payload={"verdict": "needs_review"})
+    original = store.events_after(run["run_id"])
+    monkeypatch.setattr(advisor, "review_research_run", lambda payload: {"verdict": "passed", "run_id": payload["run_id"]})
+    refreshed = store.get_run(run["run_id"])
+    assert refreshed["advisor_report"]["verdict"] == "passed"
+    assert store.snapshot(run["run_id"])["snapshot"]["advisor_report"]["verdict"] == "passed"
+    assert store.events_after(run["run_id"]) == original
+    assert next(e for e in original if e["type"] == "advisor.reviewed")["payload"]["verdict"] == "needs_review"
+
+
 def test_research_store_upgrades_a_schema_v3_workspace_to_v4_without_rebuilding_data(tmp_path: Path):
     workspace = tmp_path / "workspace.sqlite"
     ResearchRunStore(workspace)
@@ -266,6 +284,9 @@ def test_direct_chat_uses_only_a_release_approved_managed_backup(tmp_path: Path,
         workspace=tmp_path / "workspace.sqlite",
         evidence_db=tmp_path / "evidence.sqlite",
     )
+    # Plain social turns now take the Host fast lane (see AGENTS.md), so these
+    # fallback-chain contracts are pinned on a forced capability-aware route.
+    monkeypatch.setattr(research_agent, "_should_route_through_pi", lambda *args, **kwargs: True)
     attempted_models: list[str] = []
 
     def fake_pi_events(chat_request, **_kwargs):
@@ -317,6 +338,9 @@ def test_direct_chat_never_switches_models_for_a_non_transient_error(tmp_path: P
         workspace=tmp_path / "workspace.sqlite",
         evidence_db=tmp_path / "evidence.sqlite",
     )
+    # Plain social turns now take the Host fast lane (see AGENTS.md), so these
+    # fallback-chain contracts are pinned on a forced capability-aware route.
+    monkeypatch.setattr(research_agent, "_should_route_through_pi", lambda *args, **kwargs: True)
     pi_models: list[str] = []
     compatibility_models: list[str] = []
 
@@ -349,6 +373,9 @@ def test_direct_chat_does_not_use_standby_model_before_quality_approval(tmp_path
         workspace=tmp_path / "workspace.sqlite",
         evidence_db=tmp_path / "evidence.sqlite",
     )
+    # Plain social turns now take the Host fast lane (see AGENTS.md), so these
+    # fallback-chain contracts are pinned on a forced capability-aware route.
+    monkeypatch.setattr(research_agent, "_should_route_through_pi", lambda *args, **kwargs: True)
     pi_models: list[str] = []
     compatibility_models: list[str] = []
 
@@ -411,6 +438,37 @@ def test_pi_chat_uses_only_a_release_approved_managed_backup(tmp_path: Path, mon
     fallback = next(event for event in events if event["type"] == "model.fallback")
     assert fallback["to_model"] == "Qwen/Qwen2.5-7B-Instruct"
     assert events[-1]["type"] == "done"
+
+
+def test_pi_managed_rate_limit_without_backup_does_not_replay_compatibility_transport(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    request = runtime._direct_chat_request({
+        "messages": [{"role": "user", "content": "你好"}],
+    })
+
+    def failed_pi(*_args, **_kwargs):
+        if False:
+            yield {}
+        raise PiAgentRunError(
+            "managed gateway limited",
+            failure={"code": "provider_rate_limited", "retryable": True},
+        )
+
+    monkeypatch.setattr(runtime, "_pi_model_events", failed_pi)
+
+    def must_not_replay(*_args, **_kwargs):
+        raise AssertionError("the same managed turn must not replay through compatibility transport")
+
+    monkeypatch.setattr(research_agent, "stream_chat_text", must_not_replay)
+
+    with pytest.raises(PiAgentRunError):
+        list(runtime._pi_events_with_compatibility_fallback(request))
 
 
 def test_structured_recovery_makes_invalid_paper_search_output_retryable() -> None:
@@ -1348,10 +1406,67 @@ def test_paper_search_download_searches_then_downloads_without_notebook(tmp_path
     assert completed["output_artifact"]["payload"]["papers"][0]["title"] == "Leaf economics"
 
 
+def test_paper_search_download_plans_english_alias_for_chinese_topic(tmp_path: Path, monkeypatch):
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+
+    monkeypatch.setattr(
+        runtime,
+        "_writing_chat_client",
+        lambda: (_ for _ in ()).throw(AssertionError("known bilingual plan must not wait for a model")),
+    )
+
+    plan = runtime._plan({
+        "workflow_type": "paper_search_download",
+        "input": {"query": "山地土壤碳组分"},
+    })
+
+    assert plan["search_query"] == "soil organic carbon fractions mountain soils"
+    assert plan["query_variants"] == [
+        "soil organic carbon fractions mountain soils",
+        "alpine soil organic carbon fractions",
+        "soil organic carbon fractions alpine meadow",
+    ]
+    assert plan["summary"].endswith("将使用“soil organic carbon fractions mountain soils”检索论文")
+
+
 def test_paper_search_download_requires_query_or_author(tmp_path: Path):
     runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
     with pytest.raises(ValueError, match="query or author"):
         runtime.start({"workflow_type": "paper_search_download"})
+
+
+@pytest.mark.parametrize("workflow", ["paper_search_download", "paper_download", "paper_download_batch"])
+def test_literature_workflow_preserves_pause_from_download_cancellation(tmp_path: Path, monkeypatch, workflow):
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    monkeypatch.setattr(runtime, "_submit", lambda _run_id: None)
+    run = runtime.start({"workflow_type": workflow, "query": "RAG", "identifier": "2005.11401", "identifiers": ["2005.11401"]})
+
+    def stop(*args, cancel_check, **kwargs):
+        runtime.pause(run["run_id"])
+        assert cancel_check()
+        raise research_agent._BatchCancelled("paused")
+
+    monkeypatch.setattr(research_agent, "search_papers_for_download", stop)
+    monkeypatch.setattr(research_agent, "download_papers", stop)
+    runtime._execute_run(run["run_id"])
+    paused = runtime.store.get_run(run["run_id"])
+    assert paused["status"] == "paused"
+    assert paused["resumable"] is True
+    assert paused["stages"][0]["status"] == "completed"
+    assert any(stage["status"] == "paused" for stage in paused["stages"])
+
+
+def test_single_paper_download_keeps_failure_visible(tmp_path: Path, monkeypatch):
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    monkeypatch.setattr(runtime, "_submit", lambda _run_id: None)
+    monkeypatch.setattr(research_agent, "download_papers", lambda *args, **kwargs: {
+        "ok": False, "files": [], "items": [{"error": "no public PDF"}], "failed": 1,
+    })
+    run = runtime.start({"workflow_type": "paper_download", "identifier": "2005.11401"})
+    runtime._execute_run(run["run_id"])
+    failed = runtime.store.get_run(run["run_id"])
+    assert failed["status"] == "failed"
+    assert "no public PDF" in failed["error"]["message"]
 
 
 def test_deep_research_plan_has_stage_summary_and_insufficient_evidence_is_not_verified(tmp_path: Path, monkeypatch):
@@ -2219,7 +2334,8 @@ def test_evidence_index_reports_vectors_migrated_from_a_previous_store(tmp_path:
     assert run["input"]["migration_sources"] == [str(tmp_path / "legacy-evidence.sqlite")]
 
 
-def test_automatic_evidence_index_defers_when_vectors_can_be_reused(tmp_path: Path, monkeypatch):
+@pytest.mark.parametrize("cached", [0, 80])
+def test_automatic_evidence_index_defers_for_new_and_reusable_libraries(tmp_path: Path, monkeypatch, cached):
     evidence_db = tmp_path / "evidence.sqlite"
     evidence_db.write_bytes(b"0" * 1_000_001)
     runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=evidence_db)
@@ -2235,8 +2351,8 @@ def test_automatic_evidence_index_defers_when_vectors_can_be_reused(tmp_path: Pa
         lambda *_args, **_kwargs: {
             "available": True,
             "total": 100,
-            "completed": 80,
-            "serving_vectors": 80,
+            "completed": cached,
+            "serving_vectors": cached,
             "ready": False,
         },
     )
@@ -2436,6 +2552,23 @@ def test_exact_doi_download_routes_to_strict_research_mode():
     assert mode == "research"
 
 
+def test_follow_up_context_contains_actual_search_candidates_for_summary():
+    run = {
+        "workflow_type": "academic_search", "input": {"query": "RAG evaluation"},
+        "output_artifact": {
+            "artifact_type": "academic_search_result", "summary": "24 candidates",
+            "payload": {"items": [
+                {"title": f"Paper {i}", "year": 2024, "doi": f"10.1234/{i}", "abstract": "abstract evidence", "source_records": "large raw provider response"}
+                for i in range(24)
+            ]},
+        },
+    }
+    context = ResearchAgentRuntime._run_conversation_context(run)
+    assert "Paper 23" in context and "10.1234/23" in context
+    assert "abstract evidence" in context and "not verified full text" in context
+    assert "source_records" not in context and "large raw provider response" not in context
+
+
 def test_follow_up_context_preserves_each_workflow_goal_and_mode():
     run = {
         "workflow_type": "novelty_check",
@@ -2476,6 +2609,48 @@ def test_follow_up_context_names_registered_task_files(tmp_path: Path):
     context = ResearchAgentRuntime._run_conversation_context(run)
 
     assert "Registered task files: reich-paper.pdf" in context
+
+
+def test_failed_follow_up_persists_a_failure_marker_and_keeps_context_clean(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """A model failure must not leave an answered-looking dangling user turn."""
+
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    run = runtime.store.create_run(
+        notebook_id="",
+        workflow_type="paper_download",
+        title="批量文献下载",
+        input_payload={"identifiers": ["10.1/example"]},
+        stages=[StageSpec("plan", "解析论文标识", "planner")],
+    )
+    def _fail(*_args, **_kwargs):
+        raise RuntimeError("gateway unreachable")
+
+    # Both transports are pinned so the test stays offline and deterministic
+    # regardless of which route the router picks for this turn.
+    monkeypatch.setattr(runtime, "_complete_with_pi", _fail)
+    monkeypatch.setattr(research_agent, "complete_chat_text", _fail)
+
+    with pytest.raises(Exception):
+        runtime.continue_run_conversation(run["run_id"], {"content": "请解释一下显著性水平。"})
+
+    messages = runtime.store.get_run(run["run_id"])["messages"]
+    assert [item["role"] for item in messages] == ["user", "assistant"]
+    failure_notice = messages[-1]
+    assert failure_notice["usage"].get("failure") is True
+    assert "重新发送或重试" in failure_notice["content"]
+
+    # The failure marker documents the broken turn for the user but must not
+    # leak back into the model context on the next attempt.
+    context = ResearchAgentRuntime._follow_up_messages(
+        runtime.store.get_run(run["run_id"])["messages"]
+    )
+    assert [item["role"] for item in context] == ["user"]
 
 
 @pytest.mark.parametrize(
@@ -2787,6 +2962,26 @@ def test_research_run_follow_ups_reuse_the_same_persistent_pi_session(tmp_path: 
         "user",
         "assistant",
     ]
+
+
+@pytest.mark.parametrize("code", ["provider_rate_limited", "timeout", "upstream_connection_failed", "model_transport_unavailable", "plain_timeout"])
+def test_follow_up_does_not_replay_provider_after_pi_recovery(tmp_path: Path, monkeypatch, code):
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    run = runtime.store.create_run(
+        notebook_id="", workflow_type="ask", title="Saved research",
+        input_payload={"question": "Prior research"}, stages=[StageSpec("deliver", "Deliver", "delivery")],
+    )
+    def failed_pi(*_args, **_kwargs):
+        if code == "plain_timeout":
+            raise TimeoutError("Whole Pi turn expired")
+        raise PiAgentRunError("provider unavailable", failure={"code": code, "retryable": True})
+    def must_not_replay(*_args, **_kwargs):
+        raise AssertionError("Pi already owns model-response recovery")
+    monkeypatch.setattr(runtime, "_complete_with_pi", failed_pi)
+    monkeypatch.setattr(research_agent, "complete_chat_text", must_not_replay)
+    with pytest.raises((PiAgentRunError, TimeoutError)):
+        runtime.continue_run_conversation(run["run_id"], {"content": "Summarize the saved result."})
+    assert runtime.store.get_run(run["run_id"])["title"] == "Saved research"
 
 
 def test_follow_up_final_user_turn_is_not_rejected_by_a_fixed_character_limit(tmp_path: Path, monkeypatch):

@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -52,6 +53,7 @@ def test_installed_models_reads_huggingface_snapshot(tmp_path: Path, monkeypatch
             "id": "Qwen/Qwen2.5-1.5B-Instruct",
             "name": "Qwen/Qwen2.5-1.5B-Instruct",
             "path": str(snapshot),
+            "source_root": str(tmp_path),
             "size_bytes": (snapshot / "config.json").stat().st_size + len(b"weights"),
             "ready": True,
             "kind": "chat",
@@ -62,6 +64,19 @@ def test_installed_models_reads_huggingface_snapshot(tmp_path: Path, monkeypatch
             "icon_url": "https://resources.modelscope.cn/avatar/4c40e6ce-1348-43b5-a3bc-6bafec6ac805.jpg",
         }
     ]
+
+
+def test_snapshot_prefers_complete_revision_over_newer_incomplete_revision(tmp_path: Path):
+    model_folder = tmp_path / "models--openbmb--MiniCPM-V-4.6-BNB"
+    complete = model_folder / "snapshots" / "complete"
+    incomplete = model_folder / "snapshots" / "incomplete"
+    complete.mkdir(parents=True)
+    incomplete.mkdir(parents=True)
+    (complete / "model.safetensors").write_bytes(b"weights")
+    os.utime(complete, (1, 1))
+    os.utime(incomplete, (2, 2))
+
+    assert local_model_market._snapshot(model_folder) == complete
 
 
 def test_delete_installed_model_removes_huggingface_cache(tmp_path: Path, monkeypatch):
@@ -245,6 +260,28 @@ def test_installed_minicpm_snapshot_is_vision(tmp_path: Path, monkeypatch):
     assert row["architecture"] == "MiniCPMV4_6ForConditionalGeneration"
 
 
+def test_installed_tts_snapshot_is_audio_only(tmp_path: Path, monkeypatch):
+    monkeypatch.setenv("SCANSCI_MODEL_ROOT", str(tmp_path))
+    snapshot = tmp_path / "Qwen3-TTS-12Hz-0.6B-Base"
+    snapshot.mkdir(parents=True)
+    (snapshot / "config.json").write_text(
+        json.dumps(
+            {
+                "model_type": "qwen3_tts",
+                "architectures": ["Qwen3TTSForConditionalGeneration"],
+                "audio_config": {"sample_rate": 24000},
+            }
+        ),
+        encoding="utf-8",
+    )
+    (snapshot / "model.safetensors").write_bytes(b"weights")
+
+    row = local_model_market.installed_models()[0]
+
+    assert row["kind"] == "audio"
+    assert row["capabilities"] == ["audio"]
+
+
 def test_installed_model_capabilities_are_not_collapsed_to_primary_kind(monkeypatch, tmp_path: Path):
     monkeypatch.setenv("SCANSCI_MODEL_ROOT", str(tmp_path))
     snapshot = tmp_path / "Qwen-multimodal"
@@ -290,6 +327,66 @@ def test_installed_vision_snapshot_is_exposed_with_vision_capability(monkeypatch
     assert provider["models"][0]["capabilities"] == ["reasoning", "coding", "vision"]
 
 
+def test_cached_local_model_stays_configured_while_its_drive_is_offline(monkeypatch, tmp_path: Path):
+    source_root = str(tmp_path / "detached-model-drive")
+    model_id = "openbmb/MiniCPM-V-4.6-BNB"
+    monkeypatch.setattr(app_settings, "installed_models", lambda: [])
+    monkeypatch.setattr(app_settings, "missing_configured_model_roots", lambda: [source_root])
+
+    settings = app_settings._normalize_settings(
+        {
+            "active_model": {"provider_id": "local-huggingface", "model_id": model_id},
+            "providers": [
+                {
+                    "id": "local-huggingface",
+                    "name": "本地 Hugging Face",
+                    "kind": "local",
+                    "enabled": True,
+                    "models": [
+                        {
+                            "id": model_id,
+                            "name": "MiniCPM-V 4.6",
+                            "capabilities": ["reasoning", "vision"],
+                            "source_root": source_root,
+                        }
+                    ],
+                }
+            ],
+        }
+    )
+
+    provider = next(item for item in settings["providers"] if item["id"] == "local-huggingface")
+    model = provider["models"][0]
+    assert settings["active_model"] == {"provider_id": "local-huggingface", "model_id": model_id}
+    assert provider["missing_roots"] == [source_root]
+    assert model["available"] is False
+    assert model["unavailable_reason"] == "模型目录当前不可访问"
+
+
+def test_tts_snapshot_is_not_exposed_as_a_chat_model(monkeypatch):
+    monkeypatch.setattr(
+        app_settings,
+        "installed_models",
+        lambda: [
+            {
+                "id": "Qwen3-TTS-12Hz-0.6B-Base",
+                "name": "Qwen3-TTS-12Hz-0.6B-Base",
+                "ready": True,
+                "format": "transformers",
+                "architecture": "Qwen3TTSForConditionalGeneration",
+                "model_type": "qwen3_tts",
+                "kind": "audio",
+                "capabilities": ["audio"],
+            }
+        ],
+    )
+
+    settings = app_settings._normalize_settings({})
+
+    assert not any(item["id"] == "local-huggingface" for item in settings["providers"])
+    assert app_settings._normalize_capabilities(["reasoning"], fallback="Qwen3-TTS-12Hz-0.6B-Base") == ["audio"]
+
+
 def test_complete_chat_snapshot_is_exposed_as_local_provider(monkeypatch):
     monkeypatch.setattr(
         app_settings,
@@ -327,6 +424,36 @@ def test_complete_chat_snapshot_is_exposed_as_local_provider(monkeypatch):
             "capabilities": ["reasoning", "coding"],
         }
     ]
+
+
+def test_installed_chat_snapshot_with_failed_runtime_probe_stays_visible(monkeypatch):
+    monkeypatch.setattr(
+        app_settings,
+        "installed_models",
+        lambda: [
+            {
+                "id": "Qwen/Qwen3.5-4B",
+                "name": "Qwen3.5 4B",
+                "ready": False,
+                "model_files_present": True,
+                "runtime_compatible": False,
+                "runtime_message": "GPU 显存不足，当前显存约 8.0 GB。",
+                "format": "transformers",
+                "architecture": "Qwen3_5ForConditionalGeneration",
+                "model_type": "qwen3_5",
+                "capabilities": ["chat", "vision"],
+            }
+        ],
+    )
+    monkeypatch.setattr(app_settings, "missing_configured_model_roots", lambda: [])
+
+    settings = app_settings._normalize_settings({})
+    provider = next(item for item in settings["providers"] if item["id"] == "local-huggingface")
+    model = provider["models"][0]
+
+    assert model["id"] == "Qwen/Qwen3.5-4B"
+    assert model["available"] is False
+    assert "显存不足" in model["unavailable_reason"]
 
 
 def test_direct_chat_starts_loopback_runtime_for_huggingface_model(tmp_path: Path, monkeypatch):
@@ -369,8 +496,8 @@ def test_paper_download_workflow_can_start_without_notebook(tmp_path: Path, monk
 def test_paper_download_falls_back_to_public_archives_without_cli(tmp_path: Path, monkeypatch):
     destination = tmp_path / "downloads" / "paper.pdf"
     monkeypatch.setattr(research_tools.shutil, "which", lambda _name: None)
-    monkeypatch.setattr(research_tools, "_public_fulltext_candidates", lambda _identifier, timeout: [{"url": "https://example.test/paper.pdf", "source": "Institutional repository"}])
-    monkeypatch.setattr(research_tools, "_download_public_pdf", lambda _candidate, output_dir, identifier, timeout: destination)
+    monkeypatch.setattr(research_tools, "_public_fulltext_candidates", lambda _identifier, timeout, **kwargs: [{"url": "https://example.test/paper.pdf", "source": "Institutional repository"}])
+    monkeypatch.setattr(research_tools, "_download_public_pdf", lambda _candidate, output_dir, identifier, timeout, **kwargs: destination)
 
     result = research_tools.download_paper("10.1000/example", workspace=tmp_path / "workspace.sqlite", strategy="gray_oa")
 
@@ -389,7 +516,7 @@ def test_arxiv_download_uses_the_authoritative_public_archive_even_when_cli_exis
     monkeypatch.setattr(
         research_tools,
         "_download_public_pdf",
-        lambda _candidate, output_dir, identifier, timeout: destination,
+        lambda _candidate, output_dir, identifier, timeout, **kwargs: destination,
     )
 
     result = research_tools.download_paper("1706.03762", workspace=tmp_path / "workspace.sqlite")
@@ -456,10 +583,10 @@ def test_public_archive_race_keeps_one_pdf_and_records_source_health(tmp_path: P
     monkeypatch.setattr(
         research_tools,
         "_public_fulltext_candidates",
-        lambda _identifier, timeout: candidates,
+        lambda _identifier, timeout, **kwargs: candidates,
     )
 
-    def fake_download(candidate, *, output_dir, identifier, timeout):
+    def fake_download(candidate, *, output_dir, identifier, timeout, **kwargs):
         if candidate["source"] == "Broken repository":
             raise RuntimeError("HTTP 404 Not Found")
         destination = Path(output_dir) / "staged.pdf"
@@ -516,12 +643,12 @@ def test_cli_success_without_a_pdf_falls_back_to_public_archive(tmp_path: Path, 
     monkeypatch.setattr(
         research_tools,
         "_public_fulltext_candidates",
-        lambda _identifier, timeout: [{"url": "https://example.test/paper.pdf", "source": "Open archive"}],
+        lambda _identifier, timeout, **kwargs: [{"url": "https://example.test/paper.pdf", "source": "Open archive"}],
     )
     monkeypatch.setattr(
         research_tools,
         "_download_public_pdf",
-        lambda _candidate, output_dir, identifier, timeout: destination,
+        lambda _candidate, output_dir, identifier, timeout, **kwargs: destination,
     )
 
     result = research_tools.download_paper("10.1000/example", workspace=tmp_path / "workspace.sqlite")

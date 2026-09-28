@@ -1,4 +1,4 @@
-"""Contracts for the v0.4.1 release candidate and its v0.4.0 Pi baseline."""
+"""Contracts for the v0.4.2 release candidate and its v0.4.0 Pi baseline."""
 
 from __future__ import annotations
 
@@ -31,8 +31,8 @@ def test_v041_is_the_single_p0_and_maps_exactly_to_the_task8_matrix() -> None:
     matrix = _json("bench/pi_capability_tasks.json")
 
     assert scope["schema_version"] == 2
-    assert scope["version"] == "0.4.1"
-    assert "v0.4.1" in scope["p0_objective"]
+    assert scope["version"] == "0.4.2"
+    assert "v0.4.2" in scope["p0_objective"]
     assert {
         item["id"]: (item["report_axis"], item["threshold"])
         for item in scope["acceptance"]
@@ -61,7 +61,13 @@ def test_architecture_docs_define_the_full_pi_boundary_and_evidence_contract() -
     required_by_document = {
         "AGENTS.md": ["Pi 与 Host 权责", "direct fallback", "protocol v7"],
         "docs/agent-startup.zh.md": ["10 轴", "fallback_count", "bundle.sha256"],
-        "docs/project-governance.zh.md": ["Pi 编排层", "Host 权威层", "fail-closed"],
+        "docs/project-governance.zh.md": [
+            "Pi 编排层",
+            "Host 权威层",
+            "fail-closed",
+            "最小内核与插件优先约束",
+            "唯一编排面",
+        ],
         "docs/research-agent-architecture.zh.md": ["scansci.pi-capabilities", "100%", "frozen_unverified"],
         "docs/agent-harness-p0-p2.zh.md": ["protocol v7", "report schema v2", "not_run"],
         "docs/implementation-plan.md": ["v0.4.0", "TaskContract v2", "research_runs schema v4"],
@@ -100,6 +106,15 @@ def test_mcp_p0_distinguishes_deferred_evidence_from_legacy_direct_compatibility
     runtime_source = (PROJECT_ROOT / "pi-runtime" / "src" / "main.ts").read_text(encoding="utf-8")
 
     assert "deferred stdio" in mcp["requirement"]
+    assert "不增加 Harness 分支" in mcp["requirement"]
     assert "旧 direct 配置只作显式兼容" in mcp["requirement"]
     assert "if (raw.deferred === true)" in runtime_source
     assert "ensureDirectConnected" in runtime_source
+
+
+def test_routing_p0_keeps_harness_thin_and_pi_as_the_only_model_orchestrator() -> None:
+    scope = _json("config/release-scope.json")
+    routing = next(item for item in scope["acceptance"] if item["id"] == "pi-routing")
+
+    assert "Harness 只做 turn/contract/lease 绑定和事件透传" in routing["requirement"]
+    assert "模型规划与工具循环唯一归 Pi" in routing["requirement"]

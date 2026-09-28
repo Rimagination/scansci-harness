@@ -182,17 +182,26 @@ class CapabilityLedger:
             name = _clean_name(item.get("name"))
             if not name:
                 continue
+            names = [name]
+            semantic_name = _clean_name(item.get("capability_id") or item.get("capability"))
+            if semantic_name and semantic_name not in names:
+                names.append(semantic_name)
             status = _clean_name(item.get("status")).casefold()
             if status in {"completed", "succeeded", "ok", "success"}:
-                ledger.mark_completed(name, result=item.get("result"))
+                for target in names:
+                    ledger.mark_completed(target, result=item.get("result"))
             elif status in {"failed", "error"}:
-                ledger.mark_failed(name, item.get("error", "tool failed"))
+                for target in names:
+                    ledger.mark_failed(target, item.get("error", "tool failed"))
             elif status in {"unavailable", "disabled"}:
-                ledger.mark_unavailable(name, item.get("error", "tool unavailable"))
+                for target in names:
+                    ledger.mark_unavailable(target, item.get("error", "tool unavailable"))
             elif status in {"declined", "denied"}:
-                ledger.mark_declined(name, item.get("error", "tool declined"))
+                for target in names:
+                    ledger.mark_declined(target, item.get("error", "tool declined"))
             else:
-                ledger.mark_invoked(name)
+                for target in names:
+                    ledger.mark_invoked(target)
         return ledger
 
     def _set_outcome(self, name: str, status: str, **details: Any) -> None:
@@ -240,18 +249,27 @@ class CapabilityLedger:
         payload = dict(event or {})
         event_type = _clean_name(payload.get("type")).casefold()
         name = _clean_name(payload.get("name"))
+        semantic_name = _clean_name(payload.get("capability_id") or payload.get("capability"))
+        names = [name]
+        if semantic_name and semantic_name not in names:
+            names.append(semantic_name)
         if event_type in {"status", "status.update"}:
             status = _clean_name(payload.get("status")).casefold()
             if status in {"tool_started", "tool_call_started"}:
-                self.mark_invoked(name)
+                for target in names:
+                    self.mark_invoked(target)
             elif status in {"tool_failed", "tool_call_failed"}:
-                self.mark_failed(name, payload.get("error", "tool failed"))
+                for target in names:
+                    self.mark_failed(target, payload.get("error", "tool failed"))
             elif status in {"tool_completed", "tool_call_completed"}:
-                self.mark_completed(name, result=payload.get("result"))
+                for target in names:
+                    self.mark_completed(target, result=payload.get("result"))
         elif event_type == "tool.completed":
-            self.mark_completed(name, result=payload.get("result"))
+            for target in names:
+                self.mark_completed(target, result=payload.get("result"))
         elif event_type == "tool.failed":
-            self.mark_failed(name, payload.get("error", "tool failed"))
+            for target in names:
+                self.mark_failed(target, payload.get("error", "tool failed"))
 
     def mark_recovery_attempt(self) -> None:
         self.recovery_attempts += 1

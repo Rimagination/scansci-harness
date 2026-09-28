@@ -26,7 +26,7 @@ WEB_ACCESS_SCHEMA_VERSION = "scansci.web-access.v1"
 _DEFAULT_PROXY_PORT = 3456
 _DEFAULT_TIMEOUT = 30.0
 _MAX_CONTENT_CHARS = 60_000
-_USER_AGENT = "ScanSci-Pi/0.2 web-access reader"
+_USER_AGENT = "ScanSci-Harness/0.2 web-access reader"
 _RISK_NOTICE = (
     "浏览器读取会使用当前 Chrome 的登录态；部分站点可能检测自动化并触发账号风控，"
     "本次操作仅读取公开或用户已授权页面，不执行点击、提交、上传或其他写入操作。"

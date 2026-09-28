@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import base64
 import hashlib
+import io
 import json
 from pathlib import Path
 import threading
@@ -10,12 +12,16 @@ from urllib.request import urlopen
 from zipfile import ZipFile
 
 import pytest
+from cryptography.hazmat.primitives import serialization
+from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 
 from scansci_html import local_runtime_component
 import scansci_html.local_transformers_runtime as local_transformers_runtime
 from scansci_html.app_update import AppUpdateService
 from scansci_html.local_runtime_component import LocalRuntimeComponent
+from scansci_html.local_runtime_compatibility import ModelCompatibilityStore
 from scansci_html.local_runtime_server import LocalRuntimeServer
+from scansci_html.manifest_trust import canonical_manifest_bytes
 from scansci_html.webapp import NotebookWebApp
 
 
@@ -26,6 +32,15 @@ def test_local_runtime_component_uses_configured_root(monkeypatch, tmp_path):
     component = LocalRuntimeComponent(manifest_url="")
 
     assert component.root == configured.resolve()
+
+
+def test_pagefile_error_guidance_does_not_recommend_freeing_gpu_vram():
+    message = LocalRuntimeComponent._actionable_runtime_message(
+        "页面文件太小，无法完成操作。 (os error 1455)"
+    )
+
+    assert "虚拟内存（页面文件）" in message
+    assert "显存" not in message
 
 
 def test_installed_component_is_preferred_even_when_source_has_torch(tmp_path: Path, monkeypatch) -> None:
@@ -86,6 +101,54 @@ def test_runtime_component_omits_new_state_flag_for_legacy_sidecar_cli(
     assert "--state-dir" not in probe["launch"]
 
 
+def test_runtime_component_clears_stale_probe_failure_after_success(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    model_id = "openbmb/MiniCPM-V-4.6-BNB"
+    snapshot = tmp_path / "snapshot"
+    snapshot.mkdir()
+    (snapshot / "config.json").write_text("{}", encoding="utf-8")
+    (snapshot / "model.safetensors").write_bytes(b"weights")
+    record = {
+        "id": model_id,
+        "path": str(snapshot),
+        "model_files_present": True,
+    }
+    component = LocalRuntimeComponent(root=tmp_path / "installed", manifest_url="")
+    compatibility = ModelCompatibilityStore(
+        component.root / "state" / "model-compatibility.json"
+    )
+    compatibility.record_failure(
+        record,
+        component_version=component.component_version,
+        error={"code": "model_probe_failed", "message": "temporary pagefile error"},
+    )
+    monkeypatch.setattr("scansci_html.local_model_market.installed_models", lambda: [record])
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args):
+            return False
+
+        def read(self, _limit):
+            return json.dumps(
+                {"choices": [{"message": {"content": "ready"}}]}
+            ).encode("utf-8")
+
+    monkeypatch.setattr(local_runtime_component, "urlopen", lambda *_args, **_kwargs: FakeResponse())
+    component._probe_generation("http://127.0.0.1:17863/v1", model_id)
+
+    entry = json.loads(
+        (component.root / "state" / "model-compatibility.json").read_text(encoding="utf-8")
+    )["models"][model_id]
+    assert entry["compatible"] is True
+    assert entry["generated"] is True
+    assert entry["generated_preview"] == "ready"
+
+
 def _component_manifest(tmp_path: Path) -> Path:
     archive = tmp_path / "runtime.zip"
     with ZipFile(archive, "w") as output:
@@ -106,6 +169,128 @@ def _component_manifest(tmp_path: Path) -> Path:
         encoding="utf-8",
     )
     return manifest
+
+
+def test_remote_runtime_manifest_requires_signature_when_release_key_is_pinned(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private = Ed25519PrivateKey.generate()
+    public = base64.b64encode(
+        private.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+    ).decode("ascii")
+    manifest = {
+        "schema_version": 1,
+        "id": "local-transformers",
+        "version": "1.2.0",
+        "windows": {
+            "url": "https://downloads.example.test/runtime.zip",
+            "sha256": "a" * 64,
+            "size": 42,
+        },
+    }
+    manifest["signature"] = {
+        "algorithm": "ed25519",
+        "key_id": "test",
+        "value": base64.b64encode(private.sign(canonical_manifest_bytes(manifest))).decode("ascii"),
+    }
+
+    class _ManifestResponse(io.BytesIO):
+        def __init__(self, payload: bytes) -> None:
+            super().__init__(payload)
+            self.headers = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            self.close()
+
+        def geturl(self) -> str:
+            return "https://downloads.example.test/runtime.json"
+
+    payload = json.dumps(manifest).encode("utf-8")
+    monkeypatch.setattr(
+        local_runtime_component,
+        "urlopen",
+        lambda *_args, **_kwargs: _ManifestResponse(payload),
+    )
+    component = LocalRuntimeComponent(
+        root=tmp_path / "installed",
+        manifest_url="https://downloads.example.test/runtime.json",
+        release_public_key=public,
+    )
+
+    assert component._read_json(component.manifest_url)["version"] == "1.2.0"
+
+    del manifest["signature"]
+    payload = json.dumps(manifest).encode("utf-8")
+    with pytest.raises(ValueError, match="缺少 Ed25519 签名"):
+        component._read_json(component.manifest_url)
+
+
+def test_remote_runtime_manifest_cannot_select_a_local_package(tmp_path: Path) -> None:
+    component = LocalRuntimeComponent(root=tmp_path / "installed", manifest_url="")
+
+    with pytest.raises(ValueError, match="HTTPS"):
+        component._validate_component_package(
+            {
+                "url": (tmp_path / "runtime.zip").as_uri(),
+                "sha256": "a" * 64,
+                "size": 42,
+            },
+            allow_file=False,
+            require_metadata=False,
+        )
+
+
+def test_runtime_component_sanitizes_manifest_version_before_building_download_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    component = LocalRuntimeComponent(root=tmp_path / "installed", manifest_url="")
+    observed: dict[str, Path] = {}
+
+    def stop_before_download(_package, archive, _expected, **_kwargs):
+        observed["archive"] = archive
+        raise RuntimeError("stop after path selection")
+
+    monkeypatch.setattr(component, "_acquire_package", stop_before_download)
+    with pytest.raises(RuntimeError, match="path selection"):
+        component._install_component_package(
+            {"version": "x/../../../../outside"},
+            {"sha256": "a" * 64},
+        )
+
+    archive = observed["archive"].resolve()
+    assert archive.parent == (component.root / "downloads").resolve()
+    assert ".." not in archive.name
+
+
+def test_runtime_component_rejects_multipart_aggregate_before_downloading(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    component = LocalRuntimeComponent(root=tmp_path / "installed", manifest_url="")
+    monkeypatch.setattr(
+        component,
+        "_download",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("download must not start")),
+    )
+    package = {
+        "sha256": "a" * 64,
+        "size": 1,
+        "parts": [
+            {"url": "https://downloads.example.test/part1", "sha256": "b" * 64, "size": 8},
+            {"url": "https://downloads.example.test/part2", "sha256": "c" * 64, "size": 8},
+        ],
+    }
+
+    with pytest.raises(ValueError, match="总大小"):
+        component._acquire_package(package, tmp_path / "runtime.zip", "a" * 64)
 
 
 def _multipart_component_manifest(tmp_path: Path) -> Path:
@@ -148,6 +333,87 @@ def test_runtime_component_installs_once_and_uses_active_pointer(tmp_path: Path,
     assert first["version"] == "1.2.0"
     assert second == tmp_path / "installed" / "versions" / "1.2.0" / "ScanSciLocalRuntime.exe"
     assert second.read_bytes() == b"runtime-binary"
+
+
+def test_same_version_install_repairs_a_missing_runtime_dependency(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        local_runtime_component,
+        "current_build_info",
+        lambda: {"frozen": True, "package_profile": "core"},
+    )
+    component = LocalRuntimeComponent(root=tmp_path / "installed", manifest_url=_component_manifest(tmp_path).as_uri())
+    component.install()
+    dependency = component.root / "versions" / "1.2.0" / "_internal" / "runtime.dat"
+    dependency.unlink()
+
+    result = component.install()
+
+    assert result["installed"] is True
+    assert dependency.read_bytes() == b"dependency"
+
+
+def test_failed_staged_runtime_validation_keeps_the_active_same_version(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        local_runtime_component,
+        "current_build_info",
+        lambda: {"frozen": True, "package_profile": "core"},
+    )
+    component = LocalRuntimeComponent(root=tmp_path / "installed", manifest_url=_component_manifest(tmp_path).as_uri())
+    component.install()
+    executable = component.ensure_installed()
+    assert executable is not None
+    executable.write_bytes(b"known-good-active-runtime")
+    monkeypatch.setattr(
+        component,
+        "_run_diagnostics",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(RuntimeError("staged diagnostics failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="所有自动下载通道均不可用"):
+        component.install()
+
+    assert component.ensure_installed() == executable
+    assert executable.read_bytes() == b"known-good-active-runtime"
+
+
+def test_runtime_component_rejects_casefolded_duplicate_archive_paths(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        local_runtime_component,
+        "current_build_info",
+        lambda: {"frozen": True, "package_profile": "core"},
+    )
+    archive = tmp_path / "runtime.zip"
+    with ZipFile(archive, "w") as output:
+        output.writestr("ScanSciLocalRuntime/ScanSciLocalRuntime.exe", b"runtime-binary")
+        output.writestr("ScanSciLocalRuntime/runtime.dat", b"first")
+        output.writestr("ScanSciLocalRuntime/RUNTIME.DAT", b"second")
+    manifest = tmp_path / "manifest.json"
+    manifest.write_text(
+        json.dumps(
+            {
+                "id": "local-transformers",
+                "version": "1.2.0",
+                "windows": {
+                    "url": archive.as_uri(),
+                    "sha256": hashlib.sha256(archive.read_bytes()).hexdigest(),
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+    component = LocalRuntimeComponent(root=tmp_path / "installed", manifest_url=manifest.as_uri())
+
+    with pytest.raises(RuntimeError, match="重复路径"):
+        component.install()
 
 
 def test_runtime_component_installs_from_verified_parts(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -218,6 +484,38 @@ def test_runtime_component_switches_to_a_healthy_manifest_fallback_and_reports_c
     assert report["preferred_url"] == healthy.as_uri()
     assert report["channels"][0]["valid"] is False
     assert report["channels"][1]["valid"] is True
+
+
+def test_runtime_component_switches_source_when_preferred_manifest_asset_is_missing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    healthy = _component_manifest(tmp_path)
+    broken = tmp_path / "broken-manifest.json"
+    broken_payload = json.loads(healthy.read_text(encoding="utf-8"))
+    broken_payload["windows"]["url"] = (tmp_path / "missing-runtime.zip").as_uri()
+    broken.write_text(json.dumps(broken_payload), encoding="utf-8")
+    monkeypatch.setattr(local_runtime_component, "_RUNTIME_RETRY_DELAYS_SECONDS", (0.0,))
+    monkeypatch.setattr(
+        local_runtime_component,
+        "current_build_info",
+        lambda: {
+            "frozen": True,
+            "package_profile": "core-without-embedded-fallback",
+            "runtime_manifest_url": broken.as_uri(),
+        },
+    )
+    component = LocalRuntimeComponent(
+        root=tmp_path / "installed",
+        fallback_manifest_url=healthy.as_uri(),
+    )
+
+    result = component.install()
+
+    assert result["installed"] is True
+    assert result["source"] == healthy.as_uri()
+    assert result["manifest_failures"][0]["url"] == broken.as_uri()
+    assert "missing-runtime.zip" in result["manifest_failures"][0]["error"]
 
 
 def test_runtime_component_extracts_deep_windows_paths_without_zip_extractall(
@@ -384,6 +682,9 @@ def test_runtime_component_download_resumes_an_existing_partial_file(
         def read(self, _size: int = -1) -> bytes:
             return next(self._chunks)
 
+        def geturl(self) -> str:
+            return "https://downloads.example.test/runtime.zip"
+
     def _urlopen(request, timeout=0):
         observed_ranges.append(request.get_header("Range"))
         assert timeout == 300
@@ -433,6 +734,9 @@ def test_runtime_component_retries_a_connection_drop_and_resumes_the_partial_fil
             self._read = True
             return self._payload
 
+        def geturl(self) -> str:
+            return "https://downloads.example.test/runtime.zip"
+
     def _urlopen(request, timeout=0):
         calls.append(request.get_header("Range"))
         assert timeout == 300
@@ -455,6 +759,39 @@ def test_runtime_component_retries_a_connection_drop_and_resumes_the_partial_fil
 
     assert calls == [None, "bytes=4-"]
     assert destination.read_bytes() == b"abcdefghij"
+    assert not Path(f"{destination}.download").exists()
+
+
+def test_runtime_component_download_removes_a_permanently_oversized_partial(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    destination = tmp_path / "runtime.zip"
+
+    class _Response:
+        headers: dict[str, str] = {}
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def read(self, _size: int = -1) -> bytes:
+            if getattr(self, "_read", False):
+                return b""
+            self._read = True
+            return b"12345"
+
+        def geturl(self) -> str:
+            return "https://downloads.example.test/runtime.zip"
+
+    monkeypatch.setattr(local_runtime_component, "urlopen", lambda *_args, **_kwargs: _Response())
+    monkeypatch.setattr(local_runtime_component, "_MAX_RUNTIME_DOWNLOAD_BYTES", 4)
+
+    with pytest.raises(ValueError, match="超出允许范围"):
+        LocalRuntimeComponent._download("https://downloads.example.test/runtime.zip", destination)
+
     assert not Path(f"{destination}.download").exists()
 
 
@@ -573,6 +910,7 @@ def test_outdated_managed_runtime_stays_visible_but_requires_component_update(
         root=root,
         manifest_url="https://downloads.example.com/local-transformers.json",
         component_version="1.0.4",
+        minimum_component_version="1.0.4",
     )
 
     status = component.status()
@@ -580,11 +918,51 @@ def test_outdated_managed_runtime_stays_visible_but_requires_component_update(
     assert status["installed"] is True
     assert status["version"] == "1.0.3"
     assert status["required_version"] == "1.0.4"
+    assert status["recommended_version"] == "1.0.4"
     assert status["update_available"] is True
     assert status["update_required"] is True
     assert Path(status["executable"]) == executable.resolve()
     with pytest.raises(RuntimeError, match="1.0.4"):
         component.ensure_installed()
+
+
+def test_compatible_runtime_can_run_while_a_newer_component_is_available(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        local_runtime_component,
+        "current_build_info",
+        lambda: {"frozen": True, "package_profile": "core"},
+    )
+    root = tmp_path / "installed"
+    executable = root / "versions" / "1.0.0" / "ScanSciLocalRuntime.exe"
+    executable.parent.mkdir(parents=True)
+    executable.write_bytes(b"compatible-runtime")
+    (root / "active.json").write_text(
+        json.dumps(
+            {
+                "id": "local-transformers",
+                "version": "1.0.0",
+                "executable": str(executable.relative_to(root)),
+                "sha256": "0" * 64,
+            }
+        ),
+        encoding="utf-8",
+    )
+    component = LocalRuntimeComponent(
+        root=root,
+        manifest_url="https://downloads.example.com/local-transformers.json",
+    )
+
+    status = component.status()
+
+    assert status["required_version"] == "1.0.0"
+    assert status["recommended_version"] == "1.0.4"
+    assert status["minimum_version"] == "1.0.0"
+    assert status["update_available"] is True
+    assert status["update_required"] is False
+    assert component.ensure_installed() == executable.resolve()
 
 
 def test_runtime_component_rejects_corrupt_part(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -627,6 +1005,8 @@ def test_packaged_core_uses_public_runtime_manifest_fallback_when_build_info_is_
     component = LocalRuntimeComponent(root=tmp_path)
 
     assert component.manifest_url == local_runtime_component.DEFAULT_RUNTIME_MANIFEST_URL
+    assert local_runtime_component.DEFAULT_RUNTIME_MANIFEST_FALLBACK_URLS[0] in component.manifest_urls
+    assert "local-runtime-v1.0.0" in component.status()["manifest_release_url"]
     assert component.status()["install_available"] is True
 
 

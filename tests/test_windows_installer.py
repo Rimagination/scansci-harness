@@ -5,6 +5,8 @@ from __future__ import annotations
 import importlib.util
 from pathlib import Path
 
+import pytest
+
 
 ROOT = Path(__file__).resolve().parents[1]
 SPEC = importlib.util.spec_from_file_location(
@@ -37,3 +39,25 @@ def test_verifier_retains_the_end_of_an_inno_log(tmp_path: Path) -> None:
 
 def test_uninstall_wait_accepts_an_already_removed_directory(tmp_path: Path) -> None:
     assert verifier._wait_for_uninstall(tmp_path / "already-gone", timeout=0.01) is True
+
+
+def test_verifier_rejects_an_unsigned_installer_before_execution(tmp_path: Path, monkeypatch) -> None:
+    installer = tmp_path / "ScanSci-setup.exe"
+    installer.write_bytes(b"unsigned-installer")
+    executed: list[list[str]] = []
+    monkeypatch.setattr(verifier, "_authenticode_status", lambda _path: "NotSigned")
+    monkeypatch.setattr(
+        verifier,
+        "_run",
+        lambda command, **_kwargs: executed.append(list(command)) or {"exit_code": 0},
+    )
+
+    with pytest.raises(RuntimeError, match="will not be executed"):
+        verifier.verify_installer(
+            installer=installer,
+            expected_build_id="build-test",
+            expected_version="0.4.2",
+            require_signature=True,
+        )
+
+    assert executed == []

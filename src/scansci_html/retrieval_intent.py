@@ -42,6 +42,37 @@ _REQUEST_TOPIC_TAIL_RE = re.compile(
     r"(?:\s*(?:，|,|。|;|；).*)?$",
     re.IGNORECASE,
 )
+_PAPER_DOWNLOAD_AUTHOR_TITLE_RE = re.compile(
+    r"(?<![\u4e00-\u9fff])(?P<author>[\u4e00-\u9fff]{2,4})(?:院士|教授|研究员|学者|博士|老师)"
+)
+_PAPER_DOWNLOAD_AUTHOR_LABEL_RE = re.compile(
+    r"(?:作者|作者是|学者|院士|教授|研究员)\s*[:：]?\s*"
+    r"(?P<author>[\u4e00-\u9fff]{2,6}|[A-Z][A-Za-z .'-]{2,80})",
+    re.IGNORECASE,
+)
+_PAPER_DOWNLOAD_AUTHOR_OF_RE = re.compile(
+    r"(?P<author>[\u4e00-\u9fff]{2,4})\s*的\s*"
+    r"(?:TOP\s*\d+|前\s*[一二三四五六七八九十百\d]+)?\s*"
+    r"(?:高?被引|引用(?:次数|量)?)?(?:论文|文献|文章|研究)",
+    re.IGNORECASE,
+)
+_PAPER_DOWNLOAD_TOP_RE = re.compile(r"TOP\s*(?P<limit>\d{1,3})", re.IGNORECASE)
+_PAPER_DOWNLOAD_CITED_RE = re.compile(
+    r"(?:高?被引|引用(?:次数|量)?|cited(?:\s+by)?|citations?)",
+    re.IGNORECASE,
+)
+_PAPER_DOWNLOAD_ORG_RE = re.compile(r"中国科学院|中科院")
+_PAPER_DOWNLOAD_REQUEST_PREFIX_RE = re.compile(
+    r"^(?:请帮我|帮我|请|麻烦)?\s*"
+    r"(?:下载|获取|检索|搜索|查找|寻找|查询|找|列出|整理|筛选)?\s*"
+    r"(?:关于|有关)?\s*",
+    re.IGNORECASE,
+)
+_PAPER_DOWNLOAD_NOISE_RE = re.compile(
+    r"(?:请帮我|帮我|请|麻烦|下载|获取|检索|搜索|查找|寻找|查询|找|列出|整理|筛选|关于|有关|相关|的)"
+    r"|(?:论文|文献|文章|资料|研究|papers?|articles?|literature)",
+    re.IGNORECASE,
+)
 
 
 def compile_retrieval_intent(value: Any, *, kind: str = "academic") -> dict[str, Any]:
@@ -70,6 +101,11 @@ def compile_retrieval_intent(value: Any, *, kind: str = "academic") -> dict[str,
             "extraction_method": "identifier",
             "quality_policy": "identifier_exact",
         }
+    paper_download_fields = (
+        _extract_paper_download_fields(raw_query)
+        if str(kind or "").strip().lower() == "paper_download"
+        else {}
+    )
     labelled = _LABELED_SUBJECT_RE.search(raw_query)
     topical = _TOPIC_SENTENCE_RE.search(raw_query) or _TOPIC_OBJECT_RE.search(raw_query)
     if labelled:
@@ -80,6 +116,12 @@ def compile_retrieval_intent(value: Any, *, kind: str = "academic") -> dict[str,
         stripped = _clean(_SEARCH_PREFIX_RE.sub("", raw_query))
         subject, method = (stripped or raw_query), "request_fallback"
     subject = _clean(_SEARCH_PREFIX_RE.sub("", subject))
+    if paper_download_fields.get("author_only"):
+        subject = str(paper_download_fields["author"])
+        method = "paper_download_author"
+    elif paper_download_fields.get("topic"):
+        subject = str(paper_download_fields["topic"])
+        method = "paper_download_author_topic"
     # A labelled field is already the user's explicit research subject. Keep
     # its display form and derive the shorter retrieval variant below.
     if not labelled:
@@ -100,7 +142,9 @@ def compile_retrieval_intent(value: Any, *, kind: str = "academic") -> dict[str,
         else _unique_query_variants([normalized_subject, subject])[:3]
     )
     required_terms = [term for term in variants if _is_specific_concept(term)]
-    return {
+    if paper_download_fields.get("author_only"):
+        required_terms = []
+    result = {
         "schema_version": 1,
         "kind": str(kind or "academic"),
         "raw_query": raw_query,
@@ -112,6 +156,64 @@ def compile_retrieval_intent(value: Any, *, kind: str = "academic") -> dict[str,
         "extraction_method": method,
         "quality_policy": "topic_relevance" if required_terms else "provider_ranking",
     }
+    result.update(paper_download_fields)
+    if paper_download_fields.get("author_only"):
+        result["intent_type"] = "author"
+    return result
+
+
+def _extract_paper_download_fields(value: str) -> dict[str, Any]:
+    """Extract author/ranking fields from a natural-language download request.
+
+    Paper downloads have a structured author route. Keeping this small parser
+    model-free prevents an instruction such as “下载某院士 TOP10 被引论文”
+    from being sent verbatim to a broad discovery search.
+    """
+
+    raw = _clean(value)
+    author_source = _PAPER_DOWNLOAD_ORG_RE.sub("", raw)
+    author_source = _PAPER_DOWNLOAD_REQUEST_PREFIX_RE.sub("", author_source)
+    author = ""
+    author_match: re.Match[str] | None = None
+    title_match = _PAPER_DOWNLOAD_AUTHOR_TITLE_RE.search(author_source)
+    if title_match:
+        author = _clean(title_match.group("author"))
+        author_match = title_match
+    else:
+        label_match = _PAPER_DOWNLOAD_AUTHOR_LABEL_RE.search(raw)
+        if label_match:
+            author = _clean(label_match.group("author"))
+            author_match = label_match
+        else:
+            of_match = _PAPER_DOWNLOAD_AUTHOR_OF_RE.search(author_source)
+            if of_match:
+                author = _clean(of_match.group("author"))
+                author_match = of_match
+    if not author:
+        return {}
+
+    limit_match = _PAPER_DOWNLOAD_TOP_RE.search(raw)
+    limit = int(limit_match.group("limit")) if limit_match else None
+    sort = "cited_by_count" if _PAPER_DOWNLOAD_CITED_RE.search(raw) else ""
+
+    residual = author_source
+    if author_match:
+        residual = residual[: author_match.start()] + residual[author_match.end() :]
+    residual = _PAPER_DOWNLOAD_TOP_RE.sub(" ", residual)
+    residual = _PAPER_DOWNLOAD_CITED_RE.sub(" ", residual)
+    residual = _PAPER_DOWNLOAD_NOISE_RE.sub(" ", residual)
+    residual = _clean(residual).strip(" ，,。！？?；;、:：()（）[]【】")
+    fields: dict[str, Any] = {
+        "author": author,
+        "author_only": not bool(residual),
+    }
+    if residual:
+        fields["topic"] = residual
+    if sort:
+        fields["sort"] = sort
+    if limit is not None:
+        fields["limit"] = limit
+    return fields
 
 
 def _extract_identifier(value: str) -> str:

@@ -6,12 +6,14 @@ import argparse
 import json
 import os
 from pathlib import Path
+import re
 import shutil
 import subprocess
 import sys
 from threading import Thread
 import time
 from typing import Any
+from urllib.request import urlopen
 
 from .app_update import AppUpdateService
 from .app_settings import load_settings
@@ -57,6 +59,58 @@ def _default_desktop_paths() -> tuple[Path, Path]:
     if data_directory is None:
         return Path("workspace.sqlite"), Path("html-papers") / "evidence.sqlite"
     return data_directory / "workspace.sqlite", data_directory / "evidence.sqlite"
+
+
+def _signal_update_startup_ready(server: Any | None = None) -> bool:
+    """Confirm a replacement only after its exact build and loopback API are healthy."""
+
+    raw_target = os.environ.get("SCANSCI_UPDATE_READY_FILE", "").strip()
+    token = os.environ.get("SCANSCI_UPDATE_READY_TOKEN", "").strip()
+    expected_version = os.environ.get("SCANSCI_UPDATE_EXPECTED_VERSION", "").strip()
+    if not raw_target and not token and not expected_version:
+        return False
+    if server is None or not re.fullmatch(r"[0-9a-f]{32}", token):
+        return False
+    build_version = str(current_build_info().get("version", "")).strip()
+    if not expected_version or build_version != expected_version:
+        return False
+
+    local_app_data = os.environ.get("LOCALAPPDATA")
+    local_root = Path(local_app_data) if local_app_data else Path.home() / "AppData" / "Local"
+    updates_root = (local_root / "ScanSciPi" / "updates").resolve()
+    target = Path(raw_target).expanduser().resolve()
+    try:
+        target.relative_to(updates_root)
+    except ValueError:
+        return False
+
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
+        try:
+            with urlopen(f"http://127.0.0.1:{server.server_port}/api/health", timeout=2) as response:
+                health = json.loads(response.read(1_000_001).decode("utf-8"))
+            if health.get("status") == "ok" and str(health.get("version", "")) == expected_version:
+                break
+        except (OSError, ValueError, json.JSONDecodeError):
+            time.sleep(0.1)
+    else:
+        return False
+
+    temporary = target.with_name(f"{target.name}.{os.getpid()}.tmp")
+    try:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        payload = {
+            "pid": os.getpid(),
+            "token": token,
+            "version": expected_version,
+            "ready_at": int(time.time()),
+        }
+        temporary.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+        temporary.replace(target)
+    except OSError:
+        temporary.unlink(missing_ok=True)
+        return False
+    return True
 
 
 def _warm_active_managed_model(workspace: Path) -> None:
@@ -283,6 +337,14 @@ def _enable_borderless_window_resize(window: Any) -> bool:
     _apply_borderless_resize_style(hwnd)
     _set_windows_window_chrome(hwnd, maximized=False)
     return True
+
+
+def _confirm_desktop_started(window: Any, server: Any) -> bool:
+    """Signal updater readiness only after pywebview has initialized its GUI loop."""
+
+    resized = _enable_borderless_window_resize(window)
+    _signal_update_startup_ready(server)
+    return resized
 
 
 class ScanSciDesktopApi:
@@ -684,8 +746,9 @@ def launch_desktop(
             js_api=ScanSciDesktopApi(webview, workspace=workspace, update_service=updates, relaunch_args=relaunch_args),
         )
         if webview_module is None:
-            webview.start(_enable_borderless_window_resize, args=(native_window,))
+            webview.start(_confirm_desktop_started, args=(native_window, server))
         else:
+            _signal_update_startup_ready(server)
             webview.start()
     finally:
         server.shutdown()

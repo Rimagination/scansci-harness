@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import quote, unquote, urlsplit
 
+from .external_capabilities import provider_manifest_for_record
 
 CAPABILITY_SCHEMA_VERSION = "scansci.capability.v1"
 CAPABILITY_LEASE_SCHEMA_VERSION = "scansci.capability-lease.v1"
@@ -62,7 +63,7 @@ _BUILTIN_CAPABILITIES: tuple[CapabilityDescriptor, ...] = (
         output_kinds=("paper_metadata",),
     ),
     CapabilityDescriptor(
-        "search_local_evidence", "tool", "本地证据检索", "从当前证据库检索可定位的原文证据。",
+        "search_local_evidence", "tool", "本地证据检索", "从当前证据库检索命中句、前后句和可定位的原文锚点。",
         evidence_policy="required", output_kinds=("evidence_findings",),
     ),
     CapabilityDescriptor(
@@ -93,6 +94,11 @@ _BUILTIN_CAPABILITIES: tuple[CapabilityDescriptor, ...] = (
         "create_presentation", "artifact", "演示文稿产物", "创建可编辑科研演示文稿。",
         risk_level="reversible", evidence_policy="required", output_kinds=("artifact",),
         timeout_seconds=300, idempotent=False,
+    ),
+    CapabilityDescriptor(
+        "generate_image", "artifact", "图像生成", "使用已配置的图像模型生成并保存图片。",
+        risk_level="reversible", evidence_policy="assist", output_kinds=("image", "artifact"),
+        timeout_seconds=300, idempotent=False, subagent_allowed=False,
     ),
     CapabilityDescriptor(
         "search_web", "tool", "公开网络检索", "查询公开网页；结果需要区分线索与已验证证据。",
@@ -198,6 +204,7 @@ _CANONICAL_TOOL_IDS: tuple[str, ...] = (
     "create_pdf",
     "create_spreadsheet",
     "create_presentation",
+    "generate_image",
     "compile_latex",
     "edit_section",
     "edit_slide",
@@ -213,6 +220,7 @@ _REVERSIBLE_TOOL_IDS = {
     "create_pdf",
     "create_spreadsheet",
     "create_presentation",
+    "generate_image",
     "compile_latex",
     "edit_section",
     "edit_slide",
@@ -224,6 +232,7 @@ _SUBAGENT_DENIED_TOOL_IDS = {
     "create_pdf",
     "create_spreadsheet",
     "create_presentation",
+    "generate_image",
     "compile_latex",
     "edit_section",
     "edit_slide",
@@ -358,6 +367,9 @@ def capability_catalog(
             continue
         deferred = bool(raw.get("deferred", False))
         enabled = bool(raw.get("enabled", False)) and not bool(raw.get("uninstalled", False))
+        literature = str(raw.get("provider_kind") or raw.get("connector_kind") or "").strip().lower() == "literature"
+        reversible_authorized = bool(raw.get("allow_reversible", False)) or bool(raw.get("allow_write", False))
+        manifest = provider_manifest_for_record(raw)
         descriptors.append(
             CapabilityDescriptor(
                 id=f"mcp:{server_id}",
@@ -366,17 +378,21 @@ def capability_catalog(
                 description=str(raw.get("description") or "External MCP capability."),
                 source="mcp",
                 status="ready" if enabled else "disabled",
-                risk_level="reversible" if bool(raw.get("allow_write", False)) else "read_only",
+                risk_level="reversible" if reversible_authorized else "read_only",
                 requires_approval=bool(raw.get("allow_write", False)),
                 subagent_allowed=not bool(raw.get("allow_write", False)),
                 evidence_policy="assist",
-                output_kinds=("mcp_result",),
+                output_kinds=("mcp_result", "paper", "paper_metadata", "artifact") if literature else ("mcp_result",),
                 timeout_seconds=120,
-                idempotent=not bool(raw.get("allow_write", False)),
+                idempotent=not reversible_authorized,
             ).to_dict()
         )
         descriptors[-1]["activation_mode"] = "deferred" if deferred else "direct"
         descriptors[-1]["transport"] = str(raw.get("transport") or "stdio")
+        descriptors[-1]["provider_kind"] = str(raw.get("provider_kind") or raw.get("connector_kind") or "general")
+        descriptors[-1]["semantic_capabilities"] = sorted(
+            str(key) for key in dict(manifest.get("capability_aliases", {}) or {})
+        )
     return {
         "schema_version": CAPABILITY_SCHEMA_VERSION,
         "workspace": str(Path(workspace).resolve()),

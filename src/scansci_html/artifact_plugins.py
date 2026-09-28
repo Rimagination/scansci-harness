@@ -1,4 +1,4 @@
-"""Built-in office and LaTeX artifact tools for the ScanSci Pi runtime.
+"""Built-in office and LaTeX artifact tools for the ScanSci Harness Pi runtime.
 
 The tools in this module are deliberately narrow.  They only create artifacts
 under the local ScanSci workspace and never expose an arbitrary shell or an

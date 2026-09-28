@@ -149,8 +149,16 @@ def build_agent_system_context(
     chat_mode: str,
     selected_ids: list[str],
     selection: SkillSelection | None = None,
+    capability_profile: str = "auto",
 ) -> tuple[str, list[dict[str, Any]]]:
-    """Build compact Skill discovery context and stage explicit Skill preloads."""
+    """Build bounded Skill context and stage explicit Skill preloads.
+
+    The runtime keeps the full safe catalogue for ``search_skills``.  The
+    model prompt receives only a small view: ordinary chat defers catalogue
+    discovery, focused modes receive a short candidate list, and workflows
+    receive the bounded catalogue.  This keeps discovery available without
+    charging every turn for every installed Skill description.
+    """
 
     resolved = selection or SkillSelection(
         selected_ids=tuple(selected_ids),
@@ -162,8 +170,34 @@ def build_agent_system_context(
         records=records,
         priority_ids=(*resolved.explicit_ids, *resolved.inferred_ids),
     )
-    catalog = progressive.catalog()
-    catalog_by_id = {str(item["id"]).lower(): item for item in catalog}
+    full_catalog = progressive.catalog()
+    profile = str(capability_profile or "auto").strip().lower()
+    if profile not in {"auto", "minimal", "focused", "workflow"}:
+        profile = "auto"
+    if profile == "auto":
+        profile = {
+            "general": "minimal",
+            "knowledge": "focused",
+            "writing": "focused",
+            "slides": "workflow",
+        }.get(str(chat_mode or "general").strip().lower(), "focused")
+    catalog_limit = {"minimal": 0, "focused": 16, "workflow": 64}[profile]
+    full_catalog_by_id = {str(item["id"]).lower(): item for item in full_catalog}
+    priority_catalog = [
+        full_catalog_by_id[identifier.lower()]
+        for identifier in (*resolved.explicit_ids, *resolved.inferred_ids)
+        if identifier.lower() in full_catalog_by_id
+    ]
+    priority_ids = {str(item["id"]).lower() for item in priority_catalog}
+    deferred_catalog = [
+        item for item in full_catalog
+        if str(item["id"]).lower() not in priority_ids
+    ]
+    catalog = [
+        *priority_catalog,
+        *deferred_catalog[: max(0, catalog_limit - len(priority_catalog))],
+    ]
+    catalog_by_id = full_catalog_by_id
     selected: list[dict[str, Any]] = []
     skill_contracts: list[str] = []
     skill_hints: list[str] = []
@@ -234,6 +268,11 @@ def build_agent_system_context(
         "slides": "幻灯片模式：围绕所选模板和源材料生成或修改演示文稿，不把生成过程当作演示主题。",
     }
     catalog_text = json.dumps(catalog, ensure_ascii=False, separators=(",", ":")) if catalog else "[]"
+    catalog_instruction = (
+        "普通对话不预载完整目录；如任务需要其他 Skill，请调用 `search_skills` 按需发现。"
+        if profile == "minimal"
+        else "目录是当前安全清单的有界候选集；仍需按需加载 Skill 主说明。"
+    )
     system = f"""你是 ScanSci，是桌面研究工作台“ScanSci | 搜索科学”中的 Agent，编排由 Pi SDK 驱动，不是脱离软件独立运行的裸模型。
 
 运行信息：ScanSci {build.get('version', '')}，构建 {build.get('build_id', 'source')}；当前底层模型为 {model_id}，服务为 {provider_name}。
@@ -246,6 +285,7 @@ def build_agent_system_context(
 - ScanSci 可检查本机 Zotero 的实际连接状态，并在内置插件启用时检索条目、附件全文和导出引用；不要把“没有任意文件系统工具”误说成“无法访问 Zotero”。
 - 用户输入 $ 可显式选择已安装 Skill。以下是有界、已安装、已启用且通过安全门禁的 Skill 目录：
 <skill_catalog>{catalog_text}</skill_catalog>
+- Skill 目录策略：{catalog_instruction}
 - `search_skills` 可检索目录；`load_skill` 可按需加载 Skill 主说明或包内文本资源。推断提示不是激活，只有显式选择会预载全文。
 - ScanSci 还提供论文获取、模型服务、本地模型与 MCP 管理。不要声称已浏览网页、修改文件、下载论文或生成 PPT，除非本轮确实收到相应工具结果。
 

@@ -148,20 +148,33 @@ def build_model_health(
         elif provider_kind == "local" or str(provider.get("auth_mode", "")).strip().lower() == "local":
             local_id = str(provider.get("local_model_id", "")).strip()
             if local_id and local_id in local_rows:
-                local_health[local_id] = _local_model_health(
+                runtime_health = _local_model_health(
                     local_rows[local_id],
                     installed=installed,
                     ollama=ollama_status,
                     runtime_checks=checks,
                 )
+                local_health = {
+                    str(model.get("id", "")).strip(): runtime_health
+                    for model in provider_models
+                    if str(model.get("id", "")).strip()
+                }
             elif provider_id == "local-huggingface":
                 for model in provider_models:
                     model_id = str(model.get("id", "")).strip()
                     snapshot = installed.get(model_id)
-                    if snapshot and bool(snapshot.get("ready")) and snapshot.get("runtime_compatible") is not False:
+                    unavailable_reason = str(model.get("unavailable_reason") or "").strip()
+                    if snapshot and (snapshot.get("runtime_compatible") is False or model.get("available") is False):
+                        local_health[model_id] = _entry(
+                            "incompatible",
+                            detail=str(unavailable_reason or snapshot.get("runtime_message") or "当前运行组件不能执行这个模型格式。"),
+                            capabilities=_capabilities(model),
+                            runtime="local-huggingface",
+                        )
+                    elif snapshot and bool(snapshot.get("ready")):
                         local_health[model_id] = _entry("ready", detail="模型已下载并通过本地格式检查。", capabilities=_capabilities(model), runtime="local-huggingface")
-                    elif snapshot and snapshot.get("runtime_compatible") is False:
-                        local_health[model_id] = _entry("incompatible", detail=str(snapshot.get("runtime_message") or "当前运行组件不能执行这个模型格式。"), capabilities=_capabilities(model), runtime="local-huggingface")
+                    elif unavailable_reason:
+                        local_health[model_id] = _entry("unavailable", detail=unavailable_reason, capabilities=_capabilities(model), runtime="local-huggingface")
                     else:
                         local_health[model_id] = _entry("not_installed", detail="尚未发现已完成校验的本地模型。", capabilities=_capabilities(model), runtime="local-huggingface")
             else:
@@ -176,7 +189,7 @@ def build_model_health(
                     provider_detail = "本地模型已就绪。"
                 elif any(status in READY_STATUSES for status in statuses):
                     provider_status = "partial"
-                    provider_detail = "部分本地模型可用；未就绪模型不会出现在对话选择器。"
+                    provider_detail = "部分本地模型可用；未就绪模型会在选择器中显示原因。"
                 else:
                     # local_health is guaranteed non-empty here, so all
                     # statuses are non-ready: the provider is unavailable.

@@ -93,6 +93,53 @@ class _DynamicToolHandler(BaseHTTPRequestHandler):
         return
 
 
+class _RateLimitedAfterToolHandler(_DynamicToolHandler):
+    def do_POST(self) -> None:
+        if len(type(self).request_payloads) != 2:
+            return super().do_POST()
+        payload = json.loads(self.rfile.read(int(self.headers.get("Content-Length", "0"))))
+        type(self).request_payloads.append(payload)
+        body = json.dumps({"error": {"code": "rate_limit_exceeded", "message": "429 temporary rate limit"}}).encode()
+        self.send_response(429)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+
+def test_native_pi_retry_preserves_completed_tool_result(tmp_path: Path) -> None:
+    _RateLimitedAfterToolHandler.request_payloads = []
+    server, thread = _serve(_RateLimitedAfterToolHandler)
+    client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    try:
+        events = list(client.stream_chat(
+            provider_kind="openai-compatible", base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            api_key="fixture", model_id="fixture-model",
+            messages=[{"role": "user", "content": "Inspect the workspace."}],
+            thinking_level="off", task_mode="general",
+            task_contract={
+                **_TASK_CONTRACT_V2, "contract_id": "retry-after-tool", "autonomy": "read_only",
+                "risk_level": "read_only", "allowed_tools": ["inspect_workspace"],
+                "initial_tools": [], "required_tool_groups": [],
+                "initial_tool_budget": 3, "max_tool_budget": 6,
+            },
+            session_id="retry-after-tool", timeout_seconds=60,
+        ))
+    finally:
+        client.close()
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+    assert events[-1]["type"] == "done"
+    assert sum(e.get("type") == "tool.completed" and e.get("name") == "inspect_workspace" for e in events) == 1
+    assert sum(e.get("status") == "retry" for e in events) == 1
+    assert len(_RateLimitedAfterToolHandler.request_payloads) == 4
+    before, after = _RateLimitedAfterToolHandler.request_payloads[2:]
+    completed_tools = lambda payload: [m for m in payload["messages"] if m["role"] == "tool"]
+    assert completed_tools(before) == completed_tools(after)
+    assert completed_tools(after)
+
+
 class _InventoryCaptureHandler(BaseHTTPRequestHandler):
     request_payloads: list[dict[str, object]] = []
 
@@ -493,6 +540,18 @@ def test_sidecar_starts_bootstrap_only_then_additively_activates_an_authorized_t
     assert third == second
     assert "search_web" not in third
     assert any(item.get("type") == "tool.completed" and item.get("name") == "inspect_workspace" for item in events)
+    searches = [
+        item for item in events
+        if item.get("type") == "status"
+        and item.get("status") == "tool_catalog_searched"
+        and item.get("name") == "search_tools"
+    ]
+    assert searches
+    decision = dict(dict(searches[-1].get("details", {}) or {}).get("decision", {}) or {})
+    assert decision["schema_version"] == "scansci.discovery-decision.v1"
+    assert decision["source"] == "local_heuristic"
+    assert decision["fallback_used"] is True
+    assert decision["threshold"] == 0.65
     assert events[-1]["type"] == "done"
     inventory = events[-1]["stats"]["toolInventory"]
     assert inventory["registered"] == 5
@@ -619,17 +678,26 @@ def test_additive_activation_survives_the_next_turn_in_the_same_session(tmp_path
         "initial_tools": [],
         "initial_tool_budget": 3,
         "max_tool_budget": 6,
+        "recovery_budget": 2,
+        "model_token_budget": 48_000,
+        "max_model_token_budget": 192_000,
     }
     try:
         first = list(client.stream_chat(
-            messages=[{"role": "user", "content": "Discover the workspace tool."}],
+            messages=[
+                {"role": "system", "content": "Use the first-turn response policy."},
+                {"role": "user", "content": "Discover the workspace tool."},
+            ],
             task_contract={**contract, "contract_id": "continuity-first", "goal": "first"},
             **common,
         ))
         second = list(client.stream_chat(
-            messages=[{"role": "user", "content": "Continue with the same tool inventory."}],
+            messages=[
+                {"role": "system", "content": "Use the second-turn response policy."},
+                {"role": "user", "content": "Continue with the same tool inventory."},
+            ],
             task_contract={**contract, "contract_id": "continuity-second", "goal": "second"},
-            **common,
+            **{**common, "thinking_level": "high", "task_mode": "knowledge"},
         ))
     finally:
         client.close()
@@ -653,6 +721,11 @@ def test_additive_activation_survives_the_next_turn_in_the_same_session(tmp_path
     assert resumed_surface == activated_surface
     assert "search_web" not in resumed_surface
     assert next(event for event in second if event.get("type") == "session")["resumed"] is True
+    assert any(
+        message.get("role") == "user"
+        and "Discover the workspace tool." in str(message.get("content"))
+        for message in _PersistentActivationHandler.request_payloads[2]["messages"]
+    )
     assert first[-1]["type"] == "done"
     assert second[-1]["type"] == "done"
 

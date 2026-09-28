@@ -1,8 +1,8 @@
 """Local, redacted configuration for the ScanSci desktop workbench.
 
 The configuration file deliberately contains no credentials.  Provider API keys
-are stored through the operating-system keyring and the web API exposes only a
-boolean indicating whether a key is available.
+are resolved from a launch environment variable first and the operating-system
+keyring second; the web API exposes only redacted availability metadata.
 """
 
 from __future__ import annotations
@@ -13,12 +13,20 @@ import json
 import os
 from pathlib import Path
 import re
+import tempfile
 from typing import Any
 
-from .local_model_market import QWEN3_ASR_LEGACY_MODEL_ID, QWEN3_ASR_NATIVE_MODEL_ID, installed_models
+from .local_model_market import (
+    QWEN3_ASR_LEGACY_MODEL_ID,
+    QWEN3_ASR_NATIVE_MODEL_ID,
+    installed_models,
+    missing_configured_model_roots,
+)
 
 from .builtin_skills import default_skill_records
 from .artifact_plugins import default_plugin_records, enrich_builtin_plugins
+from .external_capabilities import host_policy_defaults, normalize_provider_manifest
+from .jev_client import DEFAULT_ENDPOINT as JEV_DEFAULT_ENDPOINT
 from .vector_storage import configure_vector_index_root
 
 
@@ -37,6 +45,30 @@ _DEEPSEEK_PROVIDER_ID = "deepseek"
 _DEEPSEEK_FLASH_MODEL_ID = "deepseek-v4-flash"
 _DEEPSEEK_PRO_MODEL_ID = "deepseek-v4-pro"
 _DEEPSEEK_LEGACY_MODEL_IDS = frozenset({"deepseek-chat", "deepseek-reasoner"})
+_OPENCODE_GO_PROVIDER_ID = "opencode-go"
+_OPENCODE_GO_BASE_URL = "https://opencode.ai/zen/go/v1"
+_JEV_PROVIDER_ID = "jev"
+_ZHIPU_PROVIDER_ID = "zhipu"
+_ZHIPU_STANDARD_BASE_URL = "https://open.bigmodel.cn/api/paas/v4"
+_ZHIPU_CODING_PLAN_BASE_URL = "https://open.bigmodel.cn/api/coding/paas/v4"
+_PROVIDER_API_KEY_ENV_ALIASES: dict[str, tuple[str, ...]] = {
+    "openai": ("OPENAI_API_KEY",),
+    "anthropic": ("ANTHROPIC_API_KEY",),
+    "gemini": ("GEMINI_API_KEY", "GOOGLE_API_KEY"),
+    "openrouter": ("OPENROUTER_API_KEY",),
+    "opencode-go": ("OPENCODE_API_KEY",),
+    "nvidia": ("NVIDIA_API_KEY",),
+    "deepseek": ("DEEPSEEK_API_KEY",),
+    "dashscope": ("DASHSCOPE_API_KEY",),
+    "zai": ("ZAI_API_KEY",),
+    "zhipu": ("ZHIPU_API_KEY",),
+    "moonshot": ("MOONSHOT_API_KEY",),
+    "minimax": ("MINIMAX_API_KEY",),
+    "siliconflow": ("SILICONFLOW_API_KEY",),
+    "modelscope": ("MODELSCOPE_API_TOKEN", "MODELSCOPE_API_KEY"),
+    "volcengine": ("VOLCENGINE_API_KEY",),
+    "jev": ("TYPESAFE_API_KEY",),
+}
 _STORAGE_ENV_BASELINE: dict[str, str | None] = {}
 _STORAGE_ENV_LAST_APPLIED: dict[str, str | None] = {}
 
@@ -46,12 +78,16 @@ def _provider_preset(
     name: str,
     *,
     category: str,
+    logo: str | None = None,
     base_url: str = "",
     kind: str = "openai-compatible",
     summary: str = "填写 API 地址与密钥后可读取服务商的模型列表。",
     models: list[dict[str, Any]] | None = None,
     auth_mode: str = "key",
     model_listing: bool = True,
+    api_surface: str = "chat_completions",
+    standard_base_url: str | None = None,
+    coding_plan_base_url: str = "",
 ) -> dict[str, Any]:
     """Describe a credential-free provider card shown by Model Services.
 
@@ -61,16 +97,13 @@ def _provider_preset(
     wrong host.
     """
 
-    return {
+    result = {
         "id": identifier,
         "name": name,
-        "logo": identifier,
+        "logo": logo or identifier,
         "kind": kind,
         "base_url": base_url,
-        # Keep the current production behavior explicit.  Operators may opt
-        # a provider into Responses through the settings payload only after
-        # confirming that the endpoint supports it.
-        "api_surface": "chat_completions",
+        "api_surface": api_surface,
         "responses_enabled": False,
         "category": category,
         "summary": summary,
@@ -78,6 +111,15 @@ def _provider_preset(
         "model_listing": model_listing,
         "models": models or [_model_preset("chat-model", "通用对话模型", group=name, capabilities=["reasoning"])],
     }
+    if coding_plan_base_url:
+        result.update(
+            {
+                "standard_base_url": standard_base_url or base_url,
+                "coding_plan_base_url": coding_plan_base_url,
+                "coding_plan_enabled": False,
+            }
+        )
+    return result
 
 
 def _model_preset(
@@ -117,6 +159,40 @@ _MANAGED_MODEL_PRESETS = [
 _DEEPSEEK_MODEL_PRESETS = [
     _model_preset(_DEEPSEEK_FLASH_MODEL_ID, "DeepSeek V4 Flash", group="DeepSeek", capabilities=["reasoning", "tool", "coding"]),
     _model_preset(_DEEPSEEK_PRO_MODEL_ID, "DeepSeek V4 Pro", group="DeepSeek", capabilities=["reasoning", "tool", "coding"]),
+]
+
+
+# OpenCode Go exposes one subscription endpoint while routing different model
+# families through the API surface documented by OpenCode.  Keep the catalog
+# here so a new installation is immediately usable after the user saves a key;
+# the transport layer resolves the endpoint from the selected model ID.
+_OPENCODE_GO_MODEL_PRESETS = [
+    _model_preset("grok-4.6", "Grok 4.6", group="Grok", capabilities=["reasoning", "tool", "coding"]),
+    _model_preset("glm-5.3-flash", "GLM-5.3 Flash", group="GLM", capabilities=["reasoning", "tool", "coding"]),
+    _model_preset("glm-5.3", "GLM-5.3", group="GLM", capabilities=["reasoning", "tool", "coding"]),
+    _model_preset("glm-5.2", "GLM-5.2", group="GLM", capabilities=["reasoning", "tool", "coding"]),
+    _model_preset("glm-5.1", "GLM-5.1", group="GLM", capabilities=["reasoning", "tool", "coding"]),
+    _model_preset("gpt-5.6-luna", "GPT-5.6 Luna", group="GPT", capabilities=["reasoning", "tool", "coding"]),
+    _model_preset("kimi-k3", "Kimi K3", group="Kimi", capabilities=["reasoning", "tool", "coding"]),
+    _model_preset("kimi-k2.7-code", "Kimi K2.7 Code", group="Kimi", capabilities=["reasoning", "tool", "coding"]),
+    _model_preset("kimi-k2.6", "Kimi K2.6", group="Kimi", capabilities=["reasoning", "tool", "coding"]),
+    _model_preset("longcat-2.0", "LongCat 2.0", group="LongCat", capabilities=["reasoning", "tool", "coding"]),
+    _model_preset("mimo-v2.5", "MiMo V2.5", group="MiMo", capabilities=["reasoning", "tool", "coding"]),
+    _model_preset("mimo-v2.5-pro", "MiMo V2.5 Pro", group="MiMo", capabilities=["reasoning", "tool", "coding"]),
+    _model_preset("minimax-m3", "MiniMax M3", group="MiniMax", capabilities=["reasoning", "tool", "coding"]),
+    _model_preset("minimax-m2.7", "MiniMax M2.7", group="MiniMax", capabilities=["reasoning", "tool", "coding"]),
+    _model_preset("minimax-m2.5", "MiniMax M2.5", group="MiniMax", capabilities=["reasoning", "tool", "coding"]),
+    _model_preset("muse-spark-1.2-contributor", "Muse Spark 1.2 Contributor", group="Muse", capabilities=["reasoning", "tool", "coding"]),
+    _model_preset("qwen3.8-max", "Qwen3.8 Max", group="Qwen", capabilities=["reasoning", "tool", "coding"]),
+    _model_preset("qwen3.8-flash", "Qwen3.8 Flash", group="Qwen", capabilities=["reasoning", "tool", "coding"]),
+    _model_preset("qwen3.7-max", "Qwen3.7 Max", group="Qwen", capabilities=["reasoning", "tool", "coding"]),
+    _model_preset("qwen3.7-plus", "Qwen3.7 Plus", group="Qwen", capabilities=["reasoning", "tool", "coding"]),
+    _model_preset("qwen3.6-plus", "Qwen3.6 Plus", group="Qwen", capabilities=["reasoning", "tool", "coding"]),
+    _model_preset("deepseek-v4-pro", "DeepSeek V4 Pro", group="DeepSeek", capabilities=["reasoning", "tool", "coding"]),
+    _model_preset("deepseek-v4-flash", "DeepSeek V4 Flash", group="DeepSeek", capabilities=["reasoning", "tool", "coding"]),
+    _model_preset("deepseek-v4-flash-vision-exp", "DeepSeek V4 Flash Vision Exp", group="DeepSeek", capabilities=["reasoning", "vision", "tool", "coding"]),
+    _model_preset("hy4-preview", "HY4 Preview", group="HY", capabilities=["reasoning", "tool", "coding"]),
+    _model_preset("hy3", "HY3", group="HY", capabilities=["reasoning", "tool", "coding"]),
 ]
 
 
@@ -163,16 +239,19 @@ def managed_fallback_model_ids(model_id: str) -> tuple[str, ...]:
 
 _PROVIDER_PRESETS: list[dict[str, Any]] = [
     _provider_preset(_MANAGED_PROVIDER_ID, _MANAGED_PROVIDER_NAME, category="ScanSci", base_url=_MANAGED_GATEWAY_BASE_URL, summary="Built-in managed models. Upstream credentials are held only by ScanSci's gateway.", auth_mode="managed", model_listing=False, models=_MANAGED_MODEL_PRESETS),
+    _provider_preset(_JEV_PROVIDER_ID, "JEV", category="Pi 决策层", logo="typesafe", base_url=JEV_DEFAULT_ENDPOINT, api_surface="jev_systemone", summary="JEV 作为 Pi 的结构化决策层，按需参与工具与 Skill 流程。", model_listing=False, models=[_model_preset("jev-decision-layer", "JEV Decision Layer", group="JEV", capabilities=["reasoning", "tool"])]),
     _provider_preset("openai", "OpenAI", category="国际模型", base_url="https://api.openai.com/v1", models=[_model_preset("gpt-5.2", "GPT-5.2", group="GPT", capabilities=["reasoning", "vision", "tool", "coding"]), _model_preset("gpt-5.2-mini", "GPT-5.2 mini", group="GPT", capabilities=["reasoning", "vision", "tool", "coding"]), _model_preset("text-embedding-3-large", "text-embedding-3-large", group="Embeddings", capabilities=["embedding"])]),
     _provider_preset("anthropic", "Anthropic", category="国际模型", kind="anthropic-compatible", base_url="https://api.anthropic.com/v1", models=[_model_preset("claude-sonnet-4-6", "Claude Sonnet 4.6", group="Claude", capabilities=["reasoning", "vision", "tool", "coding"]), _model_preset("claude-opus-4-6", "Claude Opus 4.6", group="Claude", capabilities=["reasoning", "vision", "tool", "coding"])]),
     _provider_preset("gemini", "Google Gemini", category="国际模型", base_url="https://generativelanguage.googleapis.com/v1beta/openai", models=[_model_preset("gemini-3.1-pro-preview", "Gemini 3.1 Pro", group="Gemini", capabilities=["reasoning", "vision", "tool", "coding", "audio"]), _model_preset("gemini-3.5-flash", "Gemini 3.5 Flash", group="Gemini", capabilities=["reasoning", "vision", "tool"]), _model_preset("gemini-embedding-001", "Gemini Embedding", group="Embeddings", capabilities=["embedding"])]),
     _provider_preset("vertex-ai", "Google Vertex AI", category="国际模型", summary="Vertex AI 通常需要网关或企业项目凭据；请粘贴其兼容 API 地址。", models=[_model_preset("gemini-3.1-pro-preview", "Gemini 3.1 Pro", group="Gemini", capabilities=["reasoning", "vision", "tool", "coding"]), _model_preset("text-embedding-005", "Text Embedding", group="Embeddings", capabilities=["embedding"])]),
     _provider_preset("openrouter", "OpenRouter", category="模型聚合", base_url="https://openrouter.ai/api/v1", models=[_model_preset("openai/gpt-5.2", "OpenAI GPT-5.2", group="OpenAI", capabilities=["reasoning", "vision", "tool", "coding"]), _model_preset("google/gemini-3.1-pro-preview", "Gemini 3.1 Pro", group="Google", capabilities=["reasoning", "vision", "tool"]), _model_preset("deepseek/deepseek-r1", "DeepSeek R1", group="DeepSeek", capabilities=["reasoning", "coding"])]),
+    _provider_preset(_OPENCODE_GO_PROVIDER_ID, "OpenCode Go", category="订阅模型", base_url=_OPENCODE_GO_BASE_URL, api_surface="auto", summary="OpenCode Go 订阅接口；在 OpenCode Zen 开通套餐后粘贴 API Key，ScanSci 会按模型自动选择接口。", models=_OPENCODE_GO_MODEL_PRESETS),
     _provider_preset("nvidia", "NVIDIA NIM", category="国际模型", base_url="https://integrate.api.nvidia.com/v1", models=[_model_preset("meta/llama-3.3-70b-instruct", "Llama 3.3 70B Instruct", group="Meta", capabilities=["reasoning", "tool", "coding"]), _model_preset("nvidia/llama-3.2-nv-embedqa-1b-v2", "NV-EmbedQA", group="Embeddings", capabilities=["embedding"])]),
     _provider_preset(_DEEPSEEK_PROVIDER_ID, "DeepSeek", category="国内直连", base_url="https://api.deepseek.com", models=_DEEPSEEK_MODEL_PRESETS),
     _provider_preset("dashscope", "阿里云百炼", category="国内直连", base_url="https://dashscope.aliyuncs.com/compatible-mode/v1", models=[_model_preset("qwen-plus", "Qwen Plus", group="Qwen", capabilities=["reasoning", "tool", "coding"]), _model_preset("qwen-vl-plus", "Qwen VL Plus", group="Qwen", capabilities=["reasoning", "vision"]), _model_preset("text-embedding-v3", "Text Embedding V3", group="Embeddings", capabilities=["embedding"]), _model_preset("gte-rerank-v2", "GTE Rerank V2", group="Rerankers", capabilities=["reranking"])]),
     _provider_preset("zai", "Z.ai", category="国内直连", base_url="https://api.z.ai/api/paas/v4", models=[_model_preset("glm-4.7", "GLM-4.7", group="GLM", capabilities=["reasoning", "tool", "coding"]), _model_preset("glm-4.6v", "GLM-4.6V", group="GLM", capabilities=["reasoning", "vision"]), _model_preset("embedding-3", "Embedding-3", group="Embeddings", capabilities=["embedding"])]),
-    _provider_preset("zhipu", "智谱开放平台", category="国内直连", base_url="https://open.bigmodel.cn/api/paas/v4", models=[_model_preset("glm-4.7-flash", "GLM-4.7 Flash（免费）", group="GLM", context_window="200K", capabilities=["reasoning", "tool", "coding"]), _model_preset("glm-4-plus", "GLM-4 Plus", group="GLM", capabilities=["reasoning", "tool", "coding"]), _model_preset("glm-4v-plus", "GLM-4V Plus", group="GLM", capabilities=["reasoning", "vision"]), _model_preset("embedding-3", "Embedding-3", group="Embeddings", capabilities=["embedding"])]),
+    _provider_preset("zhipu", "智谱开放平台", category="国内直连", base_url=_ZHIPU_STANDARD_BASE_URL, standard_base_url=_ZHIPU_STANDARD_BASE_URL, coding_plan_base_url=_ZHIPU_CODING_PLAN_BASE_URL, models=[_model_preset("glm-4.7-flash", "GLM-4.7 Flash（免费）", group="GLM", context_window="200K", capabilities=["reasoning", "tool", "coding"]), _model_preset("glm-4-plus", "GLM-4 Plus", group="GLM", capabilities=["reasoning", "tool", "coding"]), _model_preset("glm-4v-plus", "GLM-4V Plus", group="GLM", capabilities=["reasoning", "vision"]), _model_preset("embedding-3", "Embedding-3", group="Embeddings", capabilities=["embedding"])]),
+    _provider_preset("paratera", "并行智算云（Paratera）", category="国内直连", base_url="https://llmapi.paratera.com/v1", summary="并行智算云模型服务；支持通义万相与 GLM CogView 文生图。", model_listing=False, models=[_model_preset("GLM-CogView3-Flash", "GLM-CogView3-Flash（限时免费）", group="GLM CogView", capabilities=["image"]), _model_preset("WanX2.1-T2I-Plus", "WanX2.1-T2I-Plus", group="通义万相", capabilities=["image"])]),
     _provider_preset("moonshot", "Kimi", category="国内直连", base_url="https://api.moonshot.ai/v1", models=[_model_preset("kimi-k2.5", "Kimi K2.5", group="Kimi", capabilities=["reasoning", "vision", "tool", "coding"]), _model_preset("moonshot-v1-128k", "Moonshot 128K", group="Kimi", capabilities=["reasoning", "tool"])]),
     _provider_preset("minimax", "MiniMax", category="国内直连", base_url="https://api.minimaxi.com/v1", models=[_model_preset("MiniMax-M2.7", "MiniMax M2.7", group="MiniMax", capabilities=["reasoning", "tool", "coding"]), _model_preset("MiniMax-VL-01", "MiniMax VL", group="MiniMax", capabilities=["reasoning", "vision"])]),
     _provider_preset("xiaomi-mimo", "Xiaomi MiMo", category="国内直连", models=[_model_preset("mimo-v2-flash", "MiMo V2 Flash", group="MiMo", capabilities=["reasoning", "tool", "coding"])]),
@@ -214,10 +293,24 @@ _LOCAL_MODEL_PRESETS: list[dict[str, Any]] = [
         "runtime": "ollama",
         "base_url": "http://127.0.0.1:11434/v1",
         "model_id": "minicpm-v4.6",
+        "context_window": "32K",
         "capabilities": ["vision"],
         # Transformers is ScanSci's default local route for native HF vision,
         # ASR, embeddings, and reranking. Keep this as an opt-in external
         # connection so a second MiniCPM checkpoint is never pulled silently.
+        "enabled": False,
+    },
+    {
+        "id": "ollama-qwen3.5-4b",
+        "name": "Ollama · Qwen3.5 4B（工具推理）",
+        "runtime": "ollama",
+        "base_url": "http://127.0.0.1:11434/v1",
+        "model_id": "qwen3.5:4b",
+        "context_window": "32K",
+        "capabilities": ["reasoning", "tool", "coding"],
+        # Qwen3.5 is an optional user-managed Ollama model.  It is enabled
+        # after the user selects it or an existing workspace explicitly opts
+        # into the route; ScanSci never pulls it implicitly.
         "enabled": False,
     },
     {
@@ -296,6 +389,7 @@ _DEFAULT_SETTINGS: dict[str, Any] = {
         "reranking": "auto",
         "vision": "",
         "audio": "",
+        "image": "auto",
         "slides": "provider:scansci-managed:glm-4.7-flash",
     },
     "document_processing": {
@@ -342,6 +436,9 @@ _DEFAULT_SETTINGS: dict[str, Any] = {
             # Vector indexes are isolated per knowledge base.  Empty keeps the
             # legacy location next to the application evidence database.
             "vector_index": "",
+        },
+        "updates": {
+            "auto_check": True,
         },
     },
     "skills": default_skill_records(),
@@ -507,7 +604,12 @@ def configure_managed_glm_4_7_flash(workspace: str | Path) -> dict[str, Any]:
 
 
 def set_provider_api_key(workspace: str | Path, provider_id: str, value: str) -> dict[str, Any]:
-    """Store a provider key in the OS credential manager, not the JSON file."""
+    """Store a provider key in the OS credential manager, not the JSON file.
+
+    A non-empty provider environment variable is an explicit, read-only
+    override.  Refuse writes and deletes while it is active so the settings UI
+    cannot create a misleading keyring value that will never be used.
+    """
 
     settings = _normalize_settings(_read_raw_settings(workspace))
     provider = next((item for item in settings["providers"] if item["id"] == provider_id), None)
@@ -517,6 +619,11 @@ def set_provider_api_key(workspace: str | Path, provider_id: str, value: str) ->
         raise SettingsError("本地证据引擎不需要 API Key")
     if provider.get("auth_mode") == "managed":
         raise SettingsError("ScanSci 托管模型不接受本机 API Key")
+    _, environment_name = _provider_environment_api_key(provider_id)
+    if environment_name:
+        raise SettingsError(
+            f"环境变量 {environment_name} 已提供该服务商 API Key；请先清除环境变量后再通过设置页保存或移除本机凭据"
+        )
     secret = str(value or "").strip()
     try:
         import keyring
@@ -535,12 +642,20 @@ def set_provider_api_key(workspace: str | Path, provider_id: str, value: str) ->
 
 
 def get_provider_api_key(workspace: str | Path, provider_id: str) -> str:
-    """Read one provider secret for an in-process request without exposing it to the UI."""
+    """Resolve one provider key for a request without exposing it to settings.
 
+    Resolution is performed per call so a launch environment override follows
+    the DeepSeek Harness-style credential reference semantics.  The existing
+    workspace-scoped keyring entry remains the fallback for desktop use.
+    """
+
+    environment_value, _ = _provider_environment_api_key(provider_id)
+    if environment_value:
+        return environment_value
     try:
         import keyring
 
-        return str(keyring.get_password(_SERVICE_NAME, _provider_secret_name(workspace, provider_id)) or "")
+        return str(keyring.get_password(_SERVICE_NAME, _provider_secret_name(workspace, provider_id)) or "").strip()
     except Exception:
         return ""
 
@@ -648,6 +763,10 @@ def _normalize_settings(payload: object) -> dict[str, Any]:
         active = {}
     provider_id = _safe_id(active.get("provider_id"), fallback=providers[0]["id"])
     provider = next((item for item in providers if item["id"] == provider_id), providers[0])
+    if provider["id"] == _JEV_PROVIDER_ID:
+        # JEV is a typed decision service and must never become the ordinary
+        # chat model selected by the conversation model picker.
+        provider = next((item for item in providers if item["id"] == _MANAGED_PROVIDER_ID), providers[0])
     model_id = _model_id(active.get("model_id"), fallback=provider["models"][0]["id"])
     if not any(model["id"] == model_id for model in provider["models"]):
         model_id = provider["models"][0]["id"]
@@ -729,6 +848,7 @@ def _normalize_local_models(value: object) -> list[dict[str, Any]]:
                 "runtime": runtime,
                 "base_url": _text(item.get("base_url"), limit=500),
                 "model_id": model_id,
+                "context_window": _text(item.get("context_window"), limit=24),
                 "enabled": bool(item.get("enabled", True)),
                 "capabilities": capabilities,
                 # Runtime diagnostics are facts discovered by the installer;
@@ -829,13 +949,98 @@ def _with_local_runtime_providers(providers: list[dict[str, Any]], local_models:
                         "id": model_id,
                         "name": str(local.get("name") or model_id),
                         "group": f"本地 {runtime}",
-                        "context_window": "本机",
+                        "context_window": str(local.get("context_window") or "本机"),
                         "capabilities": capabilities,
                     }
                 ],
             }
         )
     return rows
+
+
+def with_discovered_local_runtime_models(
+    settings: dict[str, Any],
+    inventories: dict[str, list[object]],
+) -> dict[str, Any]:
+    """Merge models reported by configured loopback runtimes into the catalog.
+
+    Runtime discovery stays ephemeral: callers can expose the richer catalog
+    without turning a health-check request into a settings write. Existing
+    rows remain authoritative, while ``:latest`` aliases are de-duplicated.
+    """
+
+    result = deepcopy(settings)
+    rows = [dict(item) for item in list(result.get("local_models", []) or []) if isinstance(item, dict)]
+    sources = list(rows)
+    used_ids = {str(item.get("id", "")) for item in rows if str(item.get("id", "")).strip()}
+
+    def runtime_key(item: dict[str, Any], model_id: str) -> tuple[str, str, str]:
+        runtime = str(item.get("runtime", "")).strip().lower()
+        base_url = str(item.get("base_url", "")).strip().rstrip("/").casefold()
+        alias = str(model_id or "").strip().casefold()
+        if alias.endswith(":latest"):
+            alias = alias[:-7]
+        return runtime, base_url, alias
+
+    known = {
+        runtime_key(item, str(item.get("model_id", "")))
+        for item in rows
+        if str(item.get("model_id", "")).strip()
+    }
+    for source in sources:
+        runtime = str(source.get("runtime", "")).strip().lower()
+        base_url = str(source.get("base_url", "")).strip().rstrip("/")
+        source_id = str(source.get("id", "")).strip()
+        if runtime in {"builtin", "local-huggingface"} or not source.get("enabled") or not base_url:
+            continue
+        for raw_model in list(inventories.get(source_id, []) or [])[:_MAX_ITEMS]:
+            item = raw_model if isinstance(raw_model, dict) else {}
+            model_id = str(
+                item.get("id")
+                or item.get("model")
+                or item.get("name")
+                or (raw_model if isinstance(raw_model, str) else "")
+            ).strip()
+            key = runtime_key(source, model_id)
+            if not model_id or key in known:
+                continue
+            declared = item.get("capabilities") if isinstance(item.get("capabilities"), list) else []
+            declared = ["tool" if str(value).strip().lower() in {"tools", "tool_calling"} else value for value in declared]
+            capabilities = _normalize_capabilities(declared, fallback=model_id)
+            display_name = str(item.get("display_name") or item.get("name") or model_id).strip()
+            if display_name.endswith(":latest"):
+                display_name = display_name[:-7]
+            identifier = _unique_id(
+                _safe_id(f"{runtime}-{model_id}", fallback=f"{runtime}-model"),
+                used_ids,
+            )
+            rows.append(
+                {
+                    "id": identifier,
+                    "name": display_name or model_id,
+                    "runtime": runtime,
+                    "base_url": base_url,
+                    "model_id": model_id,
+                    "context_window": str(item.get("context_window") or item.get("context_length") or "").strip()[:24],
+                    "enabled": True,
+                    "capabilities": capabilities,
+                    "runtime_compatible": True,
+                    "runtime_backend": runtime,
+                    "runtime_message": "",
+                }
+            )
+            known.add(key)
+            if len(rows) >= _MAX_ITEMS:
+                break
+        if len(rows) >= _MAX_ITEMS:
+            break
+
+    result["local_models"] = rows
+    result["providers"] = _with_local_runtime_providers(
+        list(result.get("providers", []) or []),
+        rows,
+    )
+    return result
 
 
 def _with_local_huggingface_provider(providers: list[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -856,11 +1061,18 @@ def _with_local_huggingface_provider(providers: list[dict[str, Any]]) -> list[di
         ).casefold()
         architecture = str(item.get("architecture", "")).casefold()
         is_generation_architecture = "forcausallm" in architecture or "forconditionalgeneration" in architecture
+        discovered = {
+            str(value).strip().casefold()
+            for value in item.get("capabilities", [])
+            if str(value).strip()
+        }
         return (
-            bool(item.get("ready"))
+            bool(item.get("model_files_present", item.get("ready")))
             and str(item.get("format", "")) == "transformers"
             and is_generation_architecture
+            and "audio" not in discovered
             and not any(word in marker for word in ("embedding", "reranker", "asr", "whisper", "reward"))
+            and not any(word in marker for word in ("tts", "text-to-speech", "vocoder"))
         )
 
     def capabilities_for(item: dict[str, Any]) -> list[str]:
@@ -874,7 +1086,8 @@ def _with_local_huggingface_provider(providers: list[dict[str, Any]]) -> list[di
             for value in discovered
             if str(value).strip().lower() in {"chat", "vision", "audio", "embedding", "reranking"}
         ]
-        capabilities.extend(["reasoning", "coding"])
+        if not any(item in capabilities for item in ("audio", "embedding", "reranking")):
+            capabilities.extend(["reasoning", "coding"])
         marker = " ".join(
             [
                 str(item.get("id", "")),
@@ -887,17 +1100,56 @@ def _with_local_huggingface_provider(providers: list[dict[str, Any]]) -> list[di
             capabilities.append("vision")
         return list(dict.fromkeys(capabilities))
 
-    models = [
-        {
+    previous = next((item for item in providers if str(item.get("id", "")) == "local-huggingface"), None)
+    models: list[dict[str, Any]] = []
+    for item in installed_models():
+        if not is_chat_model(item):
+            continue
+        model = {
             "id": str(item["id"]),
             "name": str(item.get("name") or item["id"]),
             "group": "本地 Hugging Face",
             "context_window": "本机",
             "capabilities": capabilities_for(item),
         }
-        for item in installed_models()
-        if is_chat_model(item)
-    ]
+        if not bool(item.get("ready")) or item.get("runtime_compatible") is False:
+            model["available"] = False
+            model["unavailable_reason"] = str(
+                item.get("runtime_message")
+                or item.get("runtime_compatibility_message")
+                or "模型文件已存在，当前本地运行组件尚未完成可用性验证。"
+            )[:160]
+        source_root = str(item.get("source_root", "")).strip()
+        if source_root:
+            model["source_root"] = source_root
+        models.append(model)
+    discovered_ids = {str(model["id"]).casefold() for model in models}
+    missing_roots = missing_configured_model_roots()
+    missing_keys = {item.casefold() for item in missing_roots}
+    if previous:
+        for model in previous.get("models", []):
+            source_root = str(model.get("source_root", "")).strip()
+            unavailable = source_root.casefold() in missing_keys if source_root else False
+            if source_root:
+                if not unavailable:
+                    try:
+                        unavailable = not Path(source_root).expanduser().exists()
+                    except OSError:
+                        unavailable = True
+                if unavailable and source_root.casefold() not in missing_keys:
+                    missing_roots.append(source_root)
+                    missing_keys.add(source_root.casefold())
+            elif missing_roots:
+                unavailable = True
+            model_id = str(model.get("id", "")).casefold()
+            if unavailable and model_id not in discovered_ids:
+                models.append(
+                    {
+                        **model,
+                        "available": False,
+                        "unavailable_reason": "模型目录当前不可访问",
+                    }
+                )
     rows = [item for item in providers if str(item.get("id", "")) != "local-huggingface"]
     if models:
         rows.append(
@@ -906,13 +1158,14 @@ def _with_local_huggingface_provider(providers: list[dict[str, Any]]) -> list[di
                 "name": "本地 Hugging Face",
                 "kind": "local",
                 "base_url": "http://127.0.0.1:17863/v1",
-                "enabled": True,
+                "enabled": bool(previous.get("enabled", True)) if previous else True,
                 "logo": "local-huggingface",
                 "category": "本地模型",
                 "summary": "由 ScanSci 在本机按需启动；模型权重始终保留在本地。",
                 "auth_mode": "local",
                 "model_listing": False,
                 "models": models,
+                "missing_roots": missing_roots,
             }
         )
     return rows
@@ -960,6 +1213,7 @@ def _normalize_general(value: object) -> dict[str, Any]:
     source = value if isinstance(value, dict) else {}
     conversation_source = source.get("conversation") if isinstance(source.get("conversation"), dict) else {}
     directories_source = source.get("directories") if isinstance(source.get("directories"), dict) else {}
+    updates_source = source.get("updates") if isinstance(source.get("updates"), dict) else {}
     send_shortcut = _text(conversation_source.get("send_shortcut"), fallback=defaults["conversation"]["send_shortcut"], limit=24).lower()
     if send_shortcut not in {"enter", "shift-enter"}:
         send_shortcut = defaults["conversation"]["send_shortcut"]
@@ -976,6 +1230,9 @@ def _normalize_general(value: object) -> dict[str, Any]:
             "model_cache": _normalize_storage_path(directories_source.get("model_cache")),
             "local_runtime": _normalize_storage_path(directories_source.get("local_runtime")),
             "vector_index": _normalize_storage_path(directories_source.get("vector_index")),
+        },
+        "updates": {
+            "auto_check": bool(updates_source.get("auto_check", defaults["updates"]["auto_check"])),
         },
     }
 
@@ -1127,16 +1384,39 @@ def _normalize_providers(value: object) -> list[dict[str, Any]]:
             ]
         else:
             name = _text(item.get("name"), fallback="本地证据引擎" if kind == "local" else "未命名提供商", limit=80)
+        base_url = _text(item.get("base_url"), limit=500)
+        zhipu_endpoints: dict[str, Any] = {}
+        if identifier == _ZHIPU_PROVIDER_ID:
+            coding_plan_enabled = bool(item.get("coding_plan_enabled", False))
+            if "standard_base_url" in item:
+                standard_base_url = _text(item.get("standard_base_url"), limit=500)
+            elif coding_plan_enabled:
+                standard_base_url = _ZHIPU_STANDARD_BASE_URL
+            else:
+                standard_base_url = base_url
+            if "coding_plan_base_url" in item:
+                coding_plan_base_url = _text(item.get("coding_plan_base_url"), fallback=_ZHIPU_CODING_PLAN_BASE_URL, limit=500)
+            elif coding_plan_enabled and base_url:
+                coding_plan_base_url = base_url
+            else:
+                coding_plan_base_url = _ZHIPU_CODING_PLAN_BASE_URL
+            base_url = coding_plan_base_url if coding_plan_enabled else standard_base_url
+            zhipu_endpoints = {
+                "standard_base_url": standard_base_url,
+                "coding_plan_base_url": coding_plan_base_url,
+                "coding_plan_enabled": coding_plan_enabled,
+            }
         rows.append(
             {
                 "id": identifier,
                 "name": name,
                 "kind": kind,
-                "base_url": _text(item.get("base_url"), limit=500),
+                "base_url": base_url,
+                **zhipu_endpoints,
                 "api_surface": (
                     _text(item.get("api_surface"), fallback="chat_completions", limit=32).lower()
                     if _text(item.get("api_surface"), fallback="chat_completions", limit=32).lower()
-                    in {"auto", "chat_completions", "responses"}
+                    in {"auto", "chat_completions", "responses", "anthropic_messages", "jev_systemone"}
                     else "chat_completions"
                 ),
                 "responses_enabled": bool(item.get("responses_enabled", False)),
@@ -1197,6 +1477,42 @@ def _with_common_provider_catalog(providers: list[dict[str, Any]]) -> list[dict[
                 }
                 for model in preset["models"]
             ]
+        elif row.get("id") == _JEV_PROVIDER_ID:
+            # JEV uses TypeSafe's typed evaluation endpoint rather than the
+            # chat-completions protocol. Keep the official endpoint visible
+            # for older workspaces that received the provider before the
+            # transport adapter was added, while retaining an explicit custom
+            # proxy endpoint if the user chose one.
+            refreshed["name"] = preset["name"]
+            refreshed["kind"] = preset["kind"]
+            refreshed["api_surface"] = preset["api_surface"]
+            refreshed["responses_enabled"] = preset["responses_enabled"]
+            if not str(refreshed.get("base_url", "")).strip():
+                refreshed["base_url"] = preset["base_url"]
+            existing_models = {
+                str(model.get("id", "")): model
+                for model in refreshed["models"]
+                if str(model.get("id", ""))
+            }
+            preset_ids = {str(model["id"]) for model in preset["models"]}
+            refreshed["models"] = [
+                {
+                    **existing_models.get(str(model["id"]), {}),
+                    **deepcopy(model),
+                }
+                for model in preset["models"]
+            ] + [
+                model
+                for model in refreshed["models"]
+                if str(model.get("id", "")) not in preset_ids
+            ]
+        elif row.get("id") == "paratera":
+            # Add newly supported transports without replacing user model edits,
+            # endpoint, enablement or default role choices.
+            known_models = {str(model.get("id", "")) for model in refreshed["models"]}
+            refreshed["models"] = list(refreshed["models"]) + [
+                deepcopy(model) for model in preset["models"] if model["id"] not in known_models
+            ]
         elif row.get("id") == "siliconflow":
             # SiliconFlow's evidence models are product catalog entries too.
             # Merge newly shipped presets into an existing workspace while
@@ -1241,6 +1557,34 @@ def _with_common_provider_catalog(providers: list[dict[str, Any]]) -> list[dict[
                 if str(model.get("id", "")) not in _DEEPSEEK_LEGACY_MODEL_IDS
                 and str(model.get("id", "")) not in preset_ids
             ]
+        elif row.get("id") == _OPENCODE_GO_PROVIDER_ID:
+            # OpenCode Go has one stable catalog endpoint but its model families
+            # use different protocol surfaces. Refresh the built-in route when
+            # an existing workspace first sees this provider, while retaining
+            # a custom endpoint and any model IDs the user added manually.
+            refreshed["name"] = preset["name"]
+            refreshed["kind"] = preset["kind"]
+            refreshed["api_surface"] = preset["api_surface"]
+            refreshed["responses_enabled"] = preset["responses_enabled"]
+            if not str(refreshed.get("base_url", "")).strip():
+                refreshed["base_url"] = preset["base_url"]
+            existing_models = {
+                str(model.get("id", "")): model
+                for model in refreshed["models"]
+                if str(model.get("id", ""))
+            }
+            preset_ids = {str(model["id"]) for model in preset["models"]}
+            refreshed["models"] = [
+                {
+                    **existing_models.get(str(model["id"]), {}),
+                    **deepcopy(model),
+                }
+                for model in preset["models"]
+            ] + [
+                model
+                for model in refreshed["models"]
+                if str(model.get("id", "")) not in preset_ids
+            ]
         rows[index] = refreshed
     known_ids = {str(provider.get("id", "")) for provider in rows}
     for preset in _PROVIDER_PRESETS:
@@ -1248,7 +1592,11 @@ def _with_common_provider_catalog(providers: list[dict[str, Any]]) -> list[dict[
             continue
         row = deepcopy(preset)
         row["enabled"] = preset["id"] == _MANAGED_PROVIDER_ID
-        rows.append(row)
+        if preset["id"] == _JEV_PROVIDER_ID:
+            managed_index = next((index for index, item in enumerate(rows) if item.get("id") == _MANAGED_PROVIDER_ID), -1)
+            rows.insert(managed_index + 1 if managed_index >= 0 else len(rows), row)
+        else:
+            rows.append(row)
     return rows
 
 
@@ -1270,12 +1618,15 @@ def _infer_model_capabilities(identifier: str) -> list[str]:
         capabilities.append("reasoning")
     if "code" in value:
         capabilities.append("coding")
-    if "audio" in value or "tts" in value:
+    if any(token in value for token in ("audio", "tts", "speech", "whisper", "asr", "vocoder")):
         capabilities.append("audio")
     return capabilities or ["reasoning"]
 
 
 def _normalize_capabilities(value: object, *, fallback: str) -> list[str]:
+    marker = str(fallback or "").casefold()
+    if any(token in marker for token in ("audio", "tts", "speech", "whisper", "asr", "vocoder")):
+        return ["audio"]
     source = value if isinstance(value, list) else []
     capabilities = [
         _text(item, limit=24).lower()
@@ -1293,19 +1644,26 @@ def _normalize_models(value: object, *, fallback: str) -> list[dict[str, Any]]:
         if not isinstance(item, dict):
             continue
         identifier = _unique_id(_model_id(item.get("id"), fallback=f"model-{index + 1}"), used)
-        rows.append(
-            {
-                "id": identifier,
-                "name": _text(item.get("name"), fallback=identifier, limit=120),
-                "group": _text(item.get("group"), fallback="默认模型", limit=80),
-                "context_window": _text(item.get("context_window"), fallback="", limit=40),
-                "capabilities": _normalize_capabilities(item.get("capabilities"), fallback=identifier),
-                "readiness": _text(item.get("readiness"), fallback="production", limit=24)
-                if _text(item.get("readiness"), fallback="production", limit=24) in {"production", "standby"}
-                else "production",
-                "automatic_fallback": bool(item.get("automatic_fallback")),
-            }
-        )
+        row = {
+            "id": identifier,
+            "name": _text(item.get("name"), fallback=identifier, limit=120),
+            "group": _text(item.get("group"), fallback="默认模型", limit=80),
+            "context_window": _text(item.get("context_window"), fallback="", limit=40),
+            "capabilities": _normalize_capabilities(item.get("capabilities"), fallback=identifier),
+            "readiness": _text(item.get("readiness"), fallback="production", limit=24)
+            if _text(item.get("readiness"), fallback="production", limit=24) in {"production", "standby"}
+            else "production",
+            "automatic_fallback": bool(item.get("automatic_fallback")),
+        }
+        source_root = _text(item.get("source_root"), limit=1_000)
+        unavailable_reason = _text(item.get("unavailable_reason"), limit=160)
+        if source_root:
+            row["source_root"] = source_root
+        if item.get("available") is False:
+            row["available"] = False
+        if unavailable_reason:
+            row["unavailable_reason"] = unavailable_reason
+        rows.append(row)
     if rows:
         return rows
     return [{
@@ -1440,14 +1798,39 @@ def _normalize_records(value: object, *, kind: str) -> list[dict[str, Any]]:
             row["version"] = _text(item.get("version"), limit=80)
             row["updated_at"] = _text(item.get("updated_at"), limit=48)
             connector_kind = _text(item.get("connector_kind"), limit=32).lower()
-            row["connector_kind"] = connector_kind if connector_kind in {"", "zotero", "obsidian", "general"} else "general"
+            row["connector_kind"] = connector_kind if connector_kind in {"", "zotero", "obsidian", "general", "literature"} else "general"
+            provider_kind = _text(item.get("provider_kind"), limit=48).lower()
+            if not provider_kind and row["connector_kind"] == "literature":
+                provider_kind = "literature"
+            row["provider_kind"] = provider_kind
+            row["provider_manifest"] = normalize_provider_manifest(
+                item.get("provider_manifest"),
+                provider_kind=provider_kind or row["connector_kind"],
+            )
             # Read-only is the product default.  A saved MCP cannot expose
             # write-like tools to Pi until the user explicitly opts in.
             row["allow_write"] = bool(item.get("allow_write", False))
+            row["allow_reversible"] = bool(item.get("allow_reversible", False))
             # Tool effect classifications are host-owned policy.  Remote MCP
             # annotations are advisory and must never manufacture read access.
             row["tool_effects"] = _normalize_mcp_tool_effects(item.get("tool_effects"))
             row["tool_policies"] = _normalize_mcp_tool_policies(item.get("tool_policies"))
+            provider_defaults = host_policy_defaults(row)
+            row["provider_manifest"] = provider_defaults.get("provider_manifest", row["provider_manifest"])
+            for tool_name, effect in dict(provider_defaults.get("tool_effects", {}) or {}).items():
+                row["tool_effects"].setdefault(tool_name, effect)
+            existing_policy_names = {
+                str(policy.get("name", ""))
+                for policy in row["tool_policies"]
+                if isinstance(policy, dict)
+            }
+            for policy in list(provider_defaults.get("tool_policies", []) or []):
+                if not isinstance(policy, dict) or str(policy.get("name", "")) in existing_policy_names:
+                    continue
+                if len(row["tool_policies"]) >= _MAX_MCP_TOOL_POLICIES:
+                    break
+                row["tool_policies"].append(policy)
+                existing_policy_names.add(str(policy.get("name", "")))
             call_timeout = item.get("call_timeout_ms")
             if isinstance(call_timeout, (int, float)) and not isinstance(call_timeout, bool):
                 row["call_timeout_ms"] = max(250, min(120_000, int(call_timeout)))
@@ -1518,21 +1901,78 @@ def _with_builtin_plugins(records: list[dict[str, Any]]) -> list[dict[str, Any]]
 def _with_secret_status(settings: dict[str, Any], workspace: str | Path) -> dict[str, Any]:
     public = deepcopy(settings)
     public["plugins"] = enrich_builtin_plugins(list(public.get("plugins", []) or []))
+    public["notion_api_token_configured"] = notion_api_token_configured(workspace)
+    public["workspace_profile"] = _workspace_profile(workspace)
     for provider in public["providers"]:
-        provider["api_key_configured"] = provider.get("auth_mode") == "managed" or (provider["kind"] != "local" and _has_provider_api_key(workspace, provider["id"]))
+        if provider.get("auth_mode") == "managed":
+            provider["api_key_configured"] = True
+            provider["api_key_source"] = "managed"
+            provider["api_key_env"] = ""
+        elif provider["kind"] == "local":
+            provider["api_key_configured"] = False
+            provider["api_key_source"] = "missing"
+            provider["api_key_env"] = ""
+        else:
+            source, environment_name = _provider_credential_status(workspace, provider["id"])
+            provider["api_key_configured"] = source != "missing"
+            provider["api_key_source"] = source
+            provider["api_key_env"] = environment_name or _provider_api_key_env(provider["id"])
     document_processing = public["document_processing"]
     document_processing["ocr"]["api_key_configured"] = _has_document_service_api_key(workspace, "ocr")
     document_processing["mineru"]["api_key_configured"] = _has_document_service_api_key(workspace, "mineru")
     return public
 
 
+def _workspace_profile(workspace: str | Path) -> str:
+    workspace_path = Path(workspace).expanduser().resolve()
+    temporary_root = Path(tempfile.gettempdir()).expanduser().resolve()
+    try:
+        workspace_path.relative_to(temporary_root)
+    except ValueError:
+        return "persistent"
+    return "temporary"
+
+
 def _has_provider_api_key(workspace: str | Path, provider_id: str) -> bool:
+    return _provider_credential_status(workspace, provider_id)[0] != "missing"
+
+
+def _provider_credential_status(workspace: str | Path, provider_id: str) -> tuple[str, str]:
+    environment_value, environment_name = _provider_environment_api_key(provider_id)
+    if environment_value:
+        return "environment", environment_name
     try:
         import keyring
 
-        return bool(keyring.get_password(_SERVICE_NAME, _provider_secret_name(workspace, provider_id)))
+        if keyring.get_password(_SERVICE_NAME, _provider_secret_name(workspace, provider_id)):
+            return "keyring", ""
     except Exception:
-        return False
+        pass
+    return "missing", ""
+
+
+def _provider_environment_api_key(provider_id: str) -> tuple[str, str]:
+    for environment_name in _provider_api_key_envs(provider_id):
+        value = str(os.environ.get(environment_name) or "").strip()
+        if value:
+            return value, environment_name
+    return "", ""
+
+
+def _provider_api_key_env(provider_id: str) -> str:
+    names = _provider_api_key_envs(provider_id)
+    return names[0] if names else ""
+
+
+def _provider_api_key_envs(provider_id: str) -> tuple[str, ...]:
+    identifier = str(provider_id or "").strip().lower()
+    if not identifier or identifier in {_MANAGED_PROVIDER_ID, "local", "local-evidence"}:
+        return ()
+    known = _PROVIDER_API_KEY_ENV_ALIASES.get(identifier)
+    if known:
+        return known
+    normalized = re.sub(r"[^a-z0-9]+", "_", identifier).strip("_").upper()
+    return (f"{normalized}_API_KEY",) if normalized else ()
 
 
 def _provider_secret_name(workspace: str | Path, provider_id: str) -> str:

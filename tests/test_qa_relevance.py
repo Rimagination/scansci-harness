@@ -81,3 +81,30 @@ def test_facet_coverage_accepts_scientific_phrase_variants():
     assert coverage["status"] == "complete"
     assert coverage["covered_facets"] == ["soil carbon storage"]
     assert coverage["facet_scores"]["soil carbon storage"] >= 0.6
+
+
+def test_mixed_language_question_with_matching_latin_terms_is_review_not_rejection():
+    # Regression: “Attention 机制……” against an English library used to be
+    # rejected as “generic Chinese overlap” even though the question's own
+    # technical term (“attention”) matched the evidence, withholding a
+    # verified answer the library fully supported.
+    result = _apply_topical_relevance_gate(
+        "Attention 机制的核心思想是什么？请依据资料回答。",
+        [{"quote_id": "q0001", "exact_quote": "Scaled Dot-Product Attention computes compatibility between positions."}],
+        {"is_sufficient": True, "profile": "manual"},
+    )
+
+    assert result["answerability"] == "needs_review"
+    assert result["topical_relevance"]["status"] == "review"
+    assert "attention" in result["topical_relevance"]["matched_terms"]
+
+
+def test_chinese_question_without_any_latin_match_is_still_rejected():
+    result = _apply_topical_relevance_gate(
+        "植被群落和土壤碳储量如何响应放牧强度？",
+        [{"quote_id": "q0001", "exact_quote": "Scaled Dot-Product Attention computes compatibility between positions."}],
+        {"is_sufficient": True, "profile": "manual"},
+    )
+
+    assert result["is_sufficient"] is False
+    assert result["answerability"] == "not_enough_information"

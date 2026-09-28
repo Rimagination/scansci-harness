@@ -47,16 +47,21 @@ def _request_json(base_url: str, path: str, *, method: str = "GET", payload: dic
     return value if isinstance(value, dict) else {}
 
 
-def ollama_status(base_url: str | None = None) -> dict[str, Any]:
+def ollama_status(
+    base_url: str | None = None,
+    *,
+    model_id: str = OLLAMA_VISION_MODEL,
+) -> dict[str, Any]:
     """Return a bounded local status; an unavailable Ollama is not fatal."""
 
     root = ollama_base_url(base_url)
+    wanted_model = str(model_id or OLLAMA_VISION_MODEL).strip()
     try:
         version = _request_json(root, "/api/version", timeout=2.5)
         tags = _request_json(root, "/api/tags", timeout=3.0)
         models = [dict(item) for item in list(tags.get("models", []) or []) if isinstance(item, dict)]
         names = {str(item.get("name", "")).strip() for item in models}
-        ready = OLLAMA_VISION_MODEL in names or f"{OLLAMA_VISION_MODEL}:latest" in names
+        ready = wanted_model in names or f"{wanted_model}:latest" in names
         return {
             "reachable": True,
             "installed": True,
@@ -64,7 +69,7 @@ def ollama_status(base_url: str | None = None) -> dict[str, Any]:
             "version": str(version.get("version", "") or ""),
             "models": models[:200],
             "model_ready": ready,
-            "model_id": OLLAMA_VISION_MODEL,
+            "model_id": wanted_model,
             "error": "",
         }
     except (OSError, ValueError, json.JSONDecodeError, error.URLError) as exc:
@@ -75,7 +80,7 @@ def ollama_status(base_url: str | None = None) -> dict[str, Any]:
             "version": "",
             "models": [],
             "model_ready": False,
-            "model_id": OLLAMA_VISION_MODEL,
+            "model_id": wanted_model,
             "error": "Ollama 未运行，请先安装并启动 Ollama" if isinstance(exc, (OSError, error.URLError)) else str(exc),
         }
 

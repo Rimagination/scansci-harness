@@ -17,6 +17,22 @@ def test_ollama_status_recognizes_the_exact_minicpm_tag(monkeypatch):
     assert status["model_id"] == "minicpm-v4.6"
 
 
+def test_ollama_status_checks_the_requested_text_model(monkeypatch):
+    def fake_request(_base, path, **_kwargs):
+        if path == "/api/version":
+            return {"version": "0.33.3"}
+        return {"models": [{"name": "qwen3.5:4b"}, {"name": "minicpm-v4.6:latest"}]}
+
+    monkeypatch.setattr(ollama_runtime, "_request_json", fake_request)
+
+    qwen = ollama_runtime.ollama_status(model_id="qwen3.5:4b")
+    missing = ollama_runtime.ollama_status(model_id="qwen3.8:4b")
+
+    assert qwen["model_ready"] is True
+    assert qwen["model_id"] == "qwen3.5:4b"
+    assert missing["model_ready"] is False
+
+
 def test_ollama_install_manager_reuses_an_already_pulled_model(tmp_path: Path, monkeypatch):
     monkeypatch.setattr(
         ollama_runtime,

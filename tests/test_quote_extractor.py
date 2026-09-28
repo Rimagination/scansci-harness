@@ -328,10 +328,15 @@ def test_build_evidence_table_keeps_source_metadata_for_human_review():
             "section_kind": "results",
             "doi": "10.1234/biomass",
             "source_url": "https://publisher.example/biomass",
-            "evidence_id": "doc1.s0001",
-            "html_path": "paper.evidence.html",
-            "html_anchor": "results-p1-s0001",
-            "context_text": "",
+                "evidence_id": "doc1.s0001",
+                "html_path": "paper.evidence.html",
+                "html_anchor": "results-p1-s0001",
+                "matched_text": "The treatment increased biomass by 18%.",
+                "context_before": "",
+                "context_before_evidence_id": "",
+                "context_after": "",
+                "context_after_evidence_id": "",
+                "context_text": "",
             "parent_block_id": "",
             "parent_evidence_ids": [],
             "confidence": 0.82,
@@ -360,6 +365,11 @@ def test_build_evidence_table_keeps_parent_context_when_available():
             "section_kind": "results",
             "html_path": "paper.evidence.html",
             "html_anchor": "results-p1-s0002",
+            "matched_text": "Treatment increased cortical activity in language regions.",
+            "context_before": "The cohort included 120 participants.",
+            "context_before_evidence_id": "doc1.s0001",
+            "context_after": "The follow-up assessment found the effect persisted.",
+            "context_after_evidence_id": "doc1.s0003",
             "text": (
                 "The cohort included 120 participants. "
                 "Treatment increased cortical activity in language regions."
@@ -382,3 +392,5 @@ def test_build_evidence_table_keeps_parent_context_when_available():
     )
     assert table[0]["parent_block_id"] == "doc1:results-p1"
     assert table[0]["parent_evidence_ids"] == ["doc1.s0001", "doc1.s0002"]
+    assert table[0]["context_before"] == "The cohort included 120 participants."
+    assert table[0]["context_after"] == "The follow-up assessment found the effect persisted."

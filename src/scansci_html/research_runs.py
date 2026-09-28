@@ -721,6 +721,14 @@ class ResearchRunStore:
             payload["output_artifact"] = next(
                 (item for item in artifacts if item["artifact_id"] == payload["output_artifact_id"]), None
             )
+            if connection.execute(
+                "select 1 from research_run_events where run_id = ? and event_type = 'advisor.reviewed' limit 1",
+                (run_id,),
+            ).fetchone():
+                from .agent_advisor import review_research_run
+
+                # Re-evaluate the display without rewriting historical audit events.
+                payload["advisor_report"] = review_research_run(payload)
             return payload
 
     def events_after(self, run_id: str, *, after_sequence: int = 0, limit: int = 200) -> list[dict[str, Any]]:

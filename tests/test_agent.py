@@ -495,6 +495,25 @@ def test_assess_evidence_adequacy_requires_minimum_quotes_and_diversity():
     }
 
 
+def test_insufficient_adequacy_answer_uses_chinese_for_chinese_question():
+    result = agent._insufficient_adequacy_answer(
+        "你好",
+        {
+            "followup_reason": "no validated quotes",
+            "quote_count": 0,
+            "min_quotes": 1,
+            "document_count": 0,
+            "min_documents": 1,
+        },
+    )
+
+    limitation = result["limitations"][0]
+    assert "证据不足" in limitation
+    assert "引文 0/1" in limitation
+    assert "文档 0/1" in limitation
+    assert "No answer" not in limitation
+
+
 def test_answer_question_runs_local_evidence_first_pipeline(tmp_path: Path):
     library = tmp_path / "library"
     library.mkdir()
@@ -837,6 +856,50 @@ def test_reader_answer_limits_named_list_when_top_claim_fully_answers():
         answer,
         evidence_table,
         query_plan={"answer_type": "named_list", "expected_answer_count": 2},
+    )
+
+    assert [sentence["claim_id"] for sentence in reader_answer["sentences"]] == ["c0001"]
+
+
+def test_reader_answer_limits_focused_sentence_question_to_one_claim():
+    answer = {
+        "question": "Which sentence says that treatment increased cortical activity? Please show the previous and next sentence.",
+        "answer": [
+            {
+                "claim_id": "c0001",
+                "text": "Treatment increased cortical activity in language regions.",
+                "quote_ids": ["q0001"],
+                "support_status": "supported",
+            },
+            {
+                "claim_id": "c0002",
+                "text": "The observed signal supports further study of the treatment response.",
+                "quote_ids": ["q0002"],
+                "support_status": "supported",
+            },
+        ],
+    }
+    evidence_table = [
+        {
+            "quote_id": "q0001",
+            "evidence_id": "doc1.s0001",
+            "exact_quote": "Treatment increased cortical activity in language regions.",
+            "html_path": "paper.html",
+            "html_anchor": "s1",
+        },
+        {
+            "quote_id": "q0002",
+            "evidence_id": "doc1.s0002",
+            "exact_quote": "The observed signal supports further study of the treatment response.",
+            "html_path": "paper.html",
+            "html_anchor": "s2",
+        },
+    ]
+
+    reader_answer = build_reader_answer(
+        answer,
+        evidence_table,
+        query_plan={"answer_type": "named_list", "expected_answer_count": None},
     )
 
     assert [sentence["claim_id"] for sentence in reader_answer["sentences"]] == ["c0001"]

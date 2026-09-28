@@ -23,6 +23,7 @@ def test_plain_conversation_gets_full_read_authority_but_bootstrap_only_activati
     assert set(contract["allowed_tools"]) == _ready_read_only_tools()
     assert contract["requires_plan"] is False
     assert contract["task_profile"]["route"] == "direct_chat"
+    assert contract["task_profile"]["capability_profile"] == "minimal"
     assert contract["task_profile"]["execution_complexity"] == "none"
     assert contract["schema_version"] == "scansci.task-contract.v2"
     assert contract["version"] == 2
@@ -54,6 +55,20 @@ def test_research_download_is_reversible_and_progress_budgeted() -> None:
         ["check_task_completion"],
     ]
     assert set(contract["initial_tools"]).issubset(contract["allowed_tools"])
+
+
+def test_image_generation_gets_one_reversible_host_tool() -> None:
+    contract = compile_task_contract(
+        task_mode="image",
+        user_text="生成一张科研概念图",
+        required_tool_groups=[{"generate_image"}],
+    )
+
+    assert contract["autonomy"] == "reversible"
+    assert contract["risk_level"] == "reversible"
+    assert "generate_image" in contract["allowed_tools"]
+    assert contract["initial_tools"] == ["generate_image"]
+    assert contract["required_tool_groups"] == [["generate_image"]]
 
 
 def test_external_or_destructive_request_requires_plan() -> None:
@@ -149,6 +164,7 @@ def test_multi_stage_research_is_a_resumable_workflow() -> None:
     )
 
     assert profile.route == "resumable_workflow"
+    assert profile.capability_profile == "workflow"
     assert profile.cognitive_complexity == "high"
     assert profile.execution_complexity == "workflow"
     assert profile.risk_level == "reversible"

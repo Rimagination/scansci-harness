@@ -30,3 +30,17 @@ def test_shared_intent_preserves_doi_issn_and_arxiv_as_exact_lookup_requests():
     assert doi["quality_policy"] == "identifier_exact"
     assert issn["intent_type"] == "exact_identifier"
     assert issn["subject"] == "1234-567X"
+
+
+def test_paper_download_intent_extracts_chinese_author_and_citation_ranking():
+    intent = compile_retrieval_intent(
+        "帮我下载中科院于贵瑞院士的TOP10被引论文",
+        kind="paper_download",
+    )
+
+    assert intent["author"] == "于贵瑞"
+    assert intent["author_only"] is True
+    assert intent["subject"] == "于贵瑞"
+    assert intent["sort"] == "cited_by_count"
+    assert intent["limit"] == 10
+    assert intent["intent_type"] == "author"

@@ -6,7 +6,11 @@ import pytest
 
 from scansci_html.agent_capabilities import builtin_capability_catalog
 from scansci_html.agent_contract import compile_task_contract
-from scansci_html.research_agent import ResearchAgentRuntime, _pi_should_run
+from scansci_html.research_agent import (
+    ResearchAgentRuntime,
+    _pi_should_run,
+    _should_route_through_pi,
+)
 
 
 _BILINGUAL_MODEL_TURNS = [
@@ -66,7 +70,7 @@ def _ready_read_only_ids() -> set[str]:
 
 
 @pytest.mark.parametrize("chat_mode,web_search,prompt", _BILINGUAL_MODEL_TURNS)
-def test_every_bilingual_model_turn_is_pi_reachable_with_full_read_inventory(
+def test_bilingual_turns_use_pi_only_when_the_task_profile_requires_it(
     chat_mode: str,
     web_search: str,
     prompt: str,
@@ -78,18 +82,57 @@ def test_every_bilingual_model_turn_is_pi_reachable_with_full_read_inventory(
     )
     contract = compile_task_contract(task_mode=task_mode, user_text=prompt)
 
-    assert _pi_should_run(task_mode, prompt, contract["task_profile"]) is True
+    expected_pi = contract["task_profile"]["route"] != "direct_chat"
+    assert _pi_should_run(task_mode, prompt, contract["task_profile"]) is expected_pi
     assert _ready_read_only_ids() <= set(contract["allowed_tools"])
     assert set(contract["initial_tools"]) <= set(contract["allowed_tools"])
 
 
 @pytest.mark.parametrize("prompt", ["你好", "您好！", "hello", "Hi!", "谢谢", "thank you"])
-def test_social_turns_use_pi_with_an_explicit_empty_domain_inventory(prompt: str) -> None:
+def test_social_turns_use_the_direct_chat_fast_lane(prompt: str) -> None:
     contract = compile_task_contract(task_mode="general", user_text=prompt)
 
-    assert _pi_should_run("general", prompt, contract["task_profile"]) is True
+    assert _pi_should_run("general", prompt, contract["task_profile"]) is False
     assert contract["allowed_tools"] == []
     assert contract["initial_tools"] == []
+
+
+def test_context_bearing_turns_stay_on_pi_even_with_a_direct_task_profile() -> None:
+    contract = compile_task_contract(task_mode="general", user_text="润色这段文字")
+    profile = contract["task_profile"]
+
+    assert profile["route"] == "direct_chat"
+    assert _should_route_through_pi(
+        "general",
+        "润色这段文字",
+        profile,
+        selected_skills=[{"id": "nature-polishing", "status": "loaded"}],
+    ) is True
+    assert _should_route_through_pi(
+        "general",
+        "润色这段文字",
+        profile,
+        has_knowledge=True,
+    ) is True
+    assert _should_route_through_pi(
+        "general",
+        "润色这段文字",
+        profile,
+        has_attachments=True,
+    ) is True
+
+
+def test_auto_web_weather_question_requires_pi_search() -> None:
+    prompt = "帮我看看今天北京的天气"
+    task_mode = ResearchAgentRuntime._direct_pi_task_mode(
+        "general",
+        "auto",
+        messages=[{"role": "user", "content": prompt}],
+    )
+    contract = compile_task_contract(task_mode=task_mode, user_text=prompt)
+
+    assert task_mode == "web-auto"
+    assert _pi_should_run(task_mode, prompt, contract["task_profile"]) is True
 
 
 def test_regex_mode_only_hints_initial_tools_and_never_shrinks_read_authority() -> None:

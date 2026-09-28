@@ -5,12 +5,14 @@ from scansci_html.llm import (
     AnthropicCompatibleChatJsonClient,
     CascadingChatJsonClient,
     OpenAICompatibleChatJsonClient,
+    _model_transport_exception,
     _public_model_error,
     analyze_vision_images,
     build_chat_json_client,
     complete_chat_text,
     stream_chat_text,
 )
+from scansci_html.model_transport import provider_request_headers
 
 
 def test_public_model_error_reports_exhausted_balance_actionably():
@@ -43,6 +45,22 @@ def test_public_model_error_distinguishes_gateway_and_upstream_rate_limits():
     assert "ScanSci 托管模型网关当前限流" in _public_model_error(gateway_error, prefix="模型服务暂时不可用")
     assert "上游服务当前限流" in _public_model_error(upstream_error, prefix="模型服务暂时不可用")
     assert "b95e7079-0000-4000-8000-000000000001" in _public_model_error(gateway_error, prefix="模型服务暂时不可用")
+
+
+def test_model_transport_exception_preserves_retry_metadata():
+    class RateLimitedResponse:
+        status_code = 429
+        headers = {"Retry-After": "12"}
+
+        def json(self):
+            return {"error": {"code": "rate_limit_exceeded"}}
+
+    error = requests.HTTPError("HTTP 429", response=RateLimitedResponse())
+    wrapped = _model_transport_exception(error, prefix="模型流式响应暂时不可用")
+
+    assert wrapped.failure["code"] == "rate_limit_exceeded"
+    assert wrapped.failure["retryable"] is True
+    assert wrapped.failure["retry_after_seconds"] == 12.0
 
 
 def test_cascading_chat_client_latches_onto_healthy_fallback():
@@ -804,6 +822,51 @@ def test_stream_chat_text_automatically_continues_after_length_finish():
     }
 
 
+def test_stream_chat_text_identifies_an_opencode_go_conversation():
+    class FakeResponse:
+        headers = {"Content-Type": "text/event-stream"}
+
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self, *, decode_unicode):
+            assert decode_unicode is False
+            return iter([
+                b'data: {"choices":[{"delta":{"content":"hello"},"finish_reason":"stop"}]}',
+                b"data: [DONE]",
+            ])
+
+        def close(self):
+            return None
+
+    captured: dict[str, str] = {}
+
+    class FakeSession:
+        def post(self, _url, *, headers, json, timeout, stream):
+            del json, timeout, stream
+            captured.update(headers)
+            return FakeResponse()
+
+    events = list(stream_chat_text(
+        "openai-compatible",
+        provider_id="opencode-go",
+        provider_session_id="conversation-secret-id",
+        base_url="https://opencode.ai/zen/go/v1",
+        api_key="secret",
+        model="hy4-preview",
+        messages=[{"role": "user", "content": "hello"}],
+        session=FakeSession(),
+        max_continuations=0,
+    ))
+
+    assert events[0]["content"] == "hello"
+    assert captured["User-Agent"] == "ScanSci"
+    assert captured["x-opencode-session"] == provider_request_headers(
+        "opencode-go", "conversation-secret-id"
+    )["x-opencode-session"]
+    assert "conversation-secret-id" not in captured["x-opencode-session"]
+
+
 def test_stream_chat_text_continues_when_provider_stops_before_required_marker():
     class FakeResponse:
         headers = {"Content-Type": "text/event-stream"}
@@ -912,6 +975,69 @@ def test_stream_chat_text_retries_rate_limits_without_losing_the_reply(monkeypat
     assert events[1]["content"] == "recovered"
     assert events[-1]["truncated"] is False
     assert sleeps == [7.0]
+
+
+def test_stream_chat_text_retries_local_http_500_even_with_single_logical_request(monkeypatch):
+    class TemporaryResponse:
+        status_code = 500
+        headers = {}
+        url = "http://127.0.0.1:17863/v1/chat/completions"
+
+        def raise_for_status(self):
+            raise requests.HTTPError("local runtime warming up", response=self)
+
+        def close(self):
+            return None
+
+    class SuccessResponse:
+        headers = {"Content-Type": "text/event-stream"}
+        encoding = None
+
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self, *, decode_unicode):
+            assert decode_unicode is False
+            return iter([
+                b'data: {"choices":[{"delta":{"content":"recovered"}}]}',
+                b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}',
+                b"data: [DONE]",
+            ])
+
+        def close(self):
+            return None
+
+    responses = [TemporaryResponse(), SuccessResponse()]
+    calls = []
+
+    class FakeSession:
+        def post(self, _url, *, headers, json, timeout, stream):
+            calls.append(json)
+            return responses.pop(0)
+
+    sleeps = []
+    monkeypatch.setattr("scansci_html.llm.time.sleep", sleeps.append)
+    events = list(stream_chat_text(
+        "openai-compatible",
+        base_url="http://127.0.0.1:17863/v1",
+        api_key="local",
+        model="local-model",
+        messages=[{"role": "user", "content": "hello"}],
+        max_requests=1,
+        session=FakeSession(),
+    ))
+
+    assert events[0] == {
+        "type": "retry",
+        "reason": "temporary_upstream_error",
+        "status": 500,
+        "delay_seconds": 2.0,
+        "attempt": 1,
+    }
+    assert events[1]["content"] == "recovered"
+    assert events[-1]["truncated"] is False
+    assert len(calls) == 2
+    assert sleeps == [2.0]
 
 
 def test_stream_chat_text_retries_two_rate_limits_before_delivery(monkeypatch):

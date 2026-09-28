@@ -11,11 +11,12 @@
     <link rel="stylesheet" href="/styles.css?v=32" />
   </head>
   <body>
-    <main class="workbench" id="workbench">
+    <main class="workbench compact-shell" id="workbench">
       <header class="desktop-titlebar" aria-label="ScanSci 窗口工具栏">
         <div class="desktop-titlebar-brand pywebview-drag-region" data-titlebar-drag>
           <span class="titlebar-app-mark" aria-hidden="true"><img src="/scansci-mark.png" alt="" /></span>
           <strong data-i18n="brand">ScanSci | 搜索科学</strong>
+          <span class="runtime-mode-badge" id="runtimeModeBadge" hidden></span>
         </div>
         <div class="desktop-titlebar-nav chrome-controls" aria-label="导航操作">
           <button type="button" class="chrome-icon sidebar-toggle" data-action="toggle-sidebar" aria-label="切换侧边栏" aria-expanded="true">
@@ -26,6 +27,12 @@
           </button>
           <button type="button" class="chrome-icon" data-action="history-forward" data-history-direction="forward" aria-label="前进" disabled>
             <span data-ui-icon="arrow-right"></span>
+          </button>
+          <button type="button" class="chrome-icon titlebar-new-task" data-action="new-task" aria-label="新建研究" title="新建研究">
+            <span data-ui-icon="plus"></span>
+          </button>
+          <button type="button" class="chrome-icon titlebar-settings" data-action="open-settings" data-settings-panel="general" aria-label="打开设置" title="打开设置">
+            <span data-ui-icon="settings"></span>
           </button>
         </div>
         <div class="app-update" id="appUpdate" data-app-update data-state="checking" hidden>
@@ -127,6 +134,7 @@
             <p id="homeSubline">直接描述你想完成的事</p>
             <form class="prompt-card" id="homeAskForm">
               <input id="homeModeSelect" type="hidden" value="general" />
+              <section class="first-run-welcome" id="firstRunWelcome" aria-live="polite" hidden></section>
               <div class="composer-knowledge-strip" id="homeKnowledgeScope" aria-live="polite" hidden></div>
               <div class="composer-source-strip" id="homeSourceAttachments" aria-live="polite" hidden></div>
               <div class="paper-list-attachment" id="homePaperBatchAttachment" aria-live="polite" hidden></div>
@@ -157,7 +165,6 @@
             <nav class="home-capability-shortcuts" aria-label="功能快捷入口">
               <button type="button" data-action="select-composer-mode" data-mode-value="academic" data-composer-mode-shortcut aria-pressed="false"><span class="capability-shortcut-icon"><span data-ui-icon="search"></span></span><span>学术搜索</span></button>
               <button type="button" data-action="select-composer-mode" data-mode-value="knowledge" data-composer-mode-shortcut aria-pressed="false"><span class="capability-shortcut-icon"><span data-ui-icon="message-circle"></span></span><span>证据问答</span></button>
-              <button type="button" data-action="select-composer-mode" data-mode-value="writing" data-composer-mode-shortcut aria-pressed="false"><span class="capability-shortcut-icon"><span data-ui-icon="pen"></span></span><span>学术写作</span></button>
               <button type="button" data-action="select-composer-mode" data-mode-value="slides" data-composer-mode-shortcut aria-pressed="false"><span class="capability-shortcut-icon"><span data-ui-icon="presentation"></span></span><span>学术 PPT</span></button>
               <button type="button" data-action="select-composer-mode" data-mode-value="download" data-composer-mode-shortcut aria-pressed="false"><span class="capability-shortcut-icon"><span data-ui-icon="download"></span></span><span>文献下载</span></button>
             </nav>
@@ -175,7 +182,7 @@
         <section class="app-view conversation-view" data-view="conversation" aria-label="Research conversation">
           <header class="conversation-header">
             <button type="button" class="back-button" data-action="new-task">←</button>
-            <div><p class="overline">历史对话</p><h1 id="conversationTitle">新研究</h1></div>
+            <div class="conversation-title-group"><h1 id="conversationTitle">新研究</h1><input id="conversationTitleInput" maxlength="120" aria-label="会话标题：Enter 保存，Esc 取消" hidden /><button type="button" class="conversation-title-edit" id="renameConversationButton" data-action="rename-direct-conversation" aria-label="重命名会话" title="重命名会话" hidden><span data-ui-icon="pen"></span></button></div>
             <div class="conversation-header-actions">
               <button type="button" class="evidence-panel-expand" id="evidencePanelExpand" data-action="toggle-evidence-panel-expand" aria-label="展开全文证据面板" aria-controls="contextPanel" aria-expanded="false" title="展开全文证据面板" hidden>
                 <span data-ui-icon="expand"></span>
@@ -188,9 +195,11 @@
           <div class="conversation-layout" id="conversationLayout">
               <section class="conversation-main">
                 <div class="answer-area" id="answerArea" aria-live="polite"><div class="chat-empty">提出一个问题，回答将只引用当前资料库。</div></div>
+                <div class="conversation-composer-dock">
                 <button type="button" class="conversation-jump-latest" id="conversationJumpLatest" data-action="jump-conversation-latest" aria-label="回到最新消息" title="回到最新消息" hidden>
                   <span data-ui-icon="chevron-down"></span>
                 </button>
+                <section class="direct-live-controls" id="chatLiveControls" aria-label="当前对话运行控制" aria-live="polite" hidden></section>
                 <form class="chat-composer" id="chatAskForm">
                 <input id="chatModeSelect" type="hidden" value="general" />
                 <div class="composer-knowledge-strip" id="chatKnowledgeScope" aria-live="polite" hidden></div>
@@ -198,7 +207,6 @@
                 <div class="composer-image-strip" id="chatImageAttachments" aria-live="polite" hidden></div>
                 <div class="composer-audio-strip" id="chatAudioAttachments" aria-live="polite" hidden></div>
                 <div class="composer-skill-strip" id="chatSkillTokens" aria-label="已选择的 Skill" aria-live="polite" hidden></div>
-                <section class="direct-live-controls" id="chatLiveControls" aria-label="当前对话运行控制" aria-live="polite" hidden></section>
                 <textarea id="chatQuestionInput" rows="2" placeholder="继续追问或提出新的研究问题"></textarea>
                 <div class="chat-composer-tools">
                   <div class="composer-left">
@@ -226,6 +234,7 @@
                   <span data-ui-icon="chevron-down" data-icon-class="slide-template-chevron"></span>
                 </button>
               </div>
+                </div>
             </section>
             <aside class="reference-panel" id="contextPanel" aria-label="研究上下文">
               <section class="context-panel-view source-panel-view is-active" id="sourcePanelView" aria-label="参考文献">
@@ -278,7 +287,7 @@
                 <h2 class="settings-nav-group-title">本地 AI</h2>
                 <div class="settings-nav-group-items">
                   <button type="button" class="settings-nav" data-settings-panel="defaults"><span data-ui-icon="sliders"></span><span class="settings-nav-label" data-i18n="defaultCapabilities">默认能力</span></button>
-                  <button type="button" class="settings-nav" data-settings-panel="local-models"><span data-ui-icon="layout"></span><span class="settings-nav-label" data-i18n="localModels">本地模型</span></button>
+                  <button type="button" class="settings-nav" data-settings-panel="local-models"><span data-ui-icon="layout"></span><span class="settings-nav-label" data-i18n="localModels">模型市场</span></button>
                   <button type="button" class="settings-nav" data-settings-panel="runtime"><span data-ui-icon="cpu"></span><span class="settings-nav-label">运行时</span></button>
                 </div>
               </section>
@@ -409,7 +418,7 @@
     <div class="toast" id="toast" role="status" aria-live="polite"></div>
     <script src="/vendor/pptxgen/pptxgen.bundle.js"></script>
     <script src="/pptx-export.js"></script>
-    <script type="module" src="/app.js?v=26"></script>
+    <script type="module" src="/app.js?v=30"></script>
     <script type="module" src="/pdf-viewer.js"></script>
   </body>
 </html>

@@ -64,11 +64,11 @@ def test_each_queued_message_exposes_follow_up_and_immediate_adjust_actions() ->
     switch_mode = _function_body(script, "setQueuedDirectTurnMode", "removeQueuedDirectTurn")
 
     assert 'data-action="set-queued-direct-mode"' in render
-    assert 'data-queue-mode="follow-up"' in render
     assert 'data-queue-mode="steer"' in render
-    assert "完成后继续" in render
-    assert "立即调整" in render
-    assert '<li data-queue-id=' in render
+    assert 'data-action="edit-direct-follow-up"' in render
+    assert 'data-action="remove-direct-follow-up"' in render
+    assert "立即" in render
+    assert '<li class="direct-live-queue-item"' in render
     assert "job.queue.findIndex" in switch_mode
     assert "job.queue.splice" in switch_mode
     assert "steerDirectChat(job, turn)" in switch_mode
@@ -100,27 +100,60 @@ def test_running_composer_button_only_pauses_when_the_input_is_empty() -> None:
 def test_queued_messages_are_one_full_width_row_each() -> None:
     styles = _styles()
     queue = _css_rule(styles, ".direct-live-queue ol")
-    row = _css_rule(styles, ".direct-live-queue li")
-    message = _css_rule(styles, ".direct-live-queue li > span")
+    row = _css_rule(styles, ".direct-live-queue-item")
+    message = _css_rule(styles, ".direct-live-queue-text")
     mode_button = _css_rule(
         styles,
-        '.chat-composer .direct-live-queue li button[data-action="set-queued-direct-mode"]',
+        '.direct-live-queue-action.is-immediate',
     )
-    actions = _css_rule(styles, ".direct-live-queue li .direct-live-actions")
+    actions = _css_rule(styles, ".direct-live-queue-actions")
 
     assert "flex-direction: column" in queue
     assert "flex-wrap: nowrap" in queue
     assert "width: 100%" in queue
     assert "width: 100%" in row
-    assert "max-width: none" in row
+    assert "min-height: 34px" in row
+    assert "background: transparent" in row
     assert "min-width: 0" in message
-    assert "flex: 1 1 auto" in message
-    assert "width: auto" in mode_button
-    assert "margin-left: auto" in actions
+    assert "color: var(--ink)" in mode_button
+    assert "justify-content: flex-end" in actions
 
 
 def test_queue_surface_is_rendered_above_the_chat_input() -> None:
     index = _index()
-    composer = index.split('<form class="chat-composer" id="chatAskForm">', 1)[1].split("</form>", 1)[0]
+    assert index.index('id="chatLiveControls"') < index.index('<form class="chat-composer" id="chatAskForm">')
+    assert index.index('id="chatLiveControls"') < index.index('id="chatQuestionInput"')
 
-    assert composer.index('id="chatLiveControls"') < composer.index('id="chatQuestionInput"')
+
+def test_streaming_render_preserves_queue_nodes_during_drag() -> None:
+    render = _function_body(_script(), "renderDirectLiveControls", "setQueuedDirectTurnMode")
+
+    guard = (
+        "if (job && directQueueDrag.queueId "
+        "&& directQueueDrag.conversationId === job.conversationId) return;"
+    )
+    assert guard in render
+    assert render.index(guard) < render.index("surface.innerHTML")
+
+
+def test_direct_processing_trace_surfaces_latest_phase_and_compacts_repeated_updates() -> None:
+    script = _script()
+    trace = _function_body(script, "processTraceMarkup", "reuseImagePrompt")
+
+    assert "const trace = compactProcessTrace(message);" in trace
+    assert "const latest = trace.length ? trace[trace.length - 1] : null;" in trace
+    assert "recordCount" in trace
+    assert '<details class="answer-processing' in trace
+    assert "return unique.slice(-8);" in script
+
+
+def test_workflow_process_stays_in_one_collapsed_chat_facing_surface() -> None:
+    script = _script()
+    render = _function_body(script, "renderRun", "taskConversationMarkup")
+
+    assert "const summaryTitle" in render
+    assert "runSummaryActionsMarkup(run)" in render
+    assert '<details class="run-execution-log' in render
+    assert 'state.runExecutionDetailsOpen' in render
+    assert '<strong>执行详情</strong>' not in render
+    assert '<section class="run-activity-message' not in render

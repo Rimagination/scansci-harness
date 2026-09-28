@@ -304,6 +304,7 @@ def search_evidence_store(
     ranked = (reranker or LexicalReranker()).rerank(query, normalized_candidates)
     capped = _apply_per_document_limit(ranked, per_document_limit=per_document_limit)
     hits = capped[: max(0, int(limit))]
+    hits = _attach_sentence_context(hits, rows)
     if _normalized_context_mode(context_mode) == "block":
         hits = _expand_hits_to_parent_blocks(hits, rows)
     _append_retrieval_trace(
@@ -570,6 +571,7 @@ def _search_evidence_store_from_document_cards(
     ranked = (reranker or LexicalReranker()).rerank(query, normalized_candidates)
     capped = _apply_per_document_limit(ranked, per_document_limit=per_document_limit)
     hits = capped[: max(0, int(limit))]
+    hits = _attach_sentence_context(hits, context_rows)
     if _normalized_context_mode(context_mode) == "block":
         block_rows = _load_block_context_rows(db, {str(hit.get("evidence_id", "")): hit for hit in hits}, filters=filters)
         hits = _expand_hits_to_parent_blocks(hits, block_rows)
@@ -1493,6 +1495,50 @@ def _expand_hits_to_parent_blocks(
         expanded["text"] = parent_text
         expanded_hits.append(expanded)
     return expanded_hits
+
+
+def _attach_sentence_context(
+    hits: list[dict[str, Any]],
+    rows: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Attach exact one-hop context without changing the citation boundary.
+
+    The hit remains the selected sentence and keeps its own evidence ID and
+    anchor.  Context is read only from the same indexed parent block, so a
+    paragraph boundary can never make an unrelated sentence look adjacent.
+    """
+
+    if not hits:
+        return []
+    spans_by_block = _spans_by_block(rows)
+    enriched: list[dict[str, Any]] = []
+    for raw_hit in hits:
+        hit = dict(raw_hit)
+        evidence_id = str(hit.get("evidence_id", ""))
+        source = rows.get(evidence_id, hit)
+        block_id = str(source.get("block_id", hit.get("block_id", ""))).strip()
+        block_spans = spans_by_block.get(block_id, [])
+        current_index = next(
+            (index for index, span in enumerate(block_spans) if str(span.get("evidence_id", "")) == evidence_id),
+            -1,
+        )
+        before = block_spans[current_index - 1] if current_index > 0 else None
+        after = block_spans[current_index + 1] if current_index >= 0 and current_index + 1 < len(block_spans) else None
+        matched_text = _context_sentence_text(source.get("text", hit.get("text", "")))
+        hit["matched_text"] = matched_text
+        hit["context_before"] = _context_sentence_text(before.get("text", "")) if before else ""
+        hit["context_after"] = _context_sentence_text(after.get("text", "")) if after else ""
+        hit["context_before_evidence_id"] = str(before.get("evidence_id", "")) if before else ""
+        hit["context_after_evidence_id"] = str(after.get("evidence_id", "")) if after else ""
+        enriched.append(hit)
+    return enriched
+
+
+def _context_sentence_text(value: Any, *, max_chars: int = 1_200) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) <= max_chars:
+        return text
+    return text[: max_chars - 1].rstrip() + "…"
 
 
 def _spans_by_block(rows: dict[str, dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:

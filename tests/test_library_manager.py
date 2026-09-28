@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 import base64
+from concurrent.futures import ThreadPoolExecutor
 import json
 from pathlib import Path
 import sqlite3
+import subprocess
+import sys
+from threading import Event
 
 import pytest
 
@@ -39,6 +43,252 @@ def _workspace(tmp_path: Path) -> tuple[Path, Path]:
     initialize_notebook(workspace, notebook_id="research", title="Research", root_path=old_library)
     sync_sources_from_evidence_store(workspace, evidence, notebook_id="research")
     return workspace, evidence
+
+
+def test_concurrent_file_imports_preserve_both_additions(tmp_path: Path, monkeypatch):
+    from scansci_html import library_manager
+
+    workspace, evidence = _workspace(tmp_path)
+    first = tmp_path / "first.txt"
+    second = tmp_path / "second.txt"
+    first.write_text("The first paper contains evidence about attention mechanisms.", encoding="utf-8")
+    second.write_text("The second paper contains evidence about retrieval augmentation.", encoding="utf-8")
+    entered, release, second_started, second_finished = Event(), Event(), Event(), Event()
+    extract = library_manager.extract_local_document
+
+    def held_extract(path, **kwargs):
+        if Path(path) == first:
+            entered.set()
+            assert release.wait(5), "first import was not released"
+        return extract(path, **kwargs)
+
+    def import_second():
+        second_started.set()
+        try:
+            return import_library_files(workspace, evidence, notebook_id="research", file_paths=[second])
+        finally:
+            second_finished.set()
+
+    monkeypatch.setattr(library_manager, "extract_local_document", held_extract)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        a = executor.submit(import_library_files, workspace, evidence, notebook_id="research", file_paths=[first])
+        try:
+            assert entered.wait(5)
+            b = executor.submit(import_second)
+            assert second_started.wait(5)
+            assert not second_finished.wait(0.2), "imports must not replace each other's active generation"
+        finally:
+            release.set()
+        assert a.result()["added_files"] == 1
+        assert b.result()["added_files"] == 1
+
+    notebook = load_workspace_summary(workspace, notebook_id="research")["notebooks"][0]
+    assert notebook["counts"]["sources"] == 3
+    assert first.is_file() and second.is_file()
+
+
+def test_cross_process_import_lock_rejects_conflict_and_releases_after_error(tmp_path: Path):
+    from scansci_html.library_manager import _library_process_lock
+
+    workspace, evidence = _workspace(tmp_path)
+    source = tmp_path / "new.txt"
+    source.write_text("New evidence remains searchable after the competing importer has stopped.", encoding="utf-8")
+    root = workspace.parent / ".scansci-library" / "research"
+    script = """
+import sys
+from scansci_html.library_manager import import_library_files
+try:
+    import_library_files(sys.argv[1], sys.argv[2], notebook_id='research', file_paths=[sys.argv[3]])
+except RuntimeError as error:
+    assert 'ScanSci' in str(error) and '进程' in str(error), str(error)
+    print('locked')
+else:
+    raise AssertionError('another process imported while the library lock was held')
+"""
+    with pytest.raises(RuntimeError, match="simulated interruption"):
+        with _library_process_lock(root):
+            child = subprocess.run(
+                [sys.executable, "-X", "utf8", "-c", script, str(workspace), str(evidence), str(source)],
+                capture_output=True, text=True, encoding="utf-8", timeout=20,
+            )
+            assert child.returncode == 0, child.stderr
+            assert child.stdout.strip() == "locked"
+            assert not list(root.glob("generation-*"))
+            raise RuntimeError("simulated interruption")
+
+    result = import_library_files(workspace, evidence, notebook_id="research", file_paths=[source])
+    assert result["added_files"] == 1
+    assert result["notebook"]["counts"]["sources"] == 2
+    assert source.read_text(encoding="utf-8").startswith("New evidence")
+
+
+@pytest.mark.parametrize(
+    ("filename", "title_lines", "embedded_title", "supplied_title", "expected"),
+    [
+        ("Vaswani2017_Attention.pdf", ["Attention Is All You Need"], "", "", "Attention Is All You Need"),
+        (
+            "Lewis2020_Retrieval.pdf",
+            ["Retrieval-Augmented Generation for", "Knowledge-Intensive NLP Tasks"],
+            "", "", "Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks",
+        ),
+        ("Author2020_Short.pdf", ["A visible title on the first page"], "Verified PDF title", "", "Verified PDF title"),
+        ("Author2020_Short.pdf", ["A visible title on the first page"], "PDF title", "Curated catalog title", "Curated catalog title"),
+    ],
+)
+def test_pdf_import_prefers_catalog_then_metadata_then_first_page_title(
+    tmp_path: Path, filename, title_lines, embedded_title, supplied_title, expected,
+):
+    import fitz
+
+    workspace, evidence = _workspace(tmp_path)
+    source = tmp_path / filename
+    with fitz.open() as document:
+        page = document.new_page()
+        for index, line in enumerate(title_lines):
+            page.insert_text((60, 72 + index * 22), line, fontsize=18)
+        page.insert_text((60, 135), "A. Researcher and B. Author", fontsize=11)
+        page.insert_text((60, 158), "Research Institute", fontsize=10)
+        page.insert_text((60, 185), "Abstract", fontsize=11)
+        page.insert_text((60, 205), "This paper presents traceable evidence for reliable scientific research.", fontsize=10)
+        page.insert_text((20, 400), "arXiv: 2005.11401", fontsize=24, rotate=90)
+        if embedded_title:
+            document.set_metadata({"title": embedded_title})
+        document.save(source)
+    original_bytes = source.read_bytes()
+    result = import_library_files(
+        workspace, evidence, notebook_id="research", file_paths=[source], replace_existing=True,
+        source_metadata={str(source.resolve()): {"title": supplied_title}} if supplied_title else None,
+    )
+    assert result["notebook"]["sources"][0]["title"] == expected
+    assert result["ingestion"]["sources"][0]["metadata"]["title"] == expected
+    assert source.read_bytes() == original_bytes
+    if not supplied_title and not embedded_title:
+        assert "pdf-first-page" in result["ingestion"]["sources"][0]["metadata"]["metadata_source"]
+
+
+def test_ambiguous_pdf_title_keeps_filename_and_ignores_page_markers(tmp_path: Path):
+    import fitz
+    from scansci_html.library_manager import _pdf_first_page_title, _title_from_extracted_text
+
+    source = tmp_path / "notes.pdf"
+    with fitz.open() as document:
+        page = document.new_page()
+        page.insert_text((60, 72), "An ordinary sentence in a uniform text document.", fontsize=11)
+        page.insert_text((60, 94), "Another ordinary sentence without a prominent title.", fontsize=11)
+        document.save(source)
+    assert _pdf_first_page_title(source) == ""
+    assert _title_from_extracted_text("# 第 1 页\n\nSome text\n\n# 第 2 页\nMore text") == ""
+    assert _title_from_extracted_text("# A real document heading\n\nSome text") == "A real document heading"
+
+
+@pytest.mark.parametrize("entrypoint", ["files", "folder", "replace"])
+def test_pdf_reimport_updates_title_without_changing_source_identity(tmp_path: Path, entrypoint):
+    import fitz
+
+    workspace, evidence = tmp_path / "workspace.sqlite", tmp_path / "evidence.sqlite"
+    initialize_notebook(workspace, notebook_id="research", title="Research", root_path=tmp_path)
+    downloads = tmp_path / "downloads"
+    downloads.mkdir()
+    source = downloads / "Lewis2020_Retrieval.pdf"
+    other = tmp_path / "other.txt"
+    other.write_text("Another paper remains available when the downloaded PDF is imported again.", encoding="utf-8")
+    with fitz.open() as document:
+        page = document.new_page()
+        page.insert_text((60, 72), "Retrieval-Augmented Generation for", fontsize=18)
+        page.insert_text((60, 94), "Knowledge-Intensive NLP Tasks", fontsize=18)
+        page.insert_text((60, 135), "P. Lewis and coauthors", fontsize=10)
+        page.insert_text((60, 158), "This paper provides traceable evidence for retrieval augmented generation.", fontsize=10)
+        document.save(source)
+    original_bytes = source.read_bytes()
+    initial = import_library_files(
+        workspace, evidence, notebook_id="research", file_paths=[source, other],
+        source_metadata={str(source.resolve()): {"title": "Lewis2020"}},
+    )
+    original_sources = {item["source_url"]: item for item in initial["notebook"]["sources"]}
+    prior = original_sources[str(source.resolve())]
+    with sqlite3.connect(notebook_evidence_db(evidence, "research")) as connection:
+        prior_evidence = connection.execute(
+            "select evidence_id, text from evidence_spans where doc_id = ? order by evidence_id", (prior["doc_id"],),
+        ).fetchall()
+    assert prior_evidence
+
+    if entrypoint == "folder":
+        updated = import_library_folder(
+            workspace, evidence, notebook_id="research", folder_path=downloads, merge_existing=True,
+        )
+    else:
+        updated = import_library_files(
+            workspace, evidence, notebook_id="research",
+            file_paths=[source, other] if entrypoint == "replace" else [source, source.parent / "." / source.name],
+            replace_existing=entrypoint == "replace",
+        )
+
+    assert updated["notebook"]["counts"]["sources"] == 2
+    current_sources = {item["source_url"]: item for item in updated["notebook"]["sources"]}
+    for path, previous in original_sources.items():
+        assert current_sources[path]["doc_id"] == previous["doc_id"]
+        assert current_sources[path]["source_id"] == previous["source_id"]
+    assert current_sources[str(source.resolve())]["title"] == (
+        "Retrieval-Augmented Generation for Knowledge-Intensive NLP Tasks"
+    )
+    with sqlite3.connect(notebook_evidence_db(evidence, "research")) as connection:
+        assert connection.execute(
+            "select evidence_id, text from evidence_spans where doc_id = ? order by evidence_id", (prior["doc_id"],),
+        ).fetchall() == prior_evidence
+    assert source.read_bytes() == original_bytes
+    assert len(list(Path(updated["folder_path"]).glob("*.md"))) == 2
+
+
+def test_failed_reimport_preserves_identity_and_same_named_distinct_sources(tmp_path: Path, monkeypatch):
+    workspace, evidence = tmp_path / "workspace.sqlite", tmp_path / "evidence.sqlite"
+    initialize_notebook(workspace, notebook_id="research", title="Research", root_path=tmp_path)
+    originals = []
+    for folder in ("first", "second"):
+        path = tmp_path / folder / "paper.txt"
+        path.parent.mkdir()
+        path.write_text(f"The {folder} original has separate traceable evidence and must retain its identity.", encoding="utf-8")
+        originals.append(path)
+    initial = import_library_files(workspace, evidence, notebook_id="research", file_paths=originals)
+
+    def failed_extract(*args, **kwargs):
+        raise ValueError("simulated parser failure")
+
+    monkeypatch.setattr("scansci_html.library_manager.extract_local_document", failed_extract)
+    updated = import_library_files(workspace, evidence, notebook_id="research", file_paths=[originals[0]])
+
+    assert updated["skipped_files"] == [{"name": "paper.txt", "error": "ValueError: simulated parser failure"}]
+    assert updated["notebook"]["counts"]["sources"] == 2
+    assert {
+        (item["source_url"], item["doc_id"], item["source_id"]) for item in updated["notebook"]["sources"]
+    } == {
+        (item["source_url"], item["doc_id"], item["source_id"]) for item in initial["notebook"]["sources"]
+    }
+    assert all(path.read_text(encoding="utf-8").startswith("The ") for path in originals)
+
+
+def test_reimport_refuses_to_merge_preexisting_duplicate_source_identities(tmp_path: Path):
+    from scansci_html.library_manager import _markdown_document
+
+    workspace, evidence = tmp_path / "workspace.sqlite", tmp_path / "evidence.sqlite"
+    initialize_notebook(workspace, notebook_id="research", title="Research", root_path=tmp_path)
+    source = tmp_path / "paper.txt"
+    source.write_text("The original document has existing citations that must remain valid.", encoding="utf-8")
+    legacy = tmp_path / "legacy"
+    legacy.mkdir()
+    for index, title in enumerate(("Old title", "Improved title")):
+        (legacy / f"paper-{index}.md").write_text(
+            _markdown_document({"title": title, "source_url": str(source.resolve())}, source.read_text(encoding="utf-8")),
+            encoding="utf-8",
+        )
+    initial = import_library_folder(workspace, evidence, notebook_id="research", folder_path=legacy)
+    assert initial["notebook"]["counts"]["sources"] == 2
+
+    with pytest.raises(ValueError, match="已关联多个资料记录"):
+        import_library_files(workspace, evidence, notebook_id="research", file_paths=[source])
+
+    current = load_workspace_summary(workspace, notebook_id="research")["notebooks"][0]
+    assert current["sources"] == initial["notebook"]["sources"]
+    assert source.read_text(encoding="utf-8").startswith("The original document")
 
 
 def test_discover_local_zotero_prefers_profile_data_dir_over_stale_default(

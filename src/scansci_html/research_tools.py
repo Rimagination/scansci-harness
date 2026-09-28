@@ -7,7 +7,7 @@ credentials outside the operating-system credential manager.
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from datetime import datetime
 from difflib import SequenceMatcher
 import json
@@ -16,6 +16,7 @@ from pathlib import Path
 import random
 import re
 import shutil
+import signal
 import subprocess
 import sys
 from tempfile import TemporaryDirectory
@@ -25,9 +26,17 @@ from typing import Any, Callable
 from urllib import error, parse, request
 from uuid import uuid4
 
-from .academic_search import search_academic_papers, search_openalex_author_works
+from .academic_search import (
+    FederatedAcademicSearch,
+    _apply_topic_quality_gate,
+    _normalized_author_name,
+    build_academic_provider,
+    search_academic_papers,
+    search_openalex_author_works,
+)
 from .agent_capabilities import capability_catalog
 from .app_settings import get_provider_api_key, load_settings
+from .jev_client import DEFAULT_ENDPOINT as JEV_DEFAULT_ENDPOINT, DEFAULT_MODEL as JEV_DEFAULT_MODEL, JEVError, ask_jev
 from .retrieval_intent import compile_retrieval_intent
 from .slides_templates import get_slide_template, resolve_slide_template_dir
 
@@ -78,6 +87,7 @@ def _run_scansci_pdf(
     timeout: float,
     retry_encoding_failure: bool = False,
     env_overrides: dict[str, str] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run ``scansci-pdf`` with UTF-8 output and one encoding-safe retry."""
 
@@ -91,8 +101,9 @@ def _run_scansci_pdf(
         "shell": False,
     }
     try:
-        completed = subprocess.run(
+        completed = _run_download_cli(
             command,
+            cancel_check=cancel_check,
             env=_scansci_pdf_environment(overrides=env_overrides),
             **run_options,
         )
@@ -108,8 +119,9 @@ def _run_scansci_pdf(
         )
     if retry_encoding_failure and completed.returncode != 0 and _is_cli_encoding_failure(completed):
         try:
-            completed = subprocess.run(
+            completed = _run_download_cli(
                 command,
+                cancel_check=cancel_check,
                 env=_scansci_pdf_environment(fallback_errors=True, overrides=env_overrides),
                 **run_options,
             )
@@ -121,6 +133,129 @@ def _run_scansci_pdf(
                 stderr=f"scansci-pdf timed out after {timeout:g}s",
             )
     return completed
+
+
+def _start_windows_download(command: list[str], **options: Any):
+    """Own descendants even if the CLI launcher exits before its children.
+
+    Start suspended, assign a Windows Job, then resume: no child can escape
+    between process creation and assignment. Only this invocation is affected.
+    """
+    import ctypes
+    from ctypes import wintypes
+
+    class ThreadEntry(ctypes.Structure):
+        _fields_ = [(name, kind) for name, kind in (
+            ("size", wintypes.DWORD), ("usage", wintypes.DWORD),
+            ("thread_id", wintypes.DWORD), ("process_id", wintypes.DWORD),
+            ("priority", wintypes.LONG), ("delta", wintypes.LONG),
+            ("flags", wintypes.DWORD),
+        )]
+
+    kernel = ctypes.WinDLL("kernel32", use_last_error=True)
+    signatures = {
+        "CreateJobObjectW": ([ctypes.c_void_p, wintypes.LPCWSTR], wintypes.HANDLE),
+        "AssignProcessToJobObject": ([wintypes.HANDLE, wintypes.HANDLE], wintypes.BOOL),
+        "TerminateJobObject": ([wintypes.HANDLE, wintypes.UINT], wintypes.BOOL),
+        "CloseHandle": ([wintypes.HANDLE], wintypes.BOOL),
+        "CreateToolhelp32Snapshot": ([wintypes.DWORD, wintypes.DWORD], wintypes.HANDLE),
+        "Thread32First": ([wintypes.HANDLE, ctypes.POINTER(ThreadEntry)], wintypes.BOOL),
+        "Thread32Next": ([wintypes.HANDLE, ctypes.POINTER(ThreadEntry)], wintypes.BOOL),
+        "OpenThread": ([wintypes.DWORD, wintypes.BOOL, wintypes.DWORD], wintypes.HANDLE),
+        "ResumeThread": ([wintypes.HANDLE], wintypes.DWORD),
+    }
+    for name, (arguments, result) in signatures.items():
+        function = getattr(kernel, name)
+        function.argtypes, function.restype = arguments, result
+    job = kernel.CreateJobObjectW(None, None)
+    if not job:
+        raise ctypes.WinError(ctypes.get_last_error())
+
+    def stop_tree():
+        try:
+            if not kernel.TerminateJobObject(job, 1):
+                raise ctypes.WinError(ctypes.get_last_error())
+        finally:
+            kernel.CloseHandle(job)
+
+    process = None
+    try:
+        process = subprocess.Popen(command, creationflags=subprocess.CREATE_NO_WINDOW | 0x4, **options)  # CREATE_SUSPENDED
+        if not kernel.AssignProcessToJobObject(job, int(process._handle)):
+            raise ctypes.WinError(ctypes.get_last_error())
+        snapshot = kernel.CreateToolhelp32Snapshot(0x4, 0)  # TH32CS_SNAPTHREAD
+        if snapshot == wintypes.HANDLE(-1).value:
+            raise ctypes.WinError(ctypes.get_last_error())
+        try:
+            entry = ThreadEntry()
+            entry.size = ctypes.sizeof(entry)
+            found = kernel.Thread32First(snapshot, ctypes.byref(entry))
+            while found:
+                if entry.process_id == process.pid:
+                    thread = kernel.OpenThread(0x2, False, entry.thread_id)  # THREAD_SUSPEND_RESUME
+                    if not thread:
+                        raise ctypes.WinError(ctypes.get_last_error())
+                    try:
+                        if kernel.ResumeThread(thread) == 0xFFFFFFFF:
+                            raise ctypes.WinError(ctypes.get_last_error())
+                    finally:
+                        kernel.CloseHandle(thread)
+                    return process, stop_tree
+                found = kernel.Thread32Next(snapshot, ctypes.byref(entry))
+            raise OSError("Cannot find the download process's suspended thread")
+        finally:
+            kernel.CloseHandle(snapshot)
+    except BaseException:
+        try:
+            stop_tree()
+        finally:
+            if process is not None:
+                process.kill()
+                process.communicate(timeout=2)
+        raise
+
+
+def _run_download_cli(command: list[str], *, cancel_check: Callable[[], bool] | None, **options: Any) -> subprocess.CompletedProcess[str]:
+    if cancel_check is None:
+        return subprocess.run(command, **options)
+    if cancel_check():
+        raise _BatchCancelled("文献任务已停止")
+    timeout = float(options.pop("timeout"))
+    options.pop("check", None)
+    options.pop("capture_output", None)
+    options.update(stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    if os.name == "nt":
+        process, stop_tree = _start_windows_download(command, **options)
+    else:
+        process = subprocess.Popen(command, start_new_session=True, **options)
+    deadline = time.monotonic() + timeout
+    try:
+        while True:
+            if cancel_check():
+                raise _BatchCancelled("文献任务已停止")
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise subprocess.TimeoutExpired(command, timeout)
+            try:
+                stdout, stderr = process.communicate(timeout=min(0.1, remaining))
+                return subprocess.CompletedProcess(command, process.returncode, stdout, stderr)
+            except subprocess.TimeoutExpired:
+                continue
+    finally:
+        # The parent may already have exited while a child still holds stdout.
+        if os.name == "nt":
+            stop_tree()
+        else:
+            try:
+                os.killpg(process.pid, signal.SIGKILL)
+            except ProcessLookupError:
+                pass
+        try:
+            process.communicate(timeout=2)
+        except subprocess.TimeoutExpired:
+            # Closing a stream with an active Windows reader can itself block.
+            # Its daemon reader will close it when the terminated tree exits.
+            pass
 
 
 def _parse_scansci_pdf_json(output: str) -> dict[str, Any]:
@@ -177,6 +312,7 @@ def _run_scansci_pdf_fetch(
     output_dir: Path,
     timeout: float,
     env_overrides: dict[str, str] | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any] | None:
     """Use the latest structured institutional cascade as a safe fallback."""
 
@@ -194,6 +330,7 @@ def _run_scansci_pdf_fetch(
         timeout=timeout,
         retry_encoding_failure=True,
         env_overrides=env_overrides,
+        cancel_check=cancel_check,
     )
     stdout = str(getattr(completed, "stdout", "") or "")
     stderr = str(getattr(completed, "stderr", "") or "")
@@ -356,6 +493,52 @@ def capability_snapshot(*, workspace: str | Path, evidence_db: str | Path) -> di
     }
 
 
+def _jev_api_key(workspace: str | Path, provider_id: str) -> str:
+    """Resolve the first configured JEV key without returning it to callers."""
+
+    stored = get_provider_api_key(workspace, provider_id)
+    return next((value.strip() for value in stored.split(",") if value.strip()), "")
+
+
+def _test_jev_connection(
+    *,
+    workspace: str | Path,
+    provider: dict[str, Any],
+    timeout: float,
+) -> dict[str, Any]:
+    started = time.perf_counter()
+    api_key = _jev_api_key(workspace, str(provider.get("id", "jev")))
+    endpoint = str(provider.get("base_url") or JEV_DEFAULT_ENDPOINT).strip()
+    try:
+        payload = ask_jev(
+            api_key=api_key,
+            endpoint=endpoint,
+            model=JEV_DEFAULT_MODEL,
+            state="ScanSci connection check",
+            questions={
+                "connection_check": {
+                    "type": "noul",
+                    "instructions": "Return a typed result confirming that this connection check is reachable.",
+                }
+            },
+            timeout=timeout,
+        )
+    except JEVError as exc:
+        raise RuntimeError(str(exc)) from exc
+    answer = payload.get("answers", {}).get("connection_check")
+    if not isinstance(answer, dict) or not str(answer.get("type", "")).strip():
+        raise RuntimeError("JEV API 返回了无法识别的结构化判断结果")
+    return {
+        "ok": True,
+        "status": "connected",
+        "checked_scope": "jev_evaluation",
+        "generation_verified": False,
+        "message": "JEV 结构化判断接口可访问；最小连接检测已完成。",
+        "latency_ms": round((time.perf_counter() - started) * 1000),
+        "model": str(payload.get("model") or JEV_DEFAULT_MODEL),
+    }
+
+
 def test_provider_connection(
     *,
     workspace: str | Path,
@@ -368,10 +551,13 @@ def test_provider_connection(
     kind = str(provider.get("kind", ""))
     if kind == "local":
         return {"ok": True, "status": "ready", "latency_ms": 0, "model_count": len(provider.get("models", []))}
+    if str(provider.get("id", "")).strip().lower() == "jev" or str(provider.get("api_surface", "")).strip().lower() == "jev_systemone":
+        return _test_jev_connection(workspace=workspace, provider=provider, timeout=timeout)
     base_url = str(provider.get("base_url", "")).strip().rstrip("/")
     if not base_url:
         raise ValueError("Base URL 尚未配置")
     api_key = get_provider_api_key(workspace, str(provider.get("id", "")))
+    api_key = next((value.strip() for value in api_key.split(",") if value.strip()), "")
     if not api_key:
         raise ValueError("请先保存 API Key")
     endpoint = f"{base_url}/models"
@@ -381,12 +567,18 @@ def test_provider_connection(
     else:
         headers["Authorization"] = f"Bearer {api_key}"
     payload = _request_json(endpoint, headers=headers, timeout=timeout)
-    models = payload.get("data", []) if isinstance(payload, dict) else []
+    models = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(models, list) or payload.get("error"):
+        raise RuntimeError("模型列表接口未返回有效列表，连接检测未通过；请检查 API 地址及服务商状态。")
+    has_image = any("image" in model.get("capabilities", []) for model in provider.get("models", []) if isinstance(model, dict))
     return {
         "ok": True,
         "status": "connected",
+        "checked_scope": "model_catalog",
+        "generation_verified": False,
+        "message": "模型列表接口可访问；生图权限尚未验证，未发起生图。" if has_image else "模型列表接口可访问；模型调用权限尚未验证。",
         "latency_ms": round((time.perf_counter() - started) * 1000),
-        "model_count": len(models) if isinstance(models, list) else 0,
+        "model_count": len(models),
     }
 
 
@@ -407,6 +599,9 @@ def fetch_provider_models(
     if kind == "local":
         models = [dict(item) for item in provider.get("models", []) if isinstance(item, dict)]
         return {"provider": str(provider.get("name", "")), "models": models, "count": len(models)}
+    if str(provider.get("id", "")).strip().lower() == "jev" or str(provider.get("api_surface", "")).strip().lower() == "jev_systemone":
+        models = [dict(item) for item in provider.get("models", []) if isinstance(item, dict)]
+        return {"provider": str(provider.get("name", "JEV")), "models": models, "count": len(models), "source": "fixed"}
     base_url = str(provider.get("base_url", "")).strip().rstrip("/")
     if not base_url:
         raise ValueError("请先填写 API 地址")
@@ -547,13 +742,21 @@ def download_paper(
     strategy: str = "oa_first",
     timeout: float = 180.0,
     env_overrides: dict[str, str] | None = None,
+    metadata_is_oa: bool | None = None,
     _output_dir: str | Path | None = None,
     _source_health_dir: str | Path | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
+    _check_download_cancelled(cancel_check)
     clean = _normalize_download_identifier(identifier)
     if not (_DOI_PATTERN.fullmatch(clean) or _ARXIV_PATTERN.fullmatch(clean)):
         raise ValueError("请输入有效 DOI 或 arXiv ID")
     normalized_strategy = strategy if strategy in {"legal_only", "oa_first", "gray_oa"} else "oa_first"
+    # Search metadata that says a work is closed-access does not justify
+    # skipping it (metadata can lag), but it does justify not spending the
+    # full per-item budget inside the multi-source CLI race before reporting
+    # the predictable failure.
+    cli_timeout = min(timeout, 45.0) if metadata_is_oa is False else timeout
     executable = shutil.which("scansci-pdf")
     output_dir = Path(_output_dir).resolve() if _output_dir else _download_directory(workspace)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -574,6 +777,7 @@ def download_paper(
             workspace=workspace,
             timeout=timeout,
             output_dir=output_dir,
+            cancel_check=cancel_check,
         )
 
     # Prefer one canonical open-access location before invoking the CLI race.
@@ -588,6 +792,7 @@ def download_paper(
                 timeout=timeout,
                 output_dir=output_dir,
                 source_health_dir=_source_health_dir,
+                cancel_check=cancel_check,
             )
         except RuntimeError:
             preferred = None
@@ -598,6 +803,7 @@ def download_paper(
                 workspace=workspace,
                 timeout=timeout,
                 output_dir=output_dir,
+                cancel_check=cancel_check,
             )
 
     # arXiv is itself the authoritative public archive.  Routing it through an
@@ -611,6 +817,7 @@ def download_paper(
             timeout=timeout,
             output_dir=output_dir,
             source_health_dir=_source_health_dir,
+            cancel_check=cancel_check,
         )
         return _finalize_download_result(
             result,
@@ -618,6 +825,7 @@ def download_paper(
             workspace=workspace,
             timeout=timeout,
             output_dir=output_dir,
+            cancel_check=cancel_check,
         )
     before = {
         path.resolve(): (path.stat().st_size, path.stat().st_mtime_ns)
@@ -625,7 +833,8 @@ def download_paper(
         if path.is_file()
     }
     command = [executable, "get", clean, "--output", str(output_dir), "--strategy", normalized_strategy]
-    completed = _run_scansci_pdf(command, timeout=timeout, env_overrides=env_overrides)
+    completed = _run_scansci_pdf(command, timeout=cli_timeout, env_overrides=env_overrides, cancel_check=cancel_check)
+    _check_download_cancelled(cancel_check)
     changed_pdfs: list[Path] = []
     for path in output_dir.glob("**/*"):
         if not path.is_file() or path.suffix.casefold() != ".pdf":
@@ -650,8 +859,9 @@ def download_paper(
             executable,
             clean,
             output_dir=output_dir,
-            timeout=timeout,
+            timeout=cli_timeout,
             env_overrides=env_overrides,
+            cancel_check=cancel_check,
         )
         if institutional and institutional.get("files"):
             return _finalize_download_result(
@@ -660,6 +870,7 @@ def download_paper(
                 workspace=workspace,
                 timeout=timeout,
                 output_dir=output_dir,
+                cancel_check=cancel_check,
             )
 
         # A few optional downloader versions report success while printing a
@@ -673,6 +884,7 @@ def download_paper(
                 timeout=timeout,
                 output_dir=output_dir,
                 source_health_dir=_source_health_dir,
+                cancel_check=cancel_check,
             )
             return _finalize_download_result(
                 result,
@@ -680,6 +892,7 @@ def download_paper(
                 workspace=workspace,
                 timeout=timeout,
                 output_dir=output_dir,
+                cancel_check=cancel_check,
             )
         except RuntimeError as fallback_error:
             detail = (completed.stderr or completed.stdout or "下载器没有生成有效 PDF").strip()
@@ -691,41 +904,120 @@ def download_paper(
         "output_dir": str(output_dir),
         "files": created,
         "message": (completed.stdout or "下载完成").strip()[-1200:],
-    }, clean, workspace=workspace, timeout=timeout, output_dir=output_dir)
+    }, clean, workspace=workspace, timeout=timeout, output_dir=output_dir, cancel_check=cancel_check)
 
 
 def search_papers_for_download(
     query: str = "",
     *,
     author: str = "",
+    search_plan: dict[str, Any] | None = None,
     limit: int = 20,
     sort: str = "relevance",
     year_from: int | None = None,
     year_to: int | None = None,
     timeout: float = 60.0,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Search ``scansci-pdf`` and return records that can enter download flow."""
 
     intent = compile_retrieval_intent(query, kind="paper_download") if str(query or "").strip() else None
     clean_query = str(intent["subject"]) if intent else ""
-    clean_author = str(author or "").strip()
+    clean_author = str(author or "").strip() or str((intent or {}).get("author", "")).strip()
+    if intent and intent.get("author_only"):
+        clean_query = ""
+    search_query = clean_query
+    search_intent = dict(intent or {})
+    if clean_query and isinstance(search_plan, dict) and search_plan.get("query_variants"):
+        variants = list(dict.fromkeys(
+            str(value).strip()
+            for value in list(search_plan.get("query_variants", []) or [])
+            if str(value).strip()
+        ))[:3]
+        english_variants = [value for value in variants if re.search(r"[A-Za-z]{2,}", value)]
+        if str(search_plan.get("planner", "")) != "deterministic":
+            english_variants = english_variants[:1]
+        proposed_search_query = str(search_plan.get("search_query", "")).strip()
+        if proposed_search_query not in english_variants:
+            proposed_search_query = next(
+                iter(english_variants),
+                "",
+            )
+        if proposed_search_query:
+            search_query = proposed_search_query
+        search_intent["query_variants"] = english_variants[:3]
+        if re.search(r"[A-Za-z]{2,}", search_query):
+            # Variants are complete scholarly queries, so they provide
+            # alternative full-topic matches without trusting loose concepts.
+            search_intent["required_terms"] = english_variants[:3] or [search_query]
+
+    def preserve_query_trace(result: dict[str, Any] | None) -> dict[str, Any] | None:
+        if result is not None:
+            result["query"] = clean_query
+            result["search_query"] = search_query
+            result["search_intent"] = search_intent
+        return result
+
     if not clean_query and not clean_author:
         raise ValueError("请给出检索主题或作者姓名")
     normalized_limit = max(1, min(50, int(limit or 20)))
     normalized_sort = sort if sort in {"relevance", "cited_by_count", "publication_date"} else "relevance"
+    inferred_limit = (intent or {}).get("limit")
+    if inferred_limit is not None:
+        normalized_limit = max(1, min(50, int(inferred_limit)))
+    # Delivery count is not a recall budget: a title's usable record may rank
+    # below metadata-only copies or unrelated provider hits.
+    candidate_limit = max(6, normalized_limit)
+    # High-citation author lists are dominated by paywalled classics, so an
+    # author search pulls a wider pool before OA-first selection.
+    author_pool_limit = min(50, max(normalized_limit * 4, normalized_limit + 8))
+    if cancel_check is not None and cancel_check():
+        raise _BatchCancelled("文献检索已停止")
+    inferred_sort = str((intent or {}).get("sort", "")).strip()
+    if inferred_sort and normalized_sort == "relevance":
+        normalized_sort = inferred_sort
+    deterministic_cross_language = (
+        isinstance(search_plan, dict)
+        and str(search_plan.get("planner", "")) == "deterministic"
+        and len(search_intent.get("query_variants", [])) > 1
+        and any("\u3400" <= character <= "\u9fff" for character in clean_query)
+        and not clean_author
+    )
+    if deterministic_cross_language:
+        # Known bilingual topics use the bounded public federation directly;
+        # the keyword CLI can spend minutes on a broad/noisy query before it
+        # reaches the same sources as a fallback.
+        fallback = _public_download_search_fallback(
+            search_query,
+            author=clean_author,
+            search_intent=search_intent,
+            sort=normalized_sort,
+            limit=normalized_limit,
+            year_from=year_from,
+            year_to=year_to,
+            provider_timeout=8.0,
+            cancel_check=cancel_check,
+        )
+        if fallback is not None and fallback.get("identifiers"):
+            return preserve_query_trace(fallback) or fallback
+        raise RuntimeError("公开学术检索未找到带 DOI 或 arXiv 标识的相关论文；请补充题名、作者或 DOI 后重试")
     # Author-only searches must be resolved as authors, not treated as an
     # unqualified keyword query by the download CLI.  The registry-first path
     # avoids homonyms and remains usable when a local scansci-pdf build is
     # outdated or returns an empty author result.
     if clean_author and not clean_query:
+        oa_preferred = normalized_sort == "cited_by_count"
+        author_pool = ThreadPoolExecutor(max_workers=1)
         try:
-            author_result = search_openalex_author_works(
+            author_future = author_pool.submit(
+                search_openalex_author_works,
                 clean_author,
-                limit=normalized_limit,
+                limit=author_pool_limit,
                 sort=normalized_sort,
                 year_from=year_from,
                 year_to=year_to,
             )
+            author_result = next(_completed_downloads([author_future], cancel_check, timeout=timeout)).result()
             resolved = _download_search_result(
                 list(author_result.get("items") or []),
                 query="",
@@ -734,74 +1026,103 @@ def search_papers_for_download(
                 sort=normalized_sort,
                 limit=normalized_limit,
                 source="openalex_author_works",
+                year_from=year_from,
+                year_to=year_to,
+                author_verified=True,
+                oa_preferred=oa_preferred,
             )
             resolved["author_resolution"] = dict(author_result.get("author_resolution") or {})
             if resolved["items"]:
-                return resolved
+                return preserve_query_trace(resolved) or resolved
+        except _BatchCancelled:
+            raise
         except Exception:
             # Keep the local CLI as a compatibility fallback for unusual
             # names or transient public API failures.  Its result is still
             # validated below before download begins.
             pass
+        finally:
+            author_pool.shutdown(wait=False, cancel_futures=True)
     executable = shutil.which("scansci-pdf")
     if not executable:
         fallback = _public_download_search_fallback(
-            clean_query,
+            search_query,
             author=clean_author,
-            search_intent=intent or {},
+            search_intent=search_intent,
             sort=normalized_sort,
             limit=normalized_limit,
             year_from=year_from,
+            year_to=year_to,
+            cancel_check=cancel_check,
         )
         if fallback is not None:
-            return fallback
+            return preserve_query_trace(fallback) or fallback
         raise RuntimeError("未找到 scansci-pdf，且公开学术检索未返回可下载文献")
-    command = [executable, "search", clean_query, "--limit", str(normalized_limit), "--sort", normalized_sort]
+    cli_candidate_limit = candidate_limit
+    cli_oa_preferred = False
+    if clean_author and normalized_sort == "cited_by_count":
+        cli_candidate_limit = min(50, max(candidate_limit, author_pool_limit))
+        cli_oa_preferred = True
+    command = [executable, "search", search_query, "--limit", str(cli_candidate_limit), "--sort", normalized_sort]
     if clean_author:
         command.extend(["--author", clean_author])
     if year_from is not None:
         command.extend(["--year-from", str(int(year_from))])
     if year_to is not None:
         command.extend(["--year-to", str(int(year_to))])
-    completed = _run_scansci_pdf(command, timeout=timeout, retry_encoding_failure=True)
+    completed = _run_scansci_pdf(command, timeout=timeout, retry_encoding_failure=True, cancel_check=cancel_check)
     if completed.returncode != 0:
+        fallback = _public_download_search_fallback(
+            search_query, author=clean_author, search_intent=search_intent,
+            sort=normalized_sort, limit=normalized_limit, year_from=year_from, year_to=year_to,
+            cancel_check=cancel_check,
+        )
+        if fallback is not None and fallback["identifiers"]:
+            return preserve_query_trace(fallback) or fallback
         detail = (completed.stderr or completed.stdout or "检索失败").strip()
         raise RuntimeError(detail[-1200:])
     try:
         payload = _parse_scansci_pdf_json(completed.stdout or "")
     except ValueError as exc:
         fallback = _public_download_search_fallback(
-            clean_query or clean_author,
+            search_query,
             author=clean_author,
-            search_intent=intent or {},
+            search_intent=search_intent,
             sort=normalized_sort,
             limit=normalized_limit,
             year_from=year_from,
+            year_to=year_to,
+            cancel_check=cancel_check,
         )
         if fallback is not None:
-            return fallback
+            return preserve_query_trace(fallback) or fallback
         raise RuntimeError("scansci-pdf 未返回有效的 JSON 检索结果") from exc
     rows = payload.get("results", []) if isinstance(payload, dict) else []
     result = _download_search_result(
         list(rows or []),
         query=clean_query,
-        search_intent=intent or {},
+        search_intent=search_intent,
         author=clean_author,
         sort=normalized_sort,
         limit=normalized_limit,
         source="scansci-pdf",
+        year_from=year_from,
+        year_to=year_to,
+        oa_preferred=cli_oa_preferred,
     )
     if result["identifiers"]:
-        return result
+        return preserve_query_trace(result) or result
     fallback = _public_download_search_fallback(
-        clean_query,
+        search_query,
         author=clean_author,
-        search_intent=intent or {},
+        search_intent=search_intent,
         sort=normalized_sort,
         limit=normalized_limit,
         year_from=year_from,
+        year_to=year_to,
+        cancel_check=cancel_check,
     )
-    return fallback if fallback is not None else result
+    return preserve_query_trace(fallback if fallback is not None else result) or result
 
 
 def _download_search_result(
@@ -813,16 +1134,62 @@ def _download_search_result(
     sort: str,
     limit: int,
     source: str,
+    year_from: int | None = None,
+    year_to: int | None = None,
+    author_verified: bool = False,
+    oa_preferred: bool = False,
 ) -> dict[str, Any]:
     items: list[dict[str, Any]] = []
     identifiers: list[str] = []
     seen: set[str] = set()
-    for raw in list(rows or [])[:limit]:
-        if not isinstance(raw, dict):
+    all_rows = [dict(row) for row in list(rows or []) if isinstance(row, dict)]
+    article_rows: list[dict[str, Any]] = []
+    non_article_dropped: list[dict[str, Any]] = []
+    for row in all_rows:
+        if _is_non_article_record(row):
+            non_article_dropped.append(
+                {
+                    "title": str(row.get("title", "")),
+                    "doi": str(row.get("doi", "")),
+                    "reason": "non_article_record",
+                }
+            )
             continue
-        doi = str(raw.get("doi") or "").strip()
-        arxiv_id = str(raw.get("arxiv_id") or raw.get("arxiv") or "").strip()
-        identifier = doi if _DOI_PATTERN.fullmatch(doi) else arxiv_id if _ARXIV_PATTERN.fullmatch(arxiv_id) else ""
+        article_rows.append(row)
+    candidates, quality_gate = _apply_topic_quality_gate(
+        article_rows,
+        list(search_intent.get("required_terms") or []),
+    )
+    if oa_preferred:
+        # Author high-citation lists are dominated by paywalled classics.  A
+        # stable sort keeps citation order inside each group while letting
+        # openly accessible works enter the download flow first, so the
+        # requested count can actually deliver PDFs.
+        candidates = sorted(candidates, key=lambda row: 0 if _row_is_open_access(row) else 1)
+    for raw in candidates:
+        # Every provider/fallback must retain the user's explicit constraints.
+        # Resolved OpenAlex works already carry an author-identity filter.
+        if author and not author_verified and not any(
+            _normalized_author_name(value) == _normalized_author_name(author)
+            for value in (raw.get("authors") or [])
+        ):
+            continue
+        if year_from is not None or year_to is not None:
+            try:
+                year = int(raw.get("year"))
+            except (ValueError, TypeError):
+                continue
+            if (year_from is not None and year < year_from) or (year_to is not None and year > year_to):
+                continue
+        doi = _normalize_download_identifier(str(raw.get("doi") or ""))
+        arxiv_id = _normalize_download_identifier(str(raw.get("arxiv_id") or raw.get("arxiv") or ""))
+        if not arxiv_id:
+            for url in (raw.get("url"), raw.get("oa_url")):
+                value = _normalize_download_identifier(str(url or ""))
+                if _ARXIV_PATTERN.fullmatch(value):
+                    arxiv_id = value
+                    break
+        identifier = arxiv_id if _ARXIV_PATTERN.fullmatch(arxiv_id) else doi if _DOI_PATTERN.fullmatch(doi) else ""
         item = {
             "title": str(raw.get("title") or "未命名论文"),
             "identifier": identifier,
@@ -830,17 +1197,19 @@ def _download_search_result(
             "arxiv_id": arxiv_id,
             "authors": [str(value) for value in list(raw.get("authors") or [])],
             "year": raw.get("year"),
-            "cited_by_count": int(raw.get("cited_by_count") or 0),
+            "cited_by_count": int(raw.get("cited_by_count", raw.get("citation_count", 0)) or 0),
             "is_oa": bool(raw.get("is_oa") or raw.get("oa_url")),
             "oa_url": str(raw.get("oa_url") or ""),
             "url": str(raw.get("url") or ""),
             "source": str(raw.get("source") or source),
         }
-        items.append(item)
-        folded = identifier.casefold()
+        folded = _identifier_key(identifier)
         if identifier and folded not in seen:
             seen.add(folded)
+            items.append(item)
             identifiers.append(identifier)
+            if len(identifiers) >= limit:
+                break
     return {
         "query": query,
         "search_intent": search_intent,
@@ -852,7 +1221,80 @@ def _download_search_result(
         "total": len(items),
         "downloadable": len(identifiers),
         "source": source,
+        "quality_gate": quality_gate,
+        "non_article_dropped": {
+            "count": len(non_article_dropped),
+            "preview": non_article_dropped[:5],
+        },
     }
+
+
+_COMPONENT_DOI_SEGMENT_RE = re.compile(
+    r"(?:^|\.)(?:(?:g|t|f|s|p|r|e)\d{2,4}|tno|tn\d+|app\d*|eapp|supp?\d*|supplementary|"
+    r"metajpg|jpe?g|png|gif|pdf|epub|xml|html|video\d*|audio\d*|poster|slides?|chart|dataset)$",
+    re.IGNORECASE,
+)
+_PEER_REVIEW_DOI_RE = re.compile(r"/(?:v\d+(?:/|$)|review|response|decision|rating)", re.IGNORECASE)
+# DOI component records are numbered against a parent article: eLife appends
+# “.016” to “10.7554/elife.33423”, while a real article suffix never ends in a
+# 1–3 digit segment directly after a long numeric one (PLOS/eLife article IDs
+# and “science.277.5330.1300” all keep 4+ digits in the final segment).
+_COMPONENT_NUMERIC_DOI_RE = re.compile(r"\.(\d{3,})\.(\d{1,3})$")
+_NON_ARTICLE_TYPES = frozenset(
+    {"component", "peer-review", "reference-entry", "report-component", "abstract", "dataset"}
+)
+_NON_ARTICLE_TITLE_PREFIXES = (
+    "appendix",
+    "supplementary",
+    "supplement",
+    "table ",
+    "figure ",
+    "review for ",
+    "review of ",
+    "author's response",
+    "authors response",
+    "author response",
+    "decision letter",
+    "erratum",
+    "corrigendum",
+    "back matter",
+    "front matter",
+    "cover ",
+    "meeting abstract",
+    "conference abstract",
+)
+
+
+def _is_non_article_record(row: dict[str, Any]) -> bool:
+    """Reject appendix, peer-review, and figure-component records.
+
+    Keyword searches over Crossref legitimately return appendix tables,
+    reviewer reports, and figure components whose titles phrase-match any
+    topic.  They have no article PDF to download, so admitting them into the
+    download flow only burns a per-item timeout before failing.
+    """
+
+    doi = str(row.get("doi") or "").strip().lower()
+    if doi:
+        suffix = doi.split("/", 1)[-1]
+        if _PEER_REVIEW_DOI_RE.search(suffix):
+            return True
+        segments = suffix.split(".")
+        if len(segments) > 1 and _COMPONENT_DOI_SEGMENT_RE.search(segments[-1]):
+            return True
+        if _COMPONENT_NUMERIC_DOI_RE.search(suffix):
+            return True
+    for value in row.get("publication_types") or []:
+        if str(value or "").strip().lower() in _NON_ARTICLE_TYPES:
+            return True
+    title = " ".join(str(row.get("title") or "").split()).strip().lower()
+    if any(title.startswith(prefix) for prefix in _NON_ARTICLE_TITLE_PREFIXES):
+        return True
+    return False
+
+
+def _row_is_open_access(row: dict[str, Any]) -> bool:
+    return bool(row.get("is_oa") or row.get("oa_url") or row.get("arxiv_id") or row.get("arxiv"))
 
 
 def _public_download_search_fallback(
@@ -863,6 +1305,9 @@ def _public_download_search_fallback(
     sort: str,
     limit: int,
     year_from: int | None,
+    year_to: int | None = None,
+    provider_timeout: float | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any] | None:
     """Use the existing public federation when scansci-pdf cannot supply IDs."""
 
@@ -872,23 +1317,41 @@ def _public_download_search_fallback(
     if not clean_query:
         return None
     try:
-        public_result = search_academic_papers(
-            clean_query,
-            limit=limit,
-            per_source=min(10, limit),
-            provider_names=("openalex", "crossref"),
-            year_from=year_from,
-        )
+        search_kwargs = {
+            "query_variants": list(search_intent.get("query_variants") or []) or None,
+            "required_terms": list(search_intent.get("required_terms") or []),
+            "limit": max(12, limit),
+            "per_source": max(6, min(20, limit)),
+            "year_from": year_from,
+            "cancel_requested": cancel_check,
+        }
+        if provider_timeout is None:
+            public_result = search_academic_papers(
+                clean_query,
+                provider_names=("openalex", "crossref", "arxiv"),
+                **search_kwargs,
+            )
+        else:
+            public_result = FederatedAcademicSearch(
+                providers=[
+                    build_academic_provider(name, timeout=provider_timeout)
+                    for name in ("openalex", "crossref", "arxiv")
+                ],
+            ).search(clean_query, **search_kwargs)
+    except InterruptedError:
+        raise _BatchCancelled("文献检索已停止") from None
     except Exception:
         return None
     fallback = _download_search_result(
         list(public_result.get("items") or []),
-        query=clean_query if not author else "",
+        query=clean_query,
         search_intent=search_intent,
         author=author,
         sort=sort,
         limit=limit,
         source="public_academic_fallback",
+        year_from=year_from,
+        year_to=year_to,
     )
     if not fallback["items"]:
         return None
@@ -903,6 +1366,23 @@ class _BatchCancelled(Exception):
     The caller (the research-agent worker) catches this and translates it into
     a cooperative run cancellation, mirroring ``_RunCancelled``.
     """
+
+
+def _check_download_cancelled(cancel_check: Callable[[], bool] | None) -> None:
+    if cancel_check is not None and cancel_check():
+        raise _BatchCancelled("文献任务已停止")
+
+
+def _completed_downloads(futures, cancel_check, *, timeout: float | None = None):
+    """Poll even when every provider is blocked; as_completed alone cannot."""
+    pending = set(futures)
+    deadline = time.monotonic() + timeout if timeout is not None else None
+    while pending:
+        _check_download_cancelled(cancel_check)
+        if deadline is not None and time.monotonic() >= deadline:
+            raise TimeoutError("public source race timed out")
+        completed, pending = wait(pending, timeout=0.1, return_when=FIRST_COMPLETED)
+        yield from completed
 
 
 # Lightweight IP protection for batch downloads. Downloading dozens of papers
@@ -936,6 +1416,9 @@ def _normalize_download_identifier(value: str) -> str:
     clean = str(value or "").strip()
     clean = re.sub(r"^https?://(?:dx\.)?doi\.org/", "", clean, flags=re.IGNORECASE)
     clean = re.sub(r"^doi:\s*", "", clean, flags=re.IGNORECASE)
+    if re.match(r"^https?://(?:export\.)?arxiv\.org/(?:abs|pdf)/", clean, re.IGNORECASE):
+        clean = re.sub(r"^/(?:abs|pdf)/", "", parse.urlparse(clean).path, flags=re.IGNORECASE)
+        clean = re.sub(r"\.pdf$", "", clean, flags=re.IGNORECASE)
     if _ARXIV_PATTERN.fullmatch(clean):
         clean = re.sub(r"^arxiv:", "", clean, flags=re.IGNORECASE)
     return clean.strip()
@@ -1196,6 +1679,7 @@ def _download_public_candidate_race(
     output_dir: Path,
     identifier: str,
     timeout: float,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Download one public candidate into an isolated staging directory."""
 
@@ -1207,6 +1691,7 @@ def _download_public_candidate_race(
             output_dir=Path(staging.name),
             identifier=identifier,
             timeout=timeout,
+            cancel_check=cancel_check,
         )
     except Exception as exc:
         staging.cleanup()
@@ -1241,6 +1726,7 @@ def _race_public_archives(
     output_dir: Path,
     score_dir: Path | None = None,
     timeout: float,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Race public locations and converge the result to one canonical PDF."""
 
@@ -1252,6 +1738,7 @@ def _race_public_archives(
             output_dir=output_dir,
             identifier=identifier,
             timeout=timeout,
+            cancel_check=cancel_check,
         ): candidate
         for candidate in candidates
     }
@@ -1290,7 +1777,7 @@ def _race_public_archives(
 
     try:
         try:
-            for future in as_completed(futures, timeout=max(1.0, float(timeout))):
+            for future in _completed_downloads(futures, cancel_check, timeout=max(1.0, float(timeout))):
                 try:
                     outcome = future.result()
                 except Exception as exc:
@@ -1309,12 +1796,17 @@ def _race_public_archives(
     finally:
         for future in futures:
             future.cancel()
-        pool.shutdown(wait=True, cancel_futures=True)
+        pool.shutdown(wait=False, cancel_futures=True)
 
         # Collect late results so source health is updated and all staging
         # directories are cleaned, including sources that lost the race.
         for future, candidate in futures.items():
             if future in outcomes:
+                continue
+            if not future.done():
+                # Read-only late requests may finish after pause/winner selection.
+                # They only own staging data, which is discarded on completion.
+                future.add_done_callback(lambda finished: _cleanup_public_race_outcome(finished.result()) if not finished.cancelled() else None)
                 continue
             if future.cancelled():
                 outcomes[future] = {
@@ -1334,7 +1826,7 @@ def _race_public_archives(
                     "staging": None,
                 }
             outcomes[future] = outcome
-            evaluate(outcome, select=winner is None)
+            evaluate(outcome, select=False)
 
         attempts: list[dict[str, Any]] = []
         for outcome in outcomes.values():
@@ -1458,6 +1950,7 @@ def _canonicalize_download_files(
     *,
     download_dir: Path,
     timeout: float,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> list[str]:
     """Collapse source-race leftovers into one scansci-pdf-named PDF."""
 
@@ -1474,7 +1967,9 @@ def _canonicalize_download_files(
             path.name.casefold() == f"{_download_marker(identifier)}.pdf",
         ),
     )
-    metadata = _crossref_filename_metadata(identifier, timeout=min(timeout, 15.0))
+    _check_download_cancelled(cancel_check)
+    metadata = _crossref_filename_metadata(identifier, timeout=min(timeout, 10.0))
+    _check_download_cancelled(cancel_check)
     canonical_stem = _scansci_pdf_filename(metadata) or _scansci_pdf_safe_filename(_normalize_download_identifier(identifier))
     target = (download_dir / f"{canonical_stem}.pdf").resolve()
     if chosen != target:
@@ -1511,6 +2006,7 @@ def _finalize_download_result(
     workspace: str | Path,
     timeout: float,
     output_dir: str | Path | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     download_dir = Path(output_dir).resolve() if output_dir else _download_directory(workspace)
     raw_files = [str(path) for path in (result.get("files") or []) if path]
@@ -1521,6 +2017,7 @@ def _finalize_download_result(
         raw_files,
         download_dir=download_dir,
         timeout=timeout,
+        cancel_check=cancel_check,
     )
     if files:
         result["files"] = files
@@ -1609,13 +2106,14 @@ def download_papers(
     env_overrides: dict[str, str] | None = None,
     rotate_circuit: "Callable[[], bool] | None" = None,
     rotate_every: int = 0,
+    oa_hints: "dict[str, bool] | None" = None,
 ) -> dict[str, Any]:
     """Download a list of DOI/arXiv identifiers one by one.
 
     Each item is resolved through :func:`download_paper`; a single failure
     never aborts the batch. ``on_progress`` receives the live item-state dict
     after every item (and once at the start), and ``cancel_check`` is polled
-    between items so a cooperative cancel stops the loop cleanly. Items whose
+    during network waits so a cooperative cancel stops the loop promptly. Items whose
     PDF already exists in the download directory are marked completed without
     a network request, which makes batch resume cheap and idempotent.
 
@@ -1624,17 +2122,33 @@ def download_papers(
     ``rotate_circuit`` is called every ``rotate_every`` real downloads so an
     upstream Tor can switch circuits to spread requests over multiple exit
     IPs; its return value (whether rotation succeeded) is folded into the
-    progress output for the UI.
+    progress output for the UI. ``oa_hints`` carries the search stage's
+    ``is_oa`` knowledge keyed by identifier so works known to be closed-access
+    fail fast instead of spending the full per-item timeout in the CLI race.
     """
 
     normalized_strategy = strategy if strategy in {"legal_only", "oa_first", "gray_oa"} else "oa_first"
     download_dir = _download_directory(workspace)
     download_dir.mkdir(parents=True, exist_ok=True)
+    requested_stop = cancel_check
+    stopped = threading.Event()
+
+    def stop_requested() -> bool:
+        # Latch this invocation's stop: a later resume must not let old workers
+        # publish late files after the Host clears the persisted pause flag.
+        if requested_stop is not None and requested_stop():
+            stopped.set()
+        return stopped.is_set()
+
+    cancel_check = stop_requested
+    _check_download_cancelled(cancel_check)
 
     # Validate up front so a malformed list fails fast with a clear error,
     # rather than reporting every item as failed.
     cleaned: list[str] = []
     seen_identifiers: set[str] = set()
+    identifier_oa_hints: dict[str, bool] = {}
+    hint_source = dict(oa_hints or {})
     for raw in identifiers:
         clean = _normalize_download_identifier(raw)
         if _DOI_PATTERN.fullmatch(clean) or _ARXIV_PATTERN.fullmatch(clean):
@@ -1642,6 +2156,10 @@ def download_papers(
             if key not in seen_identifiers:
                 seen_identifiers.add(key)
                 cleaned.append(clean)
+            for hint_key in (clean, key, _normalize_download_identifier(str(raw)), _identifier_key(str(raw))):
+                if hint_key and hint_key in hint_source:
+                    identifier_oa_hints[key] = bool(hint_source[hint_key])
+                    break
     if not cleaned:
         raise ValueError("未识别到有效的 DOI 或 arXiv ID")
 
@@ -1658,6 +2176,7 @@ def download_papers(
                 existing,
                 download_dir=download_dir,
                 timeout=timeout,
+                cancel_check=cancel_check,
             )
         items.append(
             {
@@ -1709,8 +2228,10 @@ def download_papers(
                         strategy=normalized_strategy,
                         timeout=timeout,
                         env_overrides=env_overrides,
+                        metadata_is_oa=identifier_oa_hints.get(_identifier_key(identifier)),
                         _output_dir=staging_dir,
                         _source_health_dir=download_dir,
+                        cancel_check=cancel_check,
                     )
                     files = [str(path) for path in (result.get("files") or [])]
                     staged_files = [
@@ -1729,6 +2250,7 @@ def download_papers(
                                 [str(path) for path in staged_files],
                                 download_dir=download_dir,
                                 timeout=timeout,
+                                cancel_check=cancel_check,
                             )
                 return identifier, files, "", {
                     "source": str(result.get("source") or ""),
@@ -1740,7 +2262,7 @@ def download_papers(
             except Exception as error:
                 if attempt < _BATCH_MAX_RETRIES and _looks_rate_limited(error):
                     backoff = (2 ** attempt) + random.uniform(0, 1)
-                    time.sleep(backoff)
+                    _cancelable_sleep(backoff, cancel_check)
                     if cancel_check is not None and cancel_check():
                         raise _BatchCancelled("批量下载已取消") from None
                     attempt += 1
@@ -1752,8 +2274,9 @@ def download_papers(
     first_submission = True
     submitted_since_rotation = 0
     submitted = 0
-    with ThreadPoolExecutor(max_workers=workers) as executor:
-        futures: dict[Any, dict[str, Any]] = {}
+    executor = ThreadPoolExecutor(max_workers=workers)
+    futures: dict[Any, dict[str, Any]] = {}
+    try:
         for item in pending:
             # Co-operative cancel check between submissions.
             if cancel_check is not None and cancel_check():
@@ -1794,7 +2317,7 @@ def download_papers(
 
         # Collect results as they complete.
         try:
-            for future in as_completed(futures):
+            for future in _completed_downloads(futures, cancel_check):
                 if cancel_check is not None and cancel_check():
                     for f in futures:
                         f.cancel()
@@ -1828,6 +2351,15 @@ def download_papers(
             for f in futures:
                 f.cancel()
             raise
+    except BaseException:
+        stopped.set()
+        for item in pending:
+            if item["status"] in {"pending", "downloading"}:
+                item["status"] = "cancelled"
+        emit()
+        raise
+    finally:
+        executor.shutdown(wait=not stopped.is_set(), cancel_futures=stopped.is_set())
 
     return _build_result(items, download_dir, normalized_strategy, rotation_state)
 
@@ -1840,6 +2372,7 @@ def _download_from_public_archives(
     timeout: float,
     output_dir: str | Path | None = None,
     source_health_dir: str | Path | None = None,
+    cancel_check: Callable[[], bool] | None = None,
 ) -> dict[str, Any]:
     """Download from public archives when the optional CLI is not packaged.
 
@@ -1848,7 +2381,9 @@ def _download_from_public_archives(
     publisher page.
     """
 
-    candidates = _public_fulltext_candidates(identifier, timeout=min(timeout, 35.0))
+    _check_download_cancelled(cancel_check)
+    candidates = _public_fulltext_candidates(identifier, timeout=min(timeout, 10.0), cancel_check=cancel_check)
+    _check_download_cancelled(cancel_check)
     if not candidates:
         raise RuntimeError("未找到可直接获取的开放全文或灰色文献存档版本。")
     resolved_output_dir = Path(output_dir).resolve() if output_dir else _download_directory(workspace)
@@ -1864,6 +2399,7 @@ def _download_from_public_archives(
             output_dir=resolved_output_dir,
             score_dir=resolved_health_dir,
             timeout=timeout,
+            cancel_check=cancel_check,
         )
     errors: list[str] = []
     for candidate in candidates:
@@ -1874,6 +2410,7 @@ def _download_from_public_archives(
                 output_dir=resolved_output_dir,
                 identifier=identifier,
                 timeout=timeout,
+                cancel_check=cancel_check,
             )
         except RuntimeError as exc:
             errors.append(str(exc))
@@ -1913,7 +2450,8 @@ def _download_from_public_archives(
     raise RuntimeError("已找到全文入口，但下载失败：" + "；".join(errors[-3:]))
 
 
-def _public_fulltext_candidates(identifier: str, *, timeout: float) -> list[dict[str, str]]:
+def _public_fulltext_candidates(identifier: str, *, timeout: float, cancel_check: Callable[[], bool] | None = None) -> list[dict[str, str]]:
+    _check_download_cancelled(cancel_check)
     if _ARXIV_PATTERN.fullmatch(identifier):
         arxiv_id = identifier.removeprefix("arXiv:").removeprefix("ARXIV:")
         return [{"url": f"https://arxiv.org/pdf/{parse.quote(arxiv_id, safe='./')}.pdf", "source": "arXiv"}]
@@ -1941,6 +2479,7 @@ def _public_fulltext_candidates(identifier: str, *, timeout: float) -> list[dict
                     continue
                 host_type = str(location.get("host_type") or "open-access location").replace("_", " ")
                 candidates.append({"url": url, "source": f"Unpaywall {host_type}"})
+    _check_download_cancelled(cancel_check)
     europe_query = parse.quote(f"DOI:{identifier}", safe="")
     try:
         europe_pmc = _request_json(
@@ -1985,6 +2524,7 @@ def _public_fulltext_candidates(identifier: str, *, timeout: float) -> list[dict
                     "source": "Europe PMC",
                 }
             )
+    _check_download_cancelled(cancel_check)
     try:
         work = _request_json(f"https://api.openalex.org/works/https://doi.org/{encoded}", timeout=timeout)
     except RuntimeError:
@@ -1999,6 +2539,7 @@ def _public_fulltext_candidates(identifier: str, *, timeout: float) -> list[dict
                 continue
             source = dict(location.get("source") or {}).get("display_name") or "OpenAlex open-access archive"
             candidates.append({"url": url, "source": str(source)})
+    _check_download_cancelled(cancel_check)
     try:
         crossref = _request_json(f"https://api.crossref.org/works/{encoded}", timeout=timeout)
     except RuntimeError:
@@ -2014,17 +2555,28 @@ def _public_fulltext_candidates(identifier: str, *, timeout: float) -> list[dict
     return [item for item in candidates if item["url"].startswith("https://") and not (item["url"] in seen or seen.add(item["url"]))]
 
 
-def _download_public_pdf(candidate: dict[str, str], *, output_dir: Path, identifier: str, timeout: float) -> Path:
+def _download_public_pdf(candidate: dict[str, str], *, output_dir: Path, identifier: str, timeout: float, cancel_check: Callable[[], bool] | None = None) -> Path:
+    _check_download_cancelled(cancel_check)
     req = request.Request(candidate["url"], headers={"Accept": "application/pdf,*/*;q=0.8", "User-Agent": "ScanSci-Desktop/0.2"})
     try:
-        with request.urlopen(req, timeout=timeout) as response:
-            data = response.read(200 * 1024 * 1024 + 1)
+        with request.urlopen(req, timeout=min(timeout, 10.0)) as response:
+            chunks: list[bytes] = []
+            size = 0
+            while size <= 200 * 1024 * 1024:
+                _check_download_cancelled(cancel_check)
+                chunk = response.read(64 * 1024)
+                if not chunk:
+                    break
+                chunks.append(chunk)
+                size += len(chunk)
+            data = b"".join(chunks)
     except (error.HTTPError, error.URLError, OSError) as exc:
         raise RuntimeError(f"{candidate['source']} 不可访问") from exc
     if len(data) > 200 * 1024 * 1024:
         raise RuntimeError("全文文件超过 200 MB 上限")
     if not data.startswith(b"%PDF"):
         raise RuntimeError(f"{candidate['source']} 未返回 PDF")
+    _check_download_cancelled(cancel_check)
     destination = output_dir / f"{_safe_project_name(identifier.replace('/', '_'))}.pdf"
     temporary = destination.with_name(f".{destination.name}.{uuid4().hex}.tmp")
     try:

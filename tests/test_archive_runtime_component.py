@@ -31,6 +31,7 @@ def test_archives_runtime_with_installable_root_and_checksum(tmp_path: Path) -> 
             "ScanSciLocalRuntime/_internal/runtime.dat",
         }
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest["schema_version"] == 1
     assert manifest["version"] == "1.2.3"
     assert manifest["windows"]["sha256"] == hashlib.sha256(archive.read_bytes()).hexdigest()
     assert manifest["windows"]["size"] == archive.stat().st_size

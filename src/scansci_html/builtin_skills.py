@@ -55,6 +55,15 @@ BUILTIN_SKILLS: list[dict[str, Any]] = [
         "source": "ScanSci",
     },
     {
+        "id": "evidence-retrieval",
+        "name": "evidence-retrieval",
+        "description": "在当前证据库中按需检索、排序并绑定可定位原文。",
+        "path": "builtin:evidence-retrieval",
+        "enabled": True,
+        "source_type": "builtin",
+        "source": "ScanSci/scansci-evidence · MIT",
+    },
+    {
         "id": "good-question",
         "name": "good-question",
         "description": "从材料中收束重要、可检验且可证伪的核心研究问题。",
@@ -89,6 +98,15 @@ BUILTIN_SKILLS: list[dict[str, Any]] = [
         "enabled": True,
         "source_type": "builtin",
         "source": "eze-is/web-access · MIT",
+    },
+    {
+        "id": "typesafe-ai",
+        "name": "typesafe-ai",
+        "description": "使用 TypeSafe System One 与 Jev 进行结构化判断、路由、排序、抽取和证据核验。",
+        "path": "builtin:typesafe-ai",
+        "enabled": True,
+        "source_type": "builtin",
+        "source": "TypeSafe AI/typesafe-ai/skills · MIT · ScanSci adaptation",
     },
 ]
 
@@ -296,6 +314,7 @@ def third_party_notices() -> dict[str, str]:
         "Rimagination/good-question": _RIMAGINATION_MIT_NOTICE,
         "Rimagination/good-story": _RIMAGINATION_MIT_NOTICE,
         "eze-is/web-access": "MIT License. Source: https://github.com/eze-is/web-access",
+        "TypeSafe AI/typesafe-ai/skills": "MIT License. ScanSci ships a bounded adaptation for the TypeSafe System One/Jev integration. Source: https://github.com/typesafe-ai/skills",
         "Panniantong/Agent-Reach": "MIT License. ScanSci ships a read-only native adaptation of the routing and channel ideas. Source: https://github.com/Panniantong/Agent-Reach",
         "K-Dense-AI/scientific-agent-skills": "MIT License. Source: https://github.com/K-Dense-AI/scientific-agent-skills",
         "Yuan1z0825/nature-skills": "Apache-2.0 License. Source: https://github.com/Yuan1z0825/nature-skills",

@@ -31,6 +31,22 @@ def test_persisted_image_attachment_can_be_reopened_for_a_vision_request(tmp_pat
     assert vision_image_blocks(workspace, records) == [{"mime_type": "image/png", "data": _PNG}]
 
 
+def test_history_image_metadata_reuses_the_existing_local_attachment(tmp_path: Path):
+    workspace = tmp_path / "workspace.sqlite"
+    original = persist_image_attachments(
+        workspace,
+        [{"name": "figure.png", "data_url": f"data:image/png;base64,{_PNG}"}],
+    )[0]
+
+    retried = persist_image_attachments(
+        workspace,
+        [{"name": "figure.png", "id": original["id"], "mime_type": original["mime_type"]}],
+    )
+
+    assert retried == [original]
+    assert vision_image_blocks(workspace, retried) == [{"mime_type": "image/png", "data": _PNG}]
+
+
 def test_image_attachment_rejects_non_image_data_urls(tmp_path: Path):
     with pytest.raises(ValueError, match="仅支持"):
         persist_image_attachments(tmp_path / "workspace.sqlite", [{"data_url": "data:text/plain;base64,aGVsbG8="}])
