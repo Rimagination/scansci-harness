@@ -11,6 +11,7 @@ from datetime import datetime
 import json
 from pathlib import Path
 import re
+import secrets
 import sys
 import time
 
@@ -27,6 +28,8 @@ MODELS = managed_probe_model_ids()
 _NUMBERED_SECTION_PATTERN = re.compile(
     r"(?m)^\s*(?:#{1,4}\s*)?(?:第\s*)?(?:[一二三四五六]|[1-6])\s*(?:部分|[、.．:：])"
 )
+_CJK_PATTERN = re.compile(r"[\u3400-\u9fff]")
+_LATIN_PATTERN = re.compile(r"[A-Za-z]")
 
 
 def _numbered_section_count(text: str) -> int:
@@ -52,6 +55,18 @@ def _numbered_section_bullet_counts(text: str) -> list[int]:
             len(re.findall(r"(?m)^\s*(?:[-*•]|[①②③④⑤⑥])\s+", section_body))
         )
     return counts
+
+
+def _mostly_chinese(text: str) -> bool:
+    chinese = len(_CJK_PATTERN.findall(text))
+    latin = len(_LATIN_PATTERN.findall(text))
+    return chinese >= 4 and chinese >= latin / 2
+
+
+def _mostly_english(text: str) -> bool:
+    english = len(_LATIN_PATTERN.findall(text))
+    chinese = len(_CJK_PATTERN.findall(text))
+    return english >= 12 and chinese <= max(2, english // 12)
 
 
 def _run_stream(runtime: ResearchAgentRuntime, payload: dict[str, object]) -> dict[str, object]:
@@ -88,6 +103,30 @@ def verify_model(runtime: ResearchAgentRuntime, workspace: Path, model_id: str) 
     settings["active_model"] = {"provider_id": "scansci-managed", "model_id": model_id}
     save_settings(workspace, settings)
 
+    memory_token = f"SCN-{secrets.token_hex(4).upper()}"
+    first_user = {
+        "role": "user",
+        "content": f"你好，请记住校验码 {memory_token}，并用一句自然的中文确认你已经记住。",
+    }
+    greeting = _run_stream(runtime, {
+        "chat_mode": "general",
+        "messages": [first_user],
+    })
+    memory = _run_stream(runtime, {
+        "chat_mode": "general",
+        "messages": [
+            first_user,
+            {"role": "assistant", "content": str(greeting["content"])},
+            {"role": "user", "content": "我刚才让你记住的校验码是什么？只输出完整校验码。"},
+        ],
+    })
+    english = _run_stream(runtime, {
+        "chat_mode": "general",
+        "messages": [{
+            "role": "user",
+            "content": "Hello. Briefly describe one thing you can help a researcher do.",
+        }],
+    })
     identity = _run_stream(runtime, {
         "chat_mode": "general",
         "messages": [{"role": "user", "content": "你是谁？请说明当前底层模型、ScanSci 版本、可用模式和内置 Skill。"}],
@@ -118,9 +157,15 @@ def verify_model(runtime: ResearchAgentRuntime, workspace: Path, model_id: str) 
     identity_text = str(identity["content"])
     long_text = str(long_answer["content"])
     skill_text = str(skill["content"])
+    greeting_text = str(greeting["content"])
+    memory_text = str(memory["content"])
+    english_text = str(english["content"])
     long_answer_sections = _numbered_section_count(long_text)
     long_answer_bullet_counts = _numbered_section_bullet_counts(long_text)
     checks = {
+        "chinese_prompt_gets_chinese_answer": _mostly_chinese(greeting_text),
+        "multi_turn_history_is_recalled": memory_token in memory_text,
+        "english_prompt_gets_english_answer": _mostly_english(english_text),
         "identity_knows_scansci": "ScanSci" in identity_text,
         "identity_knows_model": model_id.casefold() in identity_text.casefold() or model_id.split("/")[-1].casefold() in identity_text.casefold(),
         "identity_knows_skills": "good-question" in identity_text,
@@ -143,6 +188,20 @@ def verify_model(runtime: ResearchAgentRuntime, workspace: Path, model_id: str) 
         "model_id": model_id,
         "passed": all(checks.values()),
         "checks": checks,
+        "basic_chat": {
+            "greeting": {
+                **{key: value for key, value in greeting.items() if key != "content"},
+                "characters": len(greeting_text),
+            },
+            "multi_turn": {
+                **{key: value for key, value in memory.items() if key != "content"},
+                "characters": len(memory_text),
+            },
+            "english": {
+                **{key: value for key, value in english.items() if key != "content"},
+                "characters": len(english_text),
+            },
+        },
         "identity": {key: value for key, value in identity.items() if key != "content"},
         "long_answer": {
             **{key: value for key, value in long_answer.items() if key != "content"},

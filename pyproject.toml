@@ -4,12 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "scansci"
-version = "0.4.1"
-description = "Evidence-first scientific research workbench with a Pi-powered agent runtime."
+version = "0.4.2"
+description = "Evidence-first scientific research workbench with a ScanSci Harness control plane and Pi agent runtime."
 requires-python = ">=3.11"
 dependencies = [
   "beautifulsoup4>=4.12",
   "cloakbrowser>=0.3.31",
+  "cryptography>=44,<49",
   "keyring>=25.0",
   "litellm>=1.80,<2",
   "lxml>=5.0",

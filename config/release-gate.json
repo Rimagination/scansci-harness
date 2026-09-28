@@ -1,7 +1,7 @@
 {
   "schema_version": 1,
   "product": "ScanSci",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "scope_file": "config/release-scope.json",
   "negative_checklist": "docs/desktop-delivery-negative-checklist.zh.md",
   "targeted_commands": [
@@ -38,6 +38,7 @@
         "tests/test_mcp_bridge.py",
         "tests/test_pi_security.py",
         "tests/test_pi_agent.py",
+        "tests/test_scansci_harness.py",
         "-q",
         "--junitxml",
         "{diagnostics}/pi-targeted-junit.xml"
@@ -107,6 +108,10 @@
         "tests/test_runtime_identity.py",
         "tests/test_verify_update_channel.py",
         "tests/test_direct_chat_queue_ui.py",
+        "tests/test_direct_chat_history.py",
+        "tests/test_image_generation.py",
+        "tests/test_app_settings.py",
+        "tests/test_direct_chat_recovery_ui.py",
         "tests/test_dark_theme_css_contract.py",
         "tests/test_research_tools.py",
         "tests/test_research_runs.py",
@@ -177,7 +182,7 @@
     },
     {
       "id": "frontend-browser-submit",
-      "title": "真实浏览器点击与回车提交回归",
+      "title": "真实浏览器多轮、队列、编辑、滚动与并行对话回归",
       "command": [
         "{python}",
         "scripts/verify_scansci_frontend.py",
@@ -270,7 +275,9 @@
     "mode": "onedir",
     "name": "ScanSci",
     "profile": "core",
-    "signature_required": false,
+    "signature_required": true,
+    "release_public_key": "",
+    "release_key_id": "scansci-release-v1",
     "update_manifest_url": "https://github.com/Rimagination/scansci-pi/releases/latest/download/stable.json",
     "update_package_url": "https://github.com/Rimagination/scansci-pi/releases/download/v{version}/ScanSci-{version}-windows-x64.zip",
     "runtime_manifest_url": "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.0/local-transformers.json",
@@ -290,6 +297,7 @@
       "scansci_html/web/app.js",
       "scansci_html/builtin_skill_assets/good-question/SKILL.md",
       "scansci_html/builtin_skill_assets/good-story/SKILL.md",
+      "scansci_html/builtin_skill_assets/evidence-retrieval/SKILL.md",
       "scansci_html/builtin_skill_assets/web-access/SKILL.md",
       "scansci_html/build-info.json",
       "pi_runtime/main.mjs"

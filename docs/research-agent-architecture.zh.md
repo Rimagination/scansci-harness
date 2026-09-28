@@ -11,7 +11,7 @@
 13 项声明能力是：
 
 1. protocol/feature 协商与 fail-closed 租约；
-2. 所有模型介导轮次 Pi-first 自主规划；
+2. 所有需要工具、Skill、知识库、联网、附件或工作流能力的模型轮次 Pi-first 自主规划；普通 `direct_chat` 走 Host 精简快速通道；
 3. 动态工具搜索、激活、撤销与逐次授权；
 4. 只读并行、effect 顺序屏障、hooks 与取消隔离；
 5. 模型感知长上下文、压缩和恢复；
@@ -107,7 +107,7 @@ deferred MCP 服务器启动连接数为 0。模型先搜索有界目录，再�
 
 ## fallback、退化与完成判定
 
-所有模型介导文本默认 Pi-first。允许的 Host direct 路径只有不需要模型的确定性产品事实、模型调用前的 effect/安全拒绝，以及明确的安全降级交付；它们必须标记来源。
+需要能力编排的模型介导文本默认 Pi-first。没有知识库、Skill、附件、联网或工具意图的 `direct_chat` 是计划内 Host 快速通道：使用精简系统提示、较小输出预算和显式关闭的自适应隐藏思考，不获得 capability lease，也不计入 Pi 能力证据。其他允许的 Host direct 路径包括不需要模型的确定性产品事实、模型调用前的 effect/安全拒绝，以及明确的安全降级交付；它们必须标记来源。
 
 任何 direct fallback 都不计 Pi 成功，`fallback_count` 必须为 0 才能通过 `scansci.pi-capabilities` report。模型/transport 不支持时记录 `degraded`，缺少真实 provider、凭据或外部环境时记录 `not_run`；不得把 deterministic mock、OCR 文本或 Host 改写包装成 provider-real 通过。
 

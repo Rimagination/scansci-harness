@@ -1,7 +1,7 @@
 [CmdletBinding()]
 param(
     [string]$OutputDir = "",
-    [string]$Version = "1.0.0",
+    [string]$Version = "1.0.4",
     [string]$CacheKey = "",
     [string]$PackageUrl = "",
     [string]$PythonExecutable = "python",

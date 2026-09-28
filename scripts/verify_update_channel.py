@@ -6,8 +6,15 @@ import json
 import sys
 from pathlib import Path
 from typing import Any, Callable
-from urllib.parse import urlparse
 from urllib.request import Request, urlopen
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SOURCE_ROOT = PROJECT_ROOT / "src"
+if str(SOURCE_ROOT) not in sys.path:
+    sys.path.insert(0, str(SOURCE_ROOT))
+
+from scansci_html.manifest_trust import verify_manifest_signature
+from scansci_html.release_transport import open_release_url, validate_release_url
 
 
 class UpdateChannelFailure(RuntimeError):
@@ -16,12 +23,14 @@ class UpdateChannelFailure(RuntimeError):
 
 MAX_MANIFEST_BYTES = 1024 * 1024
 MAX_BLOCKMAP_BYTES = 32 * 1024 * 1024
+MAX_RUNTIME_COMPONENT_BYTES = 16 * 1024**3
 
 
 def _https_url(value: object, label: str) -> str:
     url = str(value or "").strip()
-    parsed = urlparse(url)
-    if parsed.scheme.lower() != "https" or not parsed.netloc:
+    try:
+        validate_release_url(url)
+    except ValueError as error:
         raise UpdateChannelFailure(f"{label} must be an absolute HTTPS URL")
     return url
 
@@ -72,17 +81,137 @@ def _open(
     label: str,
 ) -> Any:
     try:
-        return opener(request, timeout=timeout)
+        return open_release_url(request, timeout=timeout, opener=opener)
     except Exception as exc:
         raise UpdateChannelFailure(f"Unable to reach {label}: {exc}") from exc
+
+
+def _stream_verified_response(
+    response: Any,
+    *,
+    expected_size: int,
+    expected_sha256: str,
+    label: str,
+    aggregate: Any | None = None,
+) -> int:
+    """Hash a published asset without keeping multi-gigabyte packages in memory."""
+
+    digest = hashlib.sha256()
+    received = 0
+    while chunk := response.read(1024 * 1024):
+        received += len(chunk)
+        if received > expected_size:
+            raise UpdateChannelFailure(f"Downloaded {label} exceeds its declared size")
+        digest.update(chunk)
+        if aggregate is not None:
+            aggregate.update(chunk)
+    if received != expected_size:
+        raise UpdateChannelFailure(f"Downloaded {label} size does not match its manifest")
+    if digest.hexdigest() != expected_sha256:
+        raise UpdateChannelFailure(f"Downloaded {label} SHA256 does not match its manifest")
+    return received
+
+
+def _component_record(manifest: dict[str, Any], component_id: str) -> dict[str, Any]:
+    if str(manifest.get("id", "")).strip() == component_id:
+        return manifest
+    components = manifest.get("components")
+    if isinstance(components, dict) and isinstance(components.get(component_id), dict):
+        return dict(components[component_id])
+    raise UpdateChannelFailure(f"Update manifest is missing required component {component_id!r}")
+
+
+def _verify_component(
+    manifest: dict[str, Any],
+    component_id: str,
+    *,
+    opener: Callable[..., Any],
+    timeout: int,
+    verify_downloads: bool,
+) -> dict[str, Any]:
+    record = _component_record(manifest, component_id)
+    version = str(record.get("version", "")).strip()
+    windows = record.get("windows")
+    if not version or not isinstance(windows, dict):
+        raise UpdateChannelFailure(f"Component {component_id!r} is missing version or Windows metadata")
+    package_sha256 = _sha256(windows.get("sha256"), f"{component_id} package SHA256")
+    package_size = _positive_int(windows.get("size"), f"{component_id} package size")
+    if package_size > MAX_RUNTIME_COMPONENT_BYTES:
+        raise UpdateChannelFailure(f"Component {component_id!r} package exceeds the audit size limit")
+    raw_parts = windows.get("parts")
+    if isinstance(raw_parts, list) and raw_parts:
+        if not all(isinstance(part, dict) for part in raw_parts):
+            raise UpdateChannelFailure(f"Component {component_id!r} has invalid multipart metadata")
+        downloads = [dict(part) for part in raw_parts]
+        total_size = sum(_positive_int(part.get("size"), f"{component_id} part size") for part in downloads)
+        if total_size != package_size or total_size > MAX_RUNTIME_COMPONENT_BYTES:
+            raise UpdateChannelFailure(f"Component {component_id!r} part sizes do not match its package size")
+    else:
+        downloads = [windows]
+
+    range_assets = 0
+    verified_bytes = 0
+    package_digest = hashlib.sha256()
+    for index, download in enumerate(downloads, start=1):
+        label = f"{component_id} asset {index}"
+        asset_url = _https_url(download.get("url"), f"{label} URL")
+        asset_sha256 = _sha256(download.get("sha256"), f"{label} SHA256")
+        asset_size = _positive_int(download.get("size"), f"{label} size")
+        head_request = Request(asset_url, method="HEAD")
+        with _open(opener, head_request, timeout=timeout, label=label) as response:
+            status = _status(response)
+            if status not in {0, 200, 204}:
+                raise UpdateChannelFailure(f"{label} returned HTTP {status} to HEAD")
+            content_length = _header(response, "Content-Length")
+        if content_length and int(content_length) != asset_size:
+            raise UpdateChannelFailure(f"{label} size does not match its manifest")
+
+        range_request = Request(asset_url, headers={"Range": "bytes=0-0"})
+        with _open(opener, range_request, timeout=timeout, label=f"{label} range probe") as response:
+            range_status = _status(response)
+            content_range = _header(response, "Content-Range")
+            probe = response.read(2)
+        if range_status not in {0, 200, 206}:
+            raise UpdateChannelFailure(f"{label} range probe returned HTTP {range_status}")
+        if range_status == 206 and content_range.strip().casefold() == f"bytes 0-0/{asset_size}".casefold() and len(probe) == 1:
+            range_assets += 1
+        if verify_downloads:
+            download_request = Request(asset_url, headers={"Accept": "application/octet-stream"})
+            with _open(opener, download_request, timeout=timeout, label=f"{label} full download") as response:
+                download_status = _status(response)
+                if download_status not in {0, 200}:
+                    raise UpdateChannelFailure(f"{label} full download returned HTTP {download_status}")
+                verified_bytes += _stream_verified_response(
+                    response,
+                    expected_size=asset_size,
+                    expected_sha256=asset_sha256,
+                    label=label,
+                    aggregate=package_digest,
+                )
+    if verify_downloads and package_digest.hexdigest() != package_sha256:
+        raise UpdateChannelFailure(f"Downloaded {component_id} package SHA256 does not match its manifest")
+
+    return {
+        "version": version,
+        "package_sha256": package_sha256,
+        "package_size": package_size,
+        "asset_count": len(downloads),
+        "range_asset_count": range_assets,
+        "download_strategy": "resumable" if range_assets == len(downloads) else "full-asset-fallback",
+        "content_verified": verify_downloads,
+        "verified_bytes": verified_bytes,
+    }
 
 
 def verify_update_channel(
     manifest_url: str,
     *,
     expected_version: str = "",
+    required_components: tuple[str, ...] = (),
+    verify_downloads: bool = False,
     opener: Callable[..., Any] = urlopen,
     timeout: int = 30,
+    release_public_key: str = "",
 ) -> dict[str, Any]:
     """Audit the public manifest, immutable assets, and differential-download capability.
 
@@ -103,6 +232,13 @@ def verify_update_channel(
         raise UpdateChannelFailure("Update manifest is not valid UTF-8 JSON") from exc
     if not isinstance(manifest, dict):
         raise UpdateChannelFailure("Update manifest root must be an object")
+    if manifest.get("schema_version") != 1:
+        raise UpdateChannelFailure("Update manifest must use schema_version 1")
+    if release_public_key:
+        try:
+            verify_manifest_signature(manifest, release_public_key, required=True)
+        except ValueError as exc:
+            raise UpdateChannelFailure(f"Update manifest signature is invalid: {exc}") from exc
 
     version = str(manifest.get("version", "")).strip()
     if not version:
@@ -181,6 +317,29 @@ def verify_update_channel(
         and content_range.strip().casefold() == f"bytes 0-0/{package_size}".casefold()
         and len(probe) == 1
     )
+    package_verified_bytes = 0
+    if verify_downloads:
+        package_request = Request(package_url, headers={"Accept": "application/octet-stream"})
+        with _open(opener, package_request, timeout=timeout, label="full update package download") as response:
+            package_status = _status(response)
+            if package_status not in {0, 200}:
+                raise UpdateChannelFailure(f"Full update package download returned HTTP {package_status}")
+            package_verified_bytes = _stream_verified_response(
+                response,
+                expected_size=package_size,
+                expected_sha256=package_sha256,
+                label="full update package",
+            )
+    verified_components = {
+        component_id: _verify_component(
+            manifest,
+            component_id,
+            opener=opener,
+            timeout=timeout,
+            verify_downloads=verify_downloads,
+        )
+        for component_id in dict.fromkeys(str(item).strip() for item in required_components if str(item).strip())
+    }
 
     return {
         "ok": True,
@@ -194,6 +353,10 @@ def verify_update_channel(
         "blockmap_size": blockmap_size,
         "range_supported": range_supported,
         "download_strategy": "differential" if range_supported else "full-package-fallback",
+        "content_verified": verify_downloads,
+        "verified_bytes": package_verified_bytes,
+        "components": verified_components,
+        "manifest_signature_verified": bool(release_public_key),
     }
 
 
@@ -209,14 +372,20 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Audit the public ScanSci automatic-update channel")
     parser.add_argument("--manifest-url", required=True)
     parser.add_argument("--expected-version", default="")
+    parser.add_argument("--require-component", action="append", default=[])
+    parser.add_argument("--verify-downloads", action="store_true")
     parser.add_argument("--output", default="")
     parser.add_argument("--timeout", type=int, default=30)
+    parser.add_argument("--public-key", default="", help="Pinned Base64 Ed25519 release public key")
     args = parser.parse_args(argv)
     try:
         result = verify_update_channel(
             args.manifest_url,
             expected_version=args.expected_version,
+            required_components=tuple(args.require_component),
+            verify_downloads=bool(args.verify_downloads),
             timeout=max(1, args.timeout),
+            release_public_key=args.public_key,
         )
     except UpdateChannelFailure as exc:
         result = {"ok": False, "error": str(exc)}

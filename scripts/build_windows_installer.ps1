@@ -18,88 +18,7 @@ $source = (Resolve-Path -LiteralPath $BuildDir).Path
 $output = [System.IO.Path]::GetFullPath($OutputDir)
 $scriptPath = Join-Path $projectRoot "installer\ScanSci.iss"
 $exe = Join-Path $source "ScanSci.exe"
-
-function Get-SigningConfiguration {
-    if (-not $RequireSignature) {
-        return $null
-    }
-
-    # Keep release credentials and certificate selection out of source control.
-    # A formal build is allowed to run only on the release machine where an
-    # Authenticode certificate is installed in the current user's My store.
-    $thumbprint = ([string]$env:SCANSCI_SIGNING_CERT_THUMBPRINT).Replace(" ", "").Trim()
-    $timestampUrl = ([string]$env:SCANSCI_TIMESTAMP_URL).Trim()
-    if (-not $thumbprint) {
-        throw "Formal signing requires SCANSCI_SIGNING_CERT_THUMBPRINT to identify a CurrentUser\\My code-signing certificate."
-    }
-    if ($thumbprint -notmatch '^[A-Fa-f0-9]{40}$') {
-        throw "SCANSCI_SIGNING_CERT_THUMBPRINT must be a 40-character SHA-1 certificate thumbprint."
-    }
-    if (-not $timestampUrl) {
-        throw "Formal signing requires SCANSCI_TIMESTAMP_URL (an HTTPS RFC 3161 timestamp service)."
-    }
-    try {
-        $timestampUri = [uri]$timestampUrl
-    } catch {
-        throw "SCANSCI_TIMESTAMP_URL is not a valid absolute HTTPS URL."
-    }
-    if (-not $timestampUri.IsAbsoluteUri -or $timestampUri.Scheme -ne "https") {
-        throw "SCANSCI_TIMESTAMP_URL must be an absolute HTTPS URL."
-    }
-
-    $certificate = Get-ChildItem -LiteralPath "Cert:\CurrentUser\My\$thumbprint" -ErrorAction SilentlyContinue
-    if (-not $certificate) {
-        throw "The signing certificate $thumbprint was not found in Cert:\CurrentUser\My."
-    }
-    if (-not $certificate.HasPrivateKey) {
-        throw "The signing certificate $thumbprint does not expose a private key to this release account."
-    }
-    if ($certificate.NotAfter -le (Get-Date)) {
-        throw "The signing certificate $thumbprint is expired."
-    }
-
-    $kitRoots = @(
-        "${env:ProgramFiles(x86)}\Windows Kits\10\bin",
-        "$env:ProgramFiles\Windows Kits\10\bin"
-    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Container) }
-    $kitCandidates = foreach ($kitRoot in $kitRoots) {
-        Get-ChildItem -LiteralPath $kitRoot -Directory -ErrorAction SilentlyContinue |
-            Sort-Object Name -Descending |
-            ForEach-Object { Join-Path $_.FullName "x64\signtool.exe" }
-    }
-    $signToolCandidates = @(
-        (Get-Command signtool.exe -ErrorAction SilentlyContinue | Select-Object -ExpandProperty Source -ErrorAction SilentlyContinue),
-        $kitCandidates
-    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_ -PathType Leaf) }
-    if (-not $signToolCandidates) {
-        throw "Formal signing requires SignTool.exe from the Windows SDK or Visual Studio Developer PowerShell."
-    }
-
-    return [pscustomobject]@{
-        Thumbprint = $thumbprint
-        TimestampUrl = $timestampUri.AbsoluteUri
-        SignTool = ($signToolCandidates | Select-Object -First 1)
-    }
-}
-
-function Sign-Artifact {
-    param(
-        [Parameter(Mandatory)]
-        [string]$Artifact,
-        [Parameter(Mandatory)]
-        [object]$Signing
-    )
-
-    & $Signing.SignTool sign /fd SHA256 /sha $Signing.Thumbprint /tr $Signing.TimestampUrl /td SHA256 $Artifact
-    if ($LASTEXITCODE -ne 0) {
-        throw "SignTool failed with exit code $LASTEXITCODE for $Artifact"
-    }
-    $signature = Get-AuthenticodeSignature -LiteralPath $Artifact
-    if ($signature.Status -ne "Valid") {
-        throw "Authenticode verification failed for $Artifact; status: $($signature.Status)"
-    }
-    return $signature
-}
+. (Join-Path $PSScriptRoot "windows_signing.ps1")
 
 if (-not (Test-Path -LiteralPath $exe -PathType Leaf)) {
     throw "Packaged ScanSci executable was not found: $exe"
@@ -124,12 +43,12 @@ if ($UpdateManifestUrl) {
     }
 }
 
-$signing = Get-SigningConfiguration
+$signing = Get-ScanSciSigningConfiguration -Required:$RequireSignature
 $sourceSignature = Get-AuthenticodeSignature -LiteralPath $exe
 if ($signing) {
-    # Sign the packaged executable first so that the copy extracted by a user
-    # remains signed, then sign the installer that transports it.
-    $sourceSignature = Sign-Artifact -Artifact $exe -Signing $signing
+    # The release gate signs this file before package hashing and ZIP creation.
+    # Installer construction verifies the exact signer and never mutates it.
+    $sourceSignature = Assert-ScanSciArtifactSignature -Artifact $exe -ExpectedThumbprint $signing.Thumbprint
 }
 
 $isccCandidates = @(
@@ -164,7 +83,7 @@ if (-not (Test-Path -LiteralPath $installer -PathType Leaf)) {
 
 $installerSignature = Get-AuthenticodeSignature -LiteralPath $installer
 if ($signing) {
-    $installerSignature = Sign-Artifact -Artifact $installer -Signing $signing
+    $installerSignature = Invoke-ScanSciArtifactSigning -Artifact $installer -Signing $signing
 }
 if ($RequireSignature -and ($sourceSignature.Status -ne "Valid" -or $installerSignature.Status -ne "Valid")) {
     throw "Formal release requires valid Authenticode signatures for both ScanSci.exe and the installer."

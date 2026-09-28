@@ -89,6 +89,7 @@ def archive_component(
     manifest.write_text(
         json.dumps(
             {
+                "schema_version": 1,
                 "id": "local-transformers",
                 "version": version,
                 "windows": windows,

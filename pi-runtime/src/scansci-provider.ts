@@ -2,6 +2,7 @@ import type {
   Api,
   AssistantMessageEventStream,
   Context,
+  FetchFunction,
   Model,
   SimpleStreamOptions,
 } from "@earendil-works/pi-ai";
@@ -75,6 +76,259 @@ function conservativeTokens(value: unknown, descriptor: ModelRuntimeDescriptor):
   return conservativeTextTokens(text, descriptor) + estimatePiImageTokens(images);
 }
 
+const OLLAMA_LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
+const OLLAMA_NATIVE_OPTION_KEYS = [
+  "temperature",
+  "top_p",
+  "top_k",
+  "min_p",
+  "repeat_penalty",
+  "presence_penalty",
+  "frequency_penalty",
+  "seed",
+  "stop",
+] as const;
+
+function isOllamaEndpoint(value: string): boolean {
+  try {
+    const url = new URL(value);
+    const port = url.port || (url.protocol === "https:" ? "443" : "80");
+    return url.protocol === "http:"
+      && OLLAMA_LOOPBACK_HOSTS.has(url.hostname.toLowerCase())
+      && port === "11434";
+  } catch {
+    return false;
+  }
+}
+
+function requestUrl(input: Parameters<FetchFunction>[0]): string {
+  if (typeof input === "string") return input;
+  if (input instanceof URL) return input.toString();
+  return String((input as { url?: unknown }).url || input);
+}
+
+function requestBodyText(body: unknown): string {
+  if (typeof body === "string") return body;
+  if (body instanceof Uint8Array) return new TextDecoder().decode(body);
+  throw new Error("Ollama adapter requires a JSON request body");
+}
+
+function nativeOllamaMessages(value: unknown): unknown[] {
+  if (!Array.isArray(value)) throw new Error("Ollama request is missing messages");
+  return value.map((item) => {
+    if (!isRecord(item)) return item;
+    const message = { ...item };
+    if (message.role === "developer") message.role = "system";
+    if (message.content === null || message.content === undefined) message.content = "";
+    if (message.role === "tool" && typeof message.name === "string" && message.name) {
+      message.tool_name = message.name;
+      delete message.name;
+    }
+    if (Array.isArray(message.tool_calls)) {
+      message.tool_calls = message.tool_calls.map((rawCall, index) => {
+        if (!isRecord(rawCall)) return rawCall;
+        const call = { ...rawCall };
+        const fn = isRecord(call.function) ? { ...call.function } : {};
+        if (typeof fn.arguments === "string") {
+          try {
+            fn.arguments = JSON.parse(fn.arguments);
+          } catch {
+            // Let Ollama report malformed model-produced arguments. The
+            // request still retains the original data for diagnostics.
+          }
+        }
+        if (!fn.name && typeof call.name === "string") fn.name = call.name;
+        call.function = fn;
+        if (typeof call.index !== "number") call.index = index;
+        delete call.custom;
+        return call;
+      });
+    }
+    return message;
+  });
+}
+
+function nativeOllamaPayload(payload: JsonRecord, contextWindowTokens: number): JsonRecord {
+  const native = { ...payload };
+  native.messages = nativeOllamaMessages(native.messages);
+  const options = isRecord(native.options) ? { ...native.options } : {};
+  const outputBudget = native.max_tokens ?? native.max_completion_tokens ?? native.max_output_tokens;
+  if (typeof outputBudget === "number" && Number.isSafeInteger(outputBudget) && outputBudget > 0) {
+    options.num_predict = outputBudget;
+  }
+  options.num_ctx = contextWindowTokens;
+  for (const key of OLLAMA_NATIVE_OPTION_KEYS) {
+    if (native[key] !== undefined) {
+      options[key] = native[key];
+      delete native[key];
+    }
+  }
+  native.options = options;
+  if (typeof native.enable_thinking === "boolean") {
+    native.think = native.enable_thinking;
+  }
+  delete native.enable_thinking;
+  delete native.reasoning_effort;
+  delete native.max_tokens;
+  delete native.max_completion_tokens;
+  delete native.max_output_tokens;
+  delete native.stream_options;
+  delete native.store;
+  delete native.prompt_cache_key;
+  delete native.prompt_cache_retention;
+  native.stream = true;
+  return native;
+}
+
+function nativeOllamaToolCall(rawCall: unknown, fallbackIndex: number): JsonRecord | undefined {
+  if (!isRecord(rawCall)) return undefined;
+  const fn = isRecord(rawCall.function) ? rawCall.function : {};
+  const name = String(fn.name || rawCall.name || "").trim();
+  if (!name) return undefined;
+  const args = fn.arguments;
+  const argumentsText = typeof args === "string"
+    ? args
+    : JSON.stringify(args && typeof args === "object" ? args : {});
+  return {
+    index: typeof rawCall.index === "number" ? rawCall.index : fallbackIndex,
+    id: String(rawCall.id || `ollama-call-${fallbackIndex}`),
+    type: "function",
+    function: { name, arguments: argumentsText },
+  };
+}
+
+function openAIChunkFromOllama(
+  event: JsonRecord,
+  modelId: string,
+  requestId: string,
+  created: number,
+  sawToolCall: { value: boolean },
+): JsonRecord {
+  const message = isRecord(event.message) ? event.message : {};
+  const delta: JsonRecord = {};
+  if (typeof message.role === "string" && message.role) delta.role = message.role;
+  if (typeof message.content === "string" && message.content) delta.content = message.content;
+  if (typeof message.thinking === "string" && message.thinking) {
+    delta.reasoning_content = message.thinking;
+  }
+  if (Array.isArray(message.tool_calls)) {
+    const toolCalls = message.tool_calls
+      .map((call, index) => nativeOllamaToolCall(call, index))
+      .filter((call): call is JsonRecord => Boolean(call));
+    if (toolCalls.length) {
+      delta.tool_calls = toolCalls;
+      sawToolCall.value = true;
+    }
+  }
+  const choice: JsonRecord = {
+    index: 0,
+    delta,
+    finish_reason: null,
+  };
+  if (event.done) {
+    choice.delta = {};
+    choice.finish_reason = sawToolCall.value
+      ? "tool_calls"
+      : String(event.done_reason || "stop");
+  }
+  const chunk: JsonRecord = {
+    id: requestId,
+    object: "chat.completion.chunk",
+    created,
+    model: modelId,
+    choices: [choice],
+  };
+  const promptTokens = Number(event.prompt_eval_count);
+  const completionTokens = Number(event.eval_count);
+  if (event.done && Number.isSafeInteger(promptTokens) && Number.isSafeInteger(completionTokens)) {
+    chunk.usage = {
+      prompt_tokens: promptTokens,
+      completion_tokens: completionTokens,
+      total_tokens: promptTokens + completionTokens,
+    };
+  }
+  return chunk;
+}
+
+function ollamaNativeFetch(
+  originalFetch: FetchFunction,
+  model: Model<Api>,
+  contextWindowTokens: number,
+): FetchFunction {
+  return async (input, init) => {
+    const url = requestUrl(input);
+    if (!isOllamaEndpoint(model.baseUrl) || !url.includes("/chat/completions")) {
+      return originalFetch(input, init);
+    }
+    const bodyText = requestBodyText(init?.body);
+    const payload = JSON.parse(bodyText) as unknown;
+    if (!isRecord(payload)) throw new Error("Ollama request body must be an object");
+    const nativeUrl = new URL(url);
+    nativeUrl.pathname = "/api/chat";
+    nativeUrl.search = "";
+    const nativeResponse = await originalFetch(nativeUrl, {
+      ...init,
+      body: JSON.stringify(nativeOllamaPayload(payload, contextWindowTokens)),
+    });
+    if (!nativeResponse.ok || !nativeResponse.body) return nativeResponse;
+
+    const reader = nativeResponse.body.getReader();
+    const decoder = new TextDecoder();
+    const encoder = new TextEncoder();
+    const requestId = `ollama-${Date.now().toString(36)}`;
+    const created = Math.floor(Date.now() / 1000);
+    const sawToolCall = { value: false };
+    const stream = new ReadableStream<Uint8Array>({
+      start(controller) {
+        void (async () => {
+          let buffer = "";
+          try {
+            while (true) {
+              const next = await reader.read();
+              if (next.done) break;
+              buffer += decoder.decode(next.value, { stream: true });
+              const lines = buffer.split(/\r?\n/);
+              buffer = lines.pop() || "";
+              for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed) continue;
+                const event = JSON.parse(trimmed) as unknown;
+                if (!isRecord(event)) throw new Error("Ollama returned a non-object event");
+                const chunk = openAIChunkFromOllama(event, model.id, requestId, created, sawToolCall);
+                controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+              }
+            }
+            const tail = decoder.decode();
+            buffer += tail;
+            if (buffer.trim()) {
+              const event = JSON.parse(buffer) as unknown;
+              if (!isRecord(event)) throw new Error("Ollama returned a non-object event");
+              const chunk = openAIChunkFromOllama(event, model.id, requestId, created, sawToolCall);
+              controller.enqueue(encoder.encode(`data: ${JSON.stringify(chunk)}\n\n`));
+            }
+            controller.enqueue(encoder.encode("data: [DONE]\n\n"));
+            controller.close();
+          } catch (error) {
+            controller.error(error);
+          }
+        })();
+      },
+      cancel(reason) {
+        void reader.cancel(reason);
+      },
+    });
+    const headers = new Headers(nativeResponse.headers);
+    headers.set("content-type", "text/event-stream");
+    headers.delete("content-length");
+    headers.delete("content-encoding");
+    return new Response(stream, {
+      status: nativeResponse.status,
+      statusText: nativeResponse.statusText,
+      headers,
+    });
+  };
+}
+
 export function assertProviderRequest(
   payload: unknown,
   descriptor: ModelRuntimeDescriptor,
@@ -146,6 +400,13 @@ export function scansciStreamSimple(descriptor: ModelRuntimeDescriptor) {
         return finalPayload;
       },
     };
+    if (model.api === "openai-completions" && isOllamaEndpoint(model.baseUrl)) {
+      guardedOptions.fetch = ollamaNativeFetch(
+        options?.fetch || globalThis.fetch,
+        model,
+        descriptor.context_window_tokens,
+      );
+    }
     if (model.api === "openai-completions") {
       return streamOpenAICompletions(model, context, guardedOptions);
     }

@@ -10,6 +10,10 @@
 
 但不建议立刻做破坏性改名。已有包名、Python import、keyring service name、缓存目录、文档链接和脚本可能都依赖 `scansci-html`。更稳的路线是：对外品牌升级，工程兼容保留。
 
+## 当前工程项目名
+
+当前控制面和项目标识为 `scansci-harness`。`ScanSci` 继续承担面向用户的产品品牌，Pi 继续表示模型执行驱动。Python 发行包 `scansci`、`scansci_html` import、CLI 命令、keyring service name、会话目录和既有发行地址继续保留，保证已有安装、脚本与用户数据可继续使用。
+
 ## 命名原则
 
 命名时优先区分三件事：

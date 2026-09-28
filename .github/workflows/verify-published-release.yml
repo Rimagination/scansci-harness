@@ -1,0 +1,83 @@
+name: Verify published release
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Published release tag, for example v0.4.2
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  verify-windows-release:
+    runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name || inputs.version }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Verify public update and runtime channels
+        shell: pwsh
+        run: |
+          $version = $env:RELEASE_TAG.TrimStart("v")
+          $releasePublicKey = (Get-Content -Raw config/release-gate.json | ConvertFrom-Json).package.release_public_key
+          if (-not $releasePublicKey) { throw "config/release-gate.json is missing the Ed25519 release public key." }
+          python scripts/verify_update_channel.py `
+            --manifest-url "https://github.com/Rimagination/scansci-pi/releases/latest/download/stable.json" `
+            --expected-version $version `
+            --public-key $releasePublicKey `
+            --require-component local-transformers `
+            --verify-downloads `
+            --output published-update-channel.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Download installer evidence
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path published-release | Out-Null
+          gh release download $env:RELEASE_TAG `
+            --dir published-release `
+            --pattern "ScanSci-*-windows-x64-setup.exe" `
+            --pattern "installer-manifest.json"
+
+      - name: Clean install, diagnose, verify signature, and uninstall
+        shell: pwsh
+        run: |
+          $version = $env:RELEASE_TAG.TrimStart("v")
+          $installers = @(Get-ChildItem -LiteralPath published-release -Filter "ScanSci-*-windows-x64-setup.exe")
+          if ($installers.Count -ne 1) { throw "Expected exactly one published installer, found $($installers.Count)." }
+          $installer = $installers[0]
+          $manifest = Get-Content -Raw -LiteralPath "published-release/installer-manifest.json" | ConvertFrom-Json
+          if (-not $manifest.build_id -or $manifest.version -ne $version) { throw "Published installer evidence does not match release $version." }
+          $actualSha256 = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne ([string]$manifest.installer_sha256).ToLowerInvariant()) { throw "Published installer SHA256 does not match installer-manifest.json." }
+          $signature = Get-AuthenticodeSignature -LiteralPath $installer.FullName
+          if ($signature.Status -ne "Valid" -or $manifest.authenticode_status -ne "Valid" -or -not $manifest.signature_required) {
+            throw "Published installer does not satisfy the formal signing contract."
+          }
+          python scripts/verify_windows_installer.py `
+            --installer $installer.FullName `
+            --expected-build-id $manifest.build_id `
+            --expected-version $version `
+            --require-signature `
+            --output published-installer-verification.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: published-release-verification-${{ env.RELEASE_TAG }}
+          path: |
+            published-update-channel.json
+            published-installer-verification.json

@@ -1,8 +1,10 @@
-# ScanSci Pi
+# ScanSci Harness
 
-![ScanSci Pi product banner](assets/scansci-pi-banner.png)
+![ScanSci Harness product banner](assets/scansci-pi-banner.png)
 
 **证据优先的科研 AI 工作台。** 找论文、读资料、核验证据、写综述、做幻灯片——每一步都绑定原文出处，证据不足时明确说明，不编造。
+
+本项目名称为 `scansci-harness`；桌面产品沿用 ScanSci 品牌，Pi 作为模型执行驱动。
 
 ## 核心能力
 
@@ -41,12 +43,12 @@
 ### 安全与可控
 
 - Agent 默认只能使用白名单科研工具，Shell 和文件修改工具默认关闭。
-- API 密钥保存在系统凭据管理器（Windows Credential Manager），不写入配置文件或日志。
+- API 密钥默认保存在系统凭据管理器（Windows Credential Manager），不写入配置文件或日志；也可按 provider 使用对应环境变量，环境变量按请求优先于 keyring，设置页不会覆盖它。
 - 任务支持暂停、续接、自动纠错和 checkpoint，中途失败不丢失进度。
 
 ## 界面预览
 
-<img src="assets/scansci-pi-home.png" alt="ScanSci Pi 首页与科研工作入口" width="100%">
+<img src="assets/scansci-pi-home.png" alt="ScanSci Harness 首页与科研工作入口" width="100%">
 
 ## 快速开始
 

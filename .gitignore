@@ -87,3 +87,10 @@ b/
 # User downloads and one-off local validation outputs
 downloads/
 icon-no-white-border.png
+
+# Local verification session artifacts
+.playwright-mcp/
+.superpowers/
+artifacts/
+ppt_run.json
+plan.json

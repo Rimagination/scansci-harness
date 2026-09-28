@@ -13,7 +13,13 @@ import {
   type ModelRuntimeDescriptor,
   type PiImageContent,
 } from "./multimodal.js";
-import { searchToolCatalog, type ToolCatalogEntry } from "./tool-catalog.js";
+import {
+  DEFAULT_DISCOVERY_THRESHOLD,
+  DISCOVERY_DECISION_SCHEMA_VERSION,
+  normalizeDiscoveryThreshold,
+  searchToolCatalog,
+  type ToolCatalogEntry,
+} from "./tool-catalog.js";
 import { conservativeTextTokens } from "./token-estimate.js";
 
 type JsonRecord = Record<string, unknown>;
@@ -358,12 +364,13 @@ export function createSearchToolsTool(options: DynamicToolRuntimeOptions) {
   return defineTool({
     name: "search_tools",
     label: "Search authorized tools",
-    description: "Search the current ScanSci capability lease by tool name, label, description, aliases, tags, group, risk, or availability. Matching authorized tools can be additively activated for the next model turn. This loader never expands the host lease.",
+    description: "Search the current ScanSci capability lease by tool name, label, description, aliases, tags, group, risk, or availability. Matching authorized tools can be additively activated for the next model turn. This loader never expands the host lease. The threshold is a local heuristic confidence cutoff, not an authorization decision.",
     executionMode: "sequential",
     parameters: Type.Object({
       query: Type.Optional(Type.String({ maxLength: 500 })),
       names: Type.Optional(Type.Array(Type.String({ minLength: 1, maxLength: 160 }), { maxItems: 20 })),
       limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
+      threshold: Type.Optional(Type.Number({ minimum: 0, maximum: 1, default: DEFAULT_DISCOVERY_THRESHOLD })),
       activate: Type.Optional(Type.Boolean({ default: true })),
     }),
     execute: async (_toolCallId, params) => {
@@ -378,8 +385,12 @@ export function createSearchToolsTool(options: DynamicToolRuntimeOptions) {
         isAuthorized: options.isAuthorized,
       });
       const shouldActivate = params.activate !== false;
+      const threshold = normalizeDiscoveryThreshold(params.threshold);
       const selected = shouldActivate
-        ? result.matches.map((match) => match.name).filter((name) => options.isAuthorized(name))
+        ? result.matches
+          .filter((match) => match.confidence >= threshold)
+          .map((match) => match.name)
+          .filter((name) => options.isAuthorized(name))
         : [];
       const next = [...new Set([...before, ...selected])]
         .filter((name) => name === "search_tools" || options.isAuthorized(name) || ["ask_user", "submit_plan"].includes(name))
@@ -387,6 +398,16 @@ export function createSearchToolsTool(options: DynamicToolRuntimeOptions) {
       const activated = next.filter((name) => !before.includes(name));
       if (activated.length) session.setActiveToolsByName(next);
       options.onActivation?.(next, activated);
+      const decision = {
+        schema_version: DISCOVERY_DECISION_SCHEMA_VERSION,
+        kind: "tool_activation",
+        source: "local_heuristic",
+        semantic_provider: "not_configured",
+        fallback_used: true,
+        threshold,
+        candidate_count: result.matches.length,
+        selected: activated,
+      };
       options.emit?.({
         type: "status.update",
         request_id: options.requestId?.() || "",
@@ -395,6 +416,7 @@ export function createSearchToolsTool(options: DynamicToolRuntimeOptions) {
         details: {
           query: String(params.query || "").slice(0, 200),
           match_count: result.matches.length,
+          decision,
           activated,
           active_tool_count: next.length,
           rejected: result.rejected,
@@ -403,6 +425,7 @@ export function createSearchToolsTool(options: DynamicToolRuntimeOptions) {
       const payload = {
         schema_version: "scansci.tool-search.v1",
         query: String(params.query || ""),
+        decision,
         matches: result.matches.map((match) => ({ ...match, active: next.includes(match.name) })),
         activated,
         rejected: result.rejected,

@@ -61,6 +61,7 @@ import {
   type McpToolPolicy,
 } from "./mcp-registry.js";
 
+const SCANSCI_PROJECT_ID = String(rootPackage.name || "scansci-harness");
 const SCANSCI_PRODUCT_VERSION = String(rootPackage.version);
 
 type JsonRecord = Record<string, unknown>;
@@ -273,6 +274,8 @@ function redactSensitiveText(value: unknown): string {
 function classifyError(error: unknown): JsonRecord {
   const raw = redactSensitiveText(error);
   const normalized = raw.toLowerCase();
+  const retryAfterMatch = raw.match(/retry[-_ ]?after\s*(?:=|:|\s)\s*(\d+(?:\.\d+)?)/i);
+  const retryAfterSeconds = retryAfterMatch ? Number(retryAfterMatch[1]) : 0;
   if (normalized.includes("insufficient balance") || normalized.includes("insufficient credit") || normalized.includes("402")) {
     return {
       code: "provider_balance_exhausted",
@@ -293,6 +296,7 @@ function classifyError(error: unknown): JsonRecord {
         { id: "retry", label: "自动重试", kind: "retry" },
         { id: "follow_up", label: "稍后继续", kind: "follow_up" },
       ],
+      ...(retryAfterSeconds > 0 ? { retry_after_seconds: retryAfterSeconds } : {}),
     };
   }
   if (
@@ -381,6 +385,25 @@ function classifyError(error: unknown): JsonRecord {
       detail: raw,
     };
   }
+  if (
+    /\b(?:500|502|503|504)\b/.test(normalized)
+    || normalized.includes("bad gateway")
+    || normalized.includes("proxyerror")
+    || normalized.includes("connection refused")
+    || normalized.includes("remote end closed")
+    || normalized.includes("could not connect")
+  ) {
+    return {
+      code: "model_transport_unavailable",
+      message: "模型服务连接暂时失败。ScanSci 已停止重复请求，可稍后重试或切换模型。",
+      retryable: true,
+      recovery_actions: [
+        { id: "retry", label: "重试当前请求", kind: "retry" },
+        { id: "change_model", label: "切换模型", kind: "branch" },
+      ],
+      detail: raw,
+    };
+  }
   return {
     code: "agent_runtime_error",
     message: error instanceof Error ? `${error.name}: ${raw}` : raw,
@@ -397,8 +420,9 @@ function providerApi(
   kind: string,
   apiSurface = "chat_completions",
 ): "anthropic-messages" | "openai-completions" | "openai-responses" {
-  if (kind === "anthropic" || kind === "anthropic-compatible") return "anthropic-messages";
-  return String(apiSurface || "chat_completions").toLowerCase() === "responses"
+  const surface = String(apiSurface || "chat_completions").toLowerCase();
+  if (kind === "anthropic" || kind === "anthropic-compatible" || surface === "anthropic_messages") return "anthropic-messages";
+  return surface === "responses"
     ? "openai-responses"
     : "openai-completions";
 }
@@ -776,6 +800,28 @@ function modelCompat(request: RunStart): JsonRecord | undefined {
     apiSurface: request.api_surface || "chat_completions",
   });
   const deferredCompat = deferredToolsMode ? { deferredToolsMode } : {};
+  let baseHostname = "";
+  try {
+    baseHostname = new URL(baseUrl).hostname;
+  } catch {
+    // The provider validation layer reports malformed URLs to the caller.
+  }
+  const isLoopbackEndpoint = ["127.0.0.1", "localhost", "::1"].includes(baseHostname);
+  if (isLoopbackEndpoint) {
+    // The managed local runtime may close an otherwise valid SSE response
+    // without exposing its terminal finish_reason to Pi.  Loopback output is
+    // trusted and Pi can safely infer `stop` at EOF for this transport.
+    return {
+      supportsStore: false,
+      supportsDeveloperRole: false,
+      supportsReasoningEffort: false,
+      supportsUsageInStreaming: true,
+      supportsFinishReason: false,
+      maxTokensField: "max_tokens",
+      supportsStrictMode: false,
+      ...deferredCompat,
+    };
+  }
   if (baseUrl.includes("models.github.ai") || model.startsWith("openai/")) {
     return {
       supportsStore: false,
@@ -875,7 +921,7 @@ function normalizeTaskContract(request: TaskContractRequest): NormalizedTaskCont
   );
   const modeParts = new Set(String(request.task_mode || "general").split("+").filter(Boolean));
   const fallbackRisk = version.valid
-    ? [...modeParts].some((part) => ["research", "slides"].includes(part))
+    ? [...modeParts].some((part) => ["research", "slides", "image"].includes(part))
       ? "reversible"
       : "read_only"
     : "none";
@@ -955,7 +1001,11 @@ function normalizeTaskContract(request: TaskContractRequest): NormalizedTaskCont
 }
 
 function toolRisk(name: string, mcpPolicy?: McpToolPolicy): ToolRisk {
-  if (mcpPolicy) return mcpPolicy.effect === "read" ? "read_only" : "high";
+  if (mcpPolicy) {
+    if (mcpPolicy.effect === "read") return "read_only";
+    if (mcpPolicy.effect === "reversible") return "reversible";
+    return "high";
+  }
   const normalized = String(name || "");
   // MCP effects are never inferred from a local or remote name.  A missing
   // structured policy is an unknown effect and therefore high risk.
@@ -966,6 +1016,7 @@ function toolRisk(name: string, mcpPolicy?: McpToolPolicy): ToolRisk {
     "create_pdf",
     "create_spreadsheet",
     "create_presentation",
+    "generate_image",
     "compile_latex",
     "edit_section",
     "edit_slide",
@@ -1632,17 +1683,17 @@ async function runNativeScientificChild(
     resourceLoader: childLoader,
     sessionManager: SessionManager.inMemory(parentState.request.cwd),
     settingsManager: SettingsManager.inMemory({
-      httpIdleTimeoutMs: 120000,
+      httpIdleTimeoutMs: 240000,
       compaction: {
         enabled: true,
         reserveTokens: parentState.session.modelRuntime.compaction_reserve_tokens,
         keepRecentTokens: parentState.session.modelRuntime.keep_recent_tokens,
       },
       retry: {
-        enabled: false,
-        maxRetries: 0,
-        baseDelayMs: 1000,
-        provider: { timeoutMs: 120000, maxRetries: 0, maxRetryDelayMs: 5000 },
+        enabled: true,
+        maxRetries: 2,
+        baseDelayMs: 15000,
+        provider: { timeoutMs: 240000, maxRetries: 0, maxRetryDelayMs: 5000 },
       },
     }),
   })).session;
@@ -2068,6 +2119,35 @@ function safeToolSegment(value: unknown): string {
     .slice(0, 48) || "mcp";
 }
 
+function isLiteratureMcpServer(raw: JsonRecord): boolean {
+  const manifest = raw.provider_manifest && typeof raw.provider_manifest === "object"
+    ? raw.provider_manifest as JsonRecord
+    : {};
+  const markers = [raw.connector_kind, raw.provider_kind, manifest.provider_kind]
+    .map((value) => String(value || "").trim().toLowerCase());
+  return markers.includes("literature")
+    || String(raw.catalog_id || "").trim().toLowerCase().includes("scansci-pdf");
+}
+
+function normalizeLiteratureMcpArguments(
+  raw: JsonRecord,
+  argumentsRecord: JsonRecord,
+): JsonRecord {
+  if (!isLiteratureMcpServer(raw)) return argumentsRecord;
+  const identifier = argumentsRecord.identifier;
+  if (typeof identifier !== "string") return argumentsRecord;
+  const match = identifier.trim().match(
+    /^(?:arxiv:\s*|https?:\/\/(?:www\.)?arxiv\.org\/(?:abs|pdf)\/)?(\d{4}\.\d{4,5}(?:v\d+)?)(?:\.pdf)?$/i,
+  );
+  if (!match) return argumentsRecord;
+  const normalized = match[1];
+  if (normalized === identifier) return argumentsRecord;
+  // Keep plugin ownership intact while canonicalizing an equivalent arXiv
+  // spelling at the Host boundary. This lets plugins with exact-string cache
+  // keys reuse a previously downloaded paper.
+  return { ...argumentsRecord, identifier: normalized };
+}
+
 function splitCommandArgs(value: unknown): string[] {
   const source = String(value || "").trim();
   if (!source) return [];
@@ -2119,6 +2199,12 @@ function mcpToolPolicy(
     configuredEffects,
     configuredPolicies: raw.tool_policies,
   });
+}
+
+function mcpToolVisible(raw: JsonRecord, policy: McpToolPolicy): boolean {
+  if (policy.effect === "read") return true;
+  if (policy.effect === "reversible") return raw.allow_reversible === true || raw.allow_write === true;
+  return raw.allow_write === true;
 }
 
 function mcpPolicyRecord(policy: McpToolPolicy): JsonRecord {
@@ -2304,7 +2390,7 @@ function deferredMcpTools(
           });
           const transport = createMcpTransport(raw, currentRequest);
           if (!transport) throw new Error(`MCP server ${serverLabel} has no usable transport configuration`);
-          const next = new McpClient({ name: "scansci-pi", version: SCANSCI_PRODUCT_VERSION }, { capabilities: {} });
+          const next = new McpClient({ name: SCANSCI_PROJECT_ID, version: SCANSCI_PRODUCT_VERSION }, { capabilities: {} });
           try {
             await next.connect(transport, { timeout: MCP_CONNECT_TIMEOUT_MS });
           } catch (error) {
@@ -2356,7 +2442,7 @@ function deferredMcpTools(
       }))
       .filter(({ tool, policy }) => {
         if (!policy.remoteName || policy.effect === "unknown") return false;
-        if (policy.effect !== "read" && raw.allow_write !== true) return false;
+        if (!mcpToolVisible(raw, policy)) return false;
         return Boolean(tool);
       });
   };
@@ -2407,16 +2493,17 @@ function deferredMcpTools(
           if (!refreshed) throw new Error(`MCP tool is unavailable or not authorized: ${policy.remoteName}`);
           policies.set(localName as string, refreshed.policy);
           const argumentsRecord = params as JsonRecord;
+          const remoteArguments = normalizeLiteratureMcpArguments(raw, argumentsRecord);
           const result = await executeMcpRemoteCall(
             localName as string,
             refreshed.policy,
-            argumentsRecord,
+            remoteArguments,
             async () => {
               await ensureConnected();
               if (!client) throw new Error(`MCP server did not connect: ${serverLabel}`);
               try {
                 return await client.callTool(
-                  { name: refreshed.policy.remoteName, arguments: argumentsRecord },
+                  { name: refreshed.policy.remoteName, arguments: remoteArguments },
                   undefined,
                   { signal, timeout: mcpCallTimeout(raw), maxTotalTimeout: mcpCallTimeout(raw) },
                 );
@@ -2450,6 +2537,30 @@ function deferredMcpTools(
     freshness: "volatile",
     annotations: { readOnlyHint: true },
   });
+
+  const configuredRemoteNames = [
+    ...(Array.isArray(raw.tool_policies)
+      ? raw.tool_policies.map((item) => item && typeof item === "object"
+        ? String((item as JsonRecord).name || (item as JsonRecord).tool || "")
+        : "")
+      : raw.tool_policies && typeof raw.tool_policies === "object"
+        ? Object.keys(raw.tool_policies as JsonRecord)
+        : []),
+    ...(raw.tool_effects && typeof raw.tool_effects === "object"
+      ? Object.keys(raw.tool_effects as JsonRecord)
+      : []),
+  ]
+    .map((name) => name.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim().slice(0, 120))
+    .filter(Boolean)
+    .filter((name, index, names) => names.indexOf(name) === index)
+    .slice(0, 12);
+  const remoteNameHint = configuredRemoteNames.length > 0
+    ? ` Known configured remote names include: ${configuredRemoteNames.join(", ")}.`
+    : " Use the exact remote name returned by the search tool.";
+  const literatureIdentifierHint = isLiteratureMcpServer(raw)
+    && configuredRemoteNames.includes("scansci_pdf_download")
+    ? ' For scansci_pdf_download, pass the field "identifier" with a bare arXiv ID such as "1706.03762"; omit the "arXiv:" prefix and never use "arxiv_id".'
+    : "";
 
   const definedTools = [
     defineTool({
@@ -2507,7 +2618,7 @@ function deferredMcpTools(
             description: String(tool.description || "").slice(0, MAX_MCP_DESCRIPTION_CHARS),
             input_schema: schema,
             ...mcpPolicyRecord(policy),
-            write_authorized: policy.effect === "read" || raw.allow_write === true,
+            write_authorized: mcpToolVisible(raw, policy),
           };
         });
         const nativeEntries = result
@@ -2544,11 +2655,19 @@ function deferredMcpTools(
     defineTool({
       name: callName,
       label: `${serverLabel} · call`,
-      description: `Call one ${serverLabel} MCP tool found through ${searchName}.`,
+      description: `Call one remote ${serverLabel} MCP tool found through ${searchName}. The tool parameter must be the remote MCP name, such as scansci_pdf_download; never put the wrapper name ${callName} there.${remoteNameHint}${literatureIdentifierHint}`,
       executionMode: "sequential",
       parameters: Type.Object({
-        tool: Type.String({ minLength: 1, maxLength: 200 }),
-        arguments: Type.Optional(Type.Unsafe<JsonRecord>({ type: "object", additionalProperties: true })),
+        tool: Type.String({
+          minLength: 1,
+          maxLength: 200,
+          description: `Exact remote MCP tool name returned by ${searchName}; do not use ${callName}.${remoteNameHint}${literatureIdentifierHint}`,
+        }),
+        arguments: Type.Optional(Type.Unsafe<JsonRecord>({
+          type: "object",
+          additionalProperties: true,
+          description: "Arguments for the selected remote MCP tool.",
+        })),
       }),
       execute: async (_toolCallId, params, signal) => {
         const remoteName = String(params.tool || "").trim();
@@ -2556,12 +2675,18 @@ function deferredMcpTools(
         const selected = remote
           .map((tool) => ({ tool, policy: mcpToolPolicy(raw, rawServerId, serverAlias, tool) }))
           .find(({ policy }) => policy.remoteName === remoteName);
-        if (!selected) throw new Error(`MCP tool is unavailable or not authorized: ${remoteName}`);
-        const effectivePolicy = selected.policy.effect !== "read" && raw.allow_write !== true
+        if (!selected) {
+          throw new Error(
+            `MCP remote tool is unavailable or not authorized: ${remoteName}. `
+            + `The tool parameter must be the remote name, not ${callName}.${remoteNameHint}${literatureIdentifierHint}`,
+          );
+        }
+        const effectivePolicy = !mcpToolVisible(raw, selected.policy)
           ? { ...selected.policy, effect: "unknown" as const, idempotent: false, freshness: "volatile" as const }
           : selected.policy;
         const argumentsRecord = (params.arguments && typeof params.arguments === "object" ? params.arguments : {}) as JsonRecord;
-        const claimedArguments = { ...argumentsRecord, _scansci_remote_tool: remoteName };
+        const remoteArguments = normalizeLiteratureMcpArguments(raw, argumentsRecord);
+        const claimedArguments = { ...remoteArguments, _scansci_remote_tool: remoteName };
         const result = await executeMcpRemoteCall(
           callName,
           effectivePolicy,
@@ -2571,7 +2696,7 @@ function deferredMcpTools(
             if (!client) throw new Error(`MCP server did not connect: ${serverLabel}`);
             try {
               return await client.callTool(
-                { name: remoteName, arguments: argumentsRecord },
+                { name: remoteName, arguments: remoteArguments },
                 undefined,
                 { signal, timeout: mcpCallTimeout(raw), maxTotalTimeout: mcpCallTimeout(raw) },
               );
@@ -2663,7 +2788,7 @@ async function externalMcpTools(
       directConnection = (async () => {
         const transport = createMcpTransport(raw, requestRef.current);
         if (!transport) throw new Error("MCP server has no usable transport configuration");
-        const next = new McpClient({ name: "scansci-pi", version: SCANSCI_PRODUCT_VERSION }, { capabilities: {} });
+        const next = new McpClient({ name: SCANSCI_PROJECT_ID, version: SCANSCI_PRODUCT_VERSION }, { capabilities: {} });
         try {
           await next.connect(transport, { timeout: MCP_CONNECT_TIMEOUT_MS });
           directClient = next;
@@ -2696,7 +2821,7 @@ async function externalMcpTools(
         const rawServerId = String(raw.id || raw.name || "").trim();
         const policy = mcpToolPolicy(raw, rawServerId, serverId, remoteTool as JsonRecord);
         if (!remoteName || policy.effect === "unknown") continue;
-        if (policy.effect !== "read" && raw.allow_write !== true) continue;
+        if (!mcpToolVisible(raw, policy)) continue;
         let localName = safeMcpLocalToolName(serverId, remoteName);
         let suffix = 2;
         while (usedNames.has(localName)) localName = safeMcpLocalToolName(serverId, `${remoteName}_${suffix++}`);
@@ -2724,15 +2849,16 @@ async function externalMcpTools(
           parameters: Type.Unsafe(inputSchema),
           execute: async (_toolCallId, params, signal) => {
             const argumentsRecord = params as JsonRecord;
+            const remoteArguments = normalizeLiteratureMcpArguments(raw, argumentsRecord);
             const result = await executeMcpRemoteCall(
               localName,
               policy,
-              argumentsRecord,
+              remoteArguments,
               async () => {
                 const currentClient = await ensureDirectConnected();
                 try {
                   return await currentClient.callTool(
-                  { name: remoteName, arguments: argumentsRecord },
+                  { name: remoteName, arguments: remoteArguments },
                   undefined,
                   { signal, timeout: mcpCallTimeout(raw), maxTotalTimeout: mcpCallTimeout(raw) },
                   );
@@ -2907,7 +3033,7 @@ function tools(
     bridgeTool(
       "search_local_evidence",
       "Search local evidence",
-      "Search sentence-level evidence in the active ScanSci notebook. Use before making source-grounded scientific claims.",
+      "Search sentence-level evidence in the active ScanSci notebook. Results keep the matched sentence, one-hop before/after context, and an evidence anchor for source-reader highlighting. Use before making source-grounded scientific claims.",
       Type.Object({
         query: Type.String({ description: "Focused evidence search query" }),
         result_limit: Type.Optional(Type.Integer({ minimum: 1, maximum: 20 })),
@@ -3101,6 +3227,25 @@ function tools(
       }),
     ),
     bridgeTool(
+      "generate_image",
+      "Generate image",
+      "Generate one image with the user's configured image model and save it inside ScanSci's artifact directory.",
+      Type.Object({
+        prompt: Type.String({ minLength: 1, maxLength: 4_000 }),
+        title: Type.Optional(Type.String()),
+        size: Type.Optional(Type.Union([
+          Type.Literal("1024x1024"),
+          Type.Literal("768x1344"),
+          Type.Literal("864x1152"),
+          Type.Literal("1344x768"),
+          Type.Literal("1152x864"),
+          Type.Literal("1440x720"),
+          Type.Literal("720x1440"),
+        ])),
+        output_name: Type.Optional(Type.String()),
+      }),
+    ),
+    bridgeTool(
       "create_document",
       "Create Word document",
       "Create a verified local DOCX artifact from a title and Markdown-like text. The file is written only inside ScanSci's artifact directory.",
@@ -3268,7 +3413,7 @@ function guardProviderRequest(payload: unknown, budget: number): unknown {
 
 function sessionInvariantSystemPrompt(): string {
   return [
-    "You are the ScanSci Pi agent runtime.",
+    "You are the Pi agent runtime embedded in ScanSci Harness.",
     "This session-level base prompt is invariant and grants no per-turn authority.",
     "Current-turn system content, date, task contract, capability leases, risk policy, and budgets are supplied separately by the before_agent_start lifecycle hook.",
   ].join("\n");
@@ -3313,6 +3458,9 @@ function currentTurnSystemPrompt(
   const hasMode = (mode: string): boolean => modeParts.has(mode);
   const userRequest = finalUserRequestText(request.prompt || "");
   const exactIdentifier = /(?:\b10\.\d{4,9}\/[A-Za-z0-9._;()/:+\-[\]]+|\b(?:arxiv:)?(?:\d{4}\.\d{4,5}|[a-z-]+\/\d{7})(?:v\d+)?)/i.test(userRequest);
+  const downloadOnlyRequest = exactIdentifier
+    && /(?:download|acquire|fetch|full\s*text|下载|获取(?:论文|文献)|全文)/i.test(userRequest)
+    && !/(?:summari[sz]e|synthesi[sz]e|review|compare|analy[sz]e|总结|综述|比较|对比|分析|归纳)/i.test(userRequest);
   const hostEvidencePolicy = String(contract.taskProfile.evidence_policy || "");
   const policy = ["off", "assist", "strict"].includes(hostEvidencePolicy)
     ? hostEvidencePolicy as "off" | "assist" | "strict"
@@ -3366,9 +3514,27 @@ function currentTurnSystemPrompt(
       : hasMode("verified-answer") || hasMode("research") || hasMode("benchmark")
         ? `For a linked Zotero library, call kb_search or zotero_search and ground the answer in returned Zotero metadata or indexed-fulltext excerpts. For ScanSci-indexed evidence sources, call build_verified_answer before delivering scientific claims. ${exactIdentifier ? "The user supplied an exact DOI/arXiv identifier: call download_and_index directly and do not spend a turn rediscovering the same paper." : "When the user asks to find, acquire, and analyze papers, use discover_papers before download_and_index."} Then call summarize_documents and check_task_completion before claiming completion. Never invent a source or treat title-only metadata as full-text evidence.`
         : "Use ScanSci tools when they materially improve the answer. Never claim a tool action happened unless the tool returned success.";
-  const artifactRule = hasMode("slides")
-    ? "This request also requires a real artifact. Call the matching create_* or compile_latex tool, use retrieved/document evidence as its content, and report only the verified file_path returned by the tool. An outline or filename invented in prose is not delivery."
+  const hasAuthorizedLiteratureMcp = contract.hasMcpLease
+    && (Array.isArray(request.mcp_servers) ? request.mcp_servers : []).some((raw) => (
+      isLiteratureMcpServer(raw)
+      && contract.allowedMcpServers.has(String(raw.id || raw.name || "").trim())
+    ));
+  const literatureRule = hasAuthorizedLiteratureMcp
+    ? [
+      "An authorized literature MCP is available in the active tool surface. For a deferred server, use its active `__call` proxy for an exact DOI/arXiv acquisition and put the exact remote MCP name in the inner `tool` field (for scansci-pdf, use `scansci_pdf_download`).",
+      "For that download tool, pass `{\"identifier\":\"1706.03762\"}` for an arXiv paper: use the field `identifier`, pass the bare ID, omit the `arXiv:` prefix, and never use `arxiv_id`.",
+      "The `__search` proxy searches MCP tool definitions, while paper retrieval uses the configured remote tool. If the user explicitly limits the task to this plugin, keep the acquisition on this MCP route and do not substitute the built-in download_and_index route.",
+      downloadOnlyRequest
+        ? "This is a download-only request: after the plugin returns success, report its verified file path, source, and cache status directly. Do not call summarize_documents or ask_user unless the current contract explicitly requires another tool."
+        : "",
+    ].filter(Boolean).join(" ")
     : "";
+  const artifactRule = [
+    literatureRule,
+    hasMode("slides")
+      ? "This request also requires a real artifact. Call the matching create_* or compile_latex tool, use retrieved/document evidence as its content, and report only the verified file_path returned by the tool. An outline or filename invented in prose is not delivery."
+      : "",
+  ].filter(Boolean).join("\n");
   const skillRule = loadedSkillPrompt(loadedSkills);
   return `${request.system_prompt}\n\nYou are running inside ScanSci with the Pi agent runtime.\nCurrent ScanSci host date (Asia/Shanghai): ${currentHostDate}. For requests containing today, latest, current, or recent, include this exact date or an explicit bounded recency term in the search query. Never infer the current date from model memory. Do not label older results as today's news; if current results cannot be verified, say so and identify the actual source dates.\n\n— HOST-OWNED TASK CONTRACT —\n${contractRule}\n${profileRule}\nThe host, not the model, owns permissions, required actions, and budgets. A denied tool call means you must choose a permitted strategy; never tell the user to change modes merely because one route was denied.\n\n— REASONING FRAMEWORK —\n1. **Plan**: Decompose the request into the smallest useful tool sequence. Submit a blocking plan only when the task contract requires it. Do not pause ordinary read-only or pre-authorized reversible work.\n2. **Execute**: Independent tools marked parallel-safe may be called as siblings; all other tools run sequentially. If a search returns zero results, broaden the query or switch sources — do not give up.\n3. **Verify**: Check the persisted result of consequential actions. Under strict evidence policy, source-ground scientific claims; otherwise do not manufacture a citation workflow the user did not ask for.\n4. **Adjust**: Call \`self_assess\` when uncertain whether to continue, adjust parameters, or deliver. Call \`ask_user\` only when a missing choice materially changes the result and bounded read-only discovery cannot resolve it; never use it as a progress update.\n5. **Deliver**: Continue until you can return the requested result or a concrete, truthful blocking error.\n\n${policyRule}\n${evidenceRule}\n${artifactRule}\n${skillRule}\n\nInitial budget: ${callBudget} tool calls; the host may extend it up to ${contract.maxToolBudget} only after verified progress. Pi's context-window compaction stays enabled. The cumulative model-token lease starts at ${contract.modelTokenBudget} and can expand automatically up to the emergency guard ${contract.maxModelTokenBudget}; do not shorten a sound answer merely to stay below the initial lease. Avoid repeating equivalent searches.\n\nA plan written only in prose, preflight note, or promise to work later is never a final answer. Built-in shell and unrestricted filesystem mutation tools are disabled.`;
 }
@@ -3432,7 +3598,8 @@ function requiredToolGroups(taskMode: string, requestText = ""): Set<string>[] {
     if (wantsDownload) groups.push(new Set(["check_task_completion"]));
   }
   if (parts.has("verified-answer")) groups.push(new Set(["build_verified_answer"]));
-  const explicitArtifact = /(?:create|generate|make|build|export|save|produce|downloadable|创建|生成|制作|导出|保存|产出|可下载|实际文件)/i.test(normalizedText);
+  const explicitArtifact = /(?:create|generate|make|build|draw|render|design|export|save|produce|downloadable|创建|生成|制作|生图|画|绘制|设计|导出|保存|产出|可下载|实际文件)/i.test(normalizedText);
+  if (parts.has("image") && explicitArtifact) groups.push(new Set(["generate_image"]));
   if (parts.has("slides") && explicitArtifact) {
     groups.push(new Set(["build_presentation_outline", "create_document", "create_pdf", "create_spreadsheet", "create_presentation", "compile_latex"]));
   }
@@ -3486,19 +3653,19 @@ function sessionSignature(request: RunStart): string {
     request.cwd,
     request.agent_dir,
     request.ephemeral_session === true,
+    request.provider_id || "",
     request.provider_kind,
     request.api_surface || "chat_completions",
     request.responses_enabled === true,
     request.base_url,
     request.model_id,
     stableHash(request.model_runtime || {}),
-    request.thinking_level || "medium",
-    request.system_prompt,
-    request.task_mode || "general",
     stableHash(boundedSkillCatalog(request.skill_catalog)),
-    // Exclude per-turn identity and goal text.  A new contract id is minted
-    // for every user message; only a real permission/budget change should
-    // force a new Pi session and discard accumulated context.
+    // Per-turn prompt, task mode, thinking level, request identity, and goal
+    // are applied through requestRef and the lifecycle hooks. Rebuilding for
+    // any of them discards in-memory context and dynamic tool activation.
+    // Only session resources or effective authority changes may replace the
+    // AgentSession.
     taskContractSessionSignature(request),
     mcpServerSessionSignature(request),
     request.disabled_tools || [],
@@ -3540,12 +3707,20 @@ async function createSession(
   let sessionRef: AgentSession | undefined;
   let stateRef: SessionState | undefined;
   const runtime = await ModelRuntime.create({ allowModelNetwork: false, modelsPath: null });
-  runtime.registerProvider("scansci-pi", {
-    name: "ScanSci Pi provider",
+  runtime.registerProvider(SCANSCI_PROJECT_ID, {
+    name: "ScanSci Harness provider",
     baseUrl: request.base_url,
     apiKey: "$SCANSCIPI_PROVIDER_KEY",
     api: providerApi(request.provider_kind, request.api_surface),
     streamSimple: scansciStreamSimple(modelRuntime),
+    ...(String(request.provider_id || "").trim().toLowerCase() === "opencode-go"
+      ? {
+        headers: {
+          "User-Agent": "ScanSci",
+          "x-opencode-session": request.session_id,
+        },
+      }
+      : {}),
     models: [{
       id: request.model_id,
       name: request.model_id,
@@ -3557,8 +3732,8 @@ async function createSession(
       compat: modelCompat(request),
     }],
   });
-  await runtime.setRuntimeApiKey("scansci-pi", apiKey);
-  const model = runtime.getModel("scansci-pi", request.model_id);
+  await runtime.setRuntimeApiKey(SCANSCI_PROJECT_ID, apiKey);
+  const model = runtime.getModel(SCANSCI_PROJECT_ID, request.model_id);
   if (!model) throw new Error(`Pi could not register model ${request.model_id}`);
 
   const loader = new DefaultResourceLoader({
@@ -3699,6 +3874,25 @@ async function createSession(
     request.disabled_tools || [],
     taskContract,
   );
+  const literatureMcpServerIds = new Set(
+    (Array.isArray(request.mcp_servers) ? request.mcp_servers : [])
+      .filter(isLiteratureMcpServer)
+      .map((raw) => String(raw.id || raw.name || "").trim())
+      .filter(Boolean),
+  );
+  const initialLiteratureMcpTools = external.tools
+    .map((tool) => {
+      const name = String(tool.name || "");
+      return { name, policy: external.policies.get(name) };
+    })
+    .filter(({ name, policy }) => (
+      name.startsWith("mcp__")
+      && !name.endsWith("__search")
+      && Boolean(policy)
+      && literatureMcpServerIds.has((policy as McpToolPolicy).serverId)
+      && contractAllowsTool(taskContract, name, policy)
+    ))
+    .map(({ name }) => name);
   const controlNames = new Set(["ask_user", "submit_plan"]);
   const domainDefinitions = leasedTools.filter((tool) => !controlNames.has(String(tool.name)));
   const catalog = buildToolCatalog(
@@ -3763,7 +3957,7 @@ async function createSession(
     registeredToolNames,
     taskContract.initialTools,
     taskContract.requiredToolGroups,
-    ["search_tools", "ask_user", "submit_plan"],
+    ["search_tools", "ask_user", "submit_plan", ...initialLiteratureMcpTools],
   );
   const prefixShape = buildPrefixShape(request, registeredToolNames, activeToolNames);
   const resumeFile = String(request.session_file || "");
@@ -3804,19 +3998,19 @@ async function createSession(
     resourceLoader: loader,
     sessionManager,
     settingsManager: SettingsManager.inMemory({
-      httpIdleTimeoutMs: 120000,
+      httpIdleTimeoutMs: 240000,
       compaction: {
         enabled: true,
         reserveTokens: modelRuntime.compaction_reserve_tokens,
         keepRecentTokens: modelRuntime.keep_recent_tokens,
       },
       retry: {
-        // ScanSci owns cross-strategy recovery. Disabling nested SDK/provider
-        // retries prevents one logical turn from multiplying paid requests.
-        enabled: false,
-        maxRetries: 0,
-        baseDelayMs: 1000,
-        provider: { timeoutMs: 120000, maxRetries: 0, maxRetryDelayMs: 5000 },
+        // Pi retries only the failed model response, retaining completed tools.
+        // Provider and managed-adapter retries stay off to keep one owner.
+        enabled: true,
+        maxRetries: 2,
+        baseDelayMs: 15000,
+        provider: { timeoutMs: 240000, maxRetries: 0, maxRetryDelayMs: 5000 },
       },
     }),
   });
@@ -4532,6 +4726,7 @@ async function loadSession(message: JsonRecord): Promise<void> {
       cwd: String(message.cwd || process.cwd()),
       agent_dir: String(message.agent_dir || process.cwd()),
       provider_kind: String(message.provider_kind || "openai-compatible"),
+      provider_id: String(message.provider_id || ""),
       base_url: String(message.base_url || ""),
       model_id: String(message.model_id || ""),
       api_surface: String(message.api_surface || "chat_completions"),
@@ -4802,7 +4997,7 @@ input.on("line", (line) => {
       type: "pong",
       ...commandCorrelation(message),
       runtime: "pi",
-      version: "0.80.10",
+      version: "0.84.3",
       protocol: PI_PROTOCOL_VERSION,
       capabilities: [...PI_PROTOCOL_FEATURES],
       negotiated_features: required.filter((feature) => supported.has(feature)),

@@ -64,6 +64,7 @@ export interface RunStartMessage extends ProtocolRecord {
   cwd: string;
   agent_dir: string;
   provider_kind: string;
+  provider_id?: string;
   base_url: string;
   model_id: string;
   api_surface?: string;

@@ -9,7 +9,9 @@ param(
     [string]$OutputDir = "",
     [string]$Channel = "stable",
     [string]$LocalRuntimeManifest = "",
-    [string]$BlockmapUrl = ""
+    [string]$BlockmapUrl = "",
+    [string]$ManifestPrivateKey = "",
+    [string]$ManifestKeyId = "scansci-release-v1"
 )
 
 $projectRoot = (Resolve-Path (Join-Path $PSScriptRoot "..")).Path
@@ -25,7 +27,18 @@ New-Item -ItemType Directory -Force -Path $releaseRoot | Out-Null
 $archive = Join-Path $releaseRoot "ScanSci-$Version-windows-x64.zip"
 $manifest = Join-Path $releaseRoot "stable.json"
 Compress-Archive -Path (Join-Path $source "*") -DestinationPath $archive -CompressionLevel Optimal -Force
-$sha256 = (Get-FileHash -LiteralPath $archive -Algorithm SHA256).Hash.ToLowerInvariant()
+function Get-Sha256Hex([string]$Path) {
+    $stream = [System.IO.File]::OpenRead($Path)
+    $hasher = [System.Security.Cryptography.SHA256]::Create()
+    try {
+        return ([System.BitConverter]::ToString($hasher.ComputeHash($stream))).Replace("-", "").ToLowerInvariant()
+    }
+    finally {
+        $hasher.Dispose()
+        $stream.Dispose()
+    }
+}
+$sha256 = Get-Sha256Hex $archive
 $blockSize = 64 * 1024
 $blockmapPath = $archive + ".blockmap"
 $blockHashes = [System.Collections.Generic.List[string]]::new()
@@ -53,13 +66,14 @@ $blockmapPayload = [ordered]@{
     blocks = @($blockHashes.ToArray())
 }
 $blockmapPayload | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath $blockmapPath -Encoding utf8
-$blockmapSha256 = (Get-FileHash -LiteralPath $blockmapPath -Algorithm SHA256).Hash.ToLowerInvariant()
+$blockmapSha256 = Get-Sha256Hex $blockmapPath
 $blockmapSize = [long](Get-Item -LiteralPath $blockmapPath).Length
 $resolvedBlockmapUrl = [string]$BlockmapUrl
 if (-not $resolvedBlockmapUrl) {
     $resolvedBlockmapUrl = $PackageUrl + ".blockmap"
 }
 $payload = [ordered]@{
+    schema_version = 1
     version = $Version
     title = "ScanSci $Version"
     channel = $Channel
@@ -121,6 +135,18 @@ if ($LocalRuntimeManifest) {
     }
 }
 $payload | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $manifest -Encoding utf8
+if ($ManifestPrivateKey) {
+    $privateKeyPath = [System.IO.Path]::GetFullPath($ManifestPrivateKey)
+    if (-not (Test-Path -LiteralPath $privateKeyPath -PathType Leaf)) {
+        throw "Manifest private key was not found: $privateKeyPath"
+    }
+    & python (Join-Path $PSScriptRoot "sign_release_manifest.py") $manifest `
+        --private-key $privateKeyPath `
+        --key-id $ManifestKeyId
+    if ($LASTEXITCODE -ne 0) {
+        throw "Failed to sign the release manifest."
+    }
+}
 Write-Output $archive
 Write-Output $blockmapPath
 Write-Output $manifest

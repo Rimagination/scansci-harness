@@ -839,7 +839,7 @@ def run_verification(
 
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Verify the ScanSci Pi capability matrix.")
+    parser = argparse.ArgumentParser(description="Verify the ScanSci Harness Pi capability matrix.")
     parser.add_argument("--mode", choices=("deterministic", "real"), default="deterministic")
     parser.add_argument("--output", required=True)
     parser.add_argument("--workspace", default=str(PROJECT_ROOT / ".scansci-diagnostics" / "pi-capability" / "workspace.sqlite"))

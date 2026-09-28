@@ -1,0 +1,4 @@
+interface:
+  display_name: "Evidence Retrieval"
+  short_description: "Find and cite bounded local evidence"
+  default_prompt: "Use $evidence-retrieval to answer this question with traceable local evidence."

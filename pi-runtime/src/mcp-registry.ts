@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 
-export type McpEffect = "read" | "write" | "destructive" | "unknown";
+export type McpEffect = "read" | "reversible" | "write" | "destructive" | "unknown";
 export type McpFreshness = "volatile" | "turn" | "run";
 
 type JsonRecord = Record<string, unknown>;
@@ -65,7 +65,8 @@ export function safeMcpLocalToolName(serverAlias: unknown, remoteName: unknown):
 export function normalizeMcpEffect(value: unknown): McpEffect {
   const normalized = String(value || "").trim().toLowerCase();
   if (["read", "read_only", "readonly"].includes(normalized)) return "read";
-  if (["write", "reversible", "mutation"].includes(normalized)) return "write";
+  if (normalized === "reversible") return "reversible";
+  if (["write", "mutation"].includes(normalized)) return "write";
   if (["destructive", "delete", "high"].includes(normalized)) return "destructive";
   return "unknown";
 }
@@ -326,6 +327,10 @@ export function authorizeMcpPolicy(
   if (!new Set(authority.allowedServerIds).has(policy.serverId)) return false;
   const ceiling = String(authority.riskLevel || "").toLowerCase();
   if (policy.effect === "read") return ["read_only", "reversible", "high", "approval_required"].includes(ceiling);
+  if (policy.effect === "reversible") {
+    if (!["reversible", "high", "approval_required"].includes(ceiling)) return false;
+    return !authority.requiresPlan || authority.planApproved;
+  }
   if (!["high", "approval_required"].includes(ceiling) || !authority.allowExternalWrite) return false;
   return authority.planApproved && (!authority.requiresPlan || authority.planApproved);
 }
@@ -341,9 +346,30 @@ export async function invokeAuthorizedMcp<T>(
   return invoke();
 }
 
+function mcpErrorDetail(value: unknown): string {
+  if (!value || typeof value !== "object") return "";
+  const record = value as JsonRecord;
+  const texts = Array.isArray(record.content)
+    ? record.content
+      .filter((item) => item && typeof item === "object" && (item as JsonRecord).type === "text")
+      .map((item) => String((item as JsonRecord).text || "").trim())
+      .filter(Boolean)
+    : [];
+  const structured = record.structuredContent && typeof record.structuredContent === "object"
+    ? record.structuredContent as JsonRecord
+    : {};
+  const detail = texts.join(" ") || String(structured.error || structured.message || "").trim();
+  return detail
+    .replace(/[\u0000-\u001f\u007f]+/g, " ")
+    .replace(/\s+/g, " ")
+    .trim()
+    .slice(0, 1000);
+}
+
 export function ensureMcpCallResult<T>(value: T): T {
   if (value && typeof value === "object" && (value as { isError?: unknown }).isError === true) {
-    throw new Error("MCP tool returned an error result");
+    const detail = mcpErrorDetail(value);
+    throw new Error(`MCP tool returned an error result${detail ? `: ${detail}` : ""}`);
   }
   return value;
 }

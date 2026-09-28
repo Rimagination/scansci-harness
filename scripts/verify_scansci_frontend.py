@@ -88,10 +88,29 @@ def _assert_follow_up_sequence(
     return questions[1:]
 
 
+def _open_new_task(page: Any) -> None:
+    sidebar_button = page.locator('.sidebar-action[data-action="new-task"]')
+    if sidebar_button.is_visible():
+        sidebar_button.click()
+        return
+    page.locator('.titlebar-new-task').click()
+
+
+def _open_history_conversation(page: Any, conversation_id: str) -> None:
+    item = page.locator(
+        f'.task-item[data-action="open-direct-conversation"][data-conversation-id="{conversation_id}"]'
+    )
+    if not item.is_visible():
+        page.locator('[data-action="toggle-sidebar"]').click()
+    item.click()
+
+
 def _fake_chat_stream(_self: ResearchAgentRuntime, payload: dict[str, Any]) -> Iterator[dict[str, Any]]:
     messages = list(payload.get("messages", []) or [])
     question = str(messages[-1].get("content", "")) if messages else ""
     reply = f"frontend submit regression passed: {question}"
+    if question.startswith("long: "):
+        reply += " This visible paragraph keeps the conversation tall enough to verify manual scrolling." * 32
     track_parallel = question.startswith("hold: explain parallel conversation ")
     if track_parallel:
         _parallel_probe_enter()
@@ -100,8 +119,9 @@ def _fake_chat_stream(_self: ResearchAgentRuntime, payload: dict[str, Any]) -> I
         yield {"type": "RUN_STARTED", "run_id": f"frontend-submit-{uuid4().hex}"}
         if question.startswith("hold: "):
             chunk_size = max(1, len(reply) // 6)
+            chunk_delay = 0.5 if "deterministic follow-up queues" in question else 0.25
             for offset in range(0, len(reply), chunk_size):
-                time.sleep(0.25)
+                time.sleep(chunk_delay)
                 yield {"type": "TEXT_MESSAGE_CONTENT", "content": reply[offset : offset + chunk_size]}
         else:
             yield {"type": "TEXT_MESSAGE_CONTENT", "content": reply}
@@ -134,6 +154,28 @@ def _fake_transcribe_audio(_self: ResearchAgentRuntime, _payload: dict[str, Any]
     }
 
 
+def _launch_chromium(chromium: Any) -> Any:
+    """Prefer Playwright's pinned browser, then use an installed stable channel."""
+
+    try:
+        return chromium.launch(headless=True)
+    except Exception as error:  # Playwright's Error type is imported lazily in verify().
+        if "Executable doesn't exist" not in str(error):
+            raise
+        managed_error = error
+    for channel in ("chrome", "msedge"):
+        try:
+            return chromium.launch(headless=True, channel=channel)
+        except Exception as error:
+            marker = f"distribution '{channel}' is not found"
+            if marker not in str(error).lower():
+                raise
+            managed_error = error
+    raise RuntimeError(
+        "Playwright browser is unavailable; install Chromium or provide Chrome/Microsoft Edge."
+    ) from managed_error
+
+
 def verify() -> dict[str, Any]:
     try:
         from playwright.sync_api import sync_playwright
@@ -157,7 +199,7 @@ def verify() -> dict[str, Any]:
             thread = threading.Thread(target=server.serve_forever, daemon=True, name="scansci-frontend-release")
             thread.start()
             with sync_playwright() as playwright:
-                browser = playwright.chromium.launch(headless=True)
+                browser = _launch_chromium(playwright.chromium)
                 page = browser.new_page(viewport={"width": 1440, "height": 900})
                 page.add_init_script(
                     """
@@ -291,15 +333,116 @@ def verify() -> dict[str, Any]:
                 page.locator(".direct-live-queue").get_by_text(queue_child, exact=True).wait_for(timeout=3_000)
                 page.locator("#chatQuestionInput").fill(queue_child_two)
                 page.locator("#chatAskForm button[type=submit]").click()
-                page.locator(".direct-live-queue").get_by_text(queue_child_two, exact=True).wait_for(timeout=3_000)
-                page.get_by_text(f"frontend submit regression passed: {queue_child}", exact=True).wait_for(timeout=10_000)
+                queue = page.locator(".direct-live-queue")
+                queue.get_by_text(queue_child_two, exact=True).wait_for(timeout=3_000)
+                queue_style = queue.evaluate(
+                    """queue => {
+                      const row = queue.querySelector('.direct-live-queue-item');
+                      const controls = queue.closest('.direct-live-controls');
+                      return {
+                        controlsBackground: getComputedStyle(controls).backgroundColor,
+                        rowBackground: getComputedStyle(row).backgroundColor,
+                        rowHeight: row.getBoundingClientRect().height,
+                        nestedWhite: [...row.querySelectorAll('*')]
+                          .some(node => getComputedStyle(node).backgroundColor === 'rgb(255, 255, 255)'),
+                      };
+                    }"""
+                )
+                if queue_style["controlsBackground"] == "rgb(255, 255, 255)":
+                    raise AssertionError(f"Follow-up queue did not use a neutral gray surface: {queue_style}")
+                if queue_style["rowBackground"] not in {"rgba(0, 0, 0, 0)", "transparent"} or queue_style["nestedWhite"]:
+                    raise AssertionError(f"Follow-up queue still contains a nested white card: {queue_style}")
+                if float(queue_style["rowHeight"]) > 38:
+                    raise AssertionError(f"Follow-up queue row is taller than 38px: {queue_style}")
+
+                queue_rows = page.locator(".direct-live-queue-item")
+                queue_rows.nth(1).locator("[data-direct-queue-drag]").drag_to(
+                    queue_rows.nth(0),
+                    target_position={"x": 8, "y": 2},
+                )
+                dragged_order = [text.strip() for text in queue.locator(".direct-live-queue-text").all_text_contents()]
+                if dragged_order != [queue_child_two, queue_child]:
+                    raise AssertionError(f"Follow-up queue drag did not persist the new order: {dragged_order}")
+
                 page.get_by_text(f"frontend submit regression passed: {queue_child_two}", exact=True).wait_for(
                     timeout=10_000
                 )
+                page.get_by_text(f"frontend submit regression passed: {queue_child}", exact=True).wait_for(timeout=10_000)
                 follow_up_order = _assert_follow_up_sequence(
                     _stream_events(),
-                    [queue_parent, queue_child, queue_child_two],
+                    [queue_parent, queue_child_two, queue_child],
                 )
+
+                title_before_edit = page.locator("#conversationTitle").inner_text().strip()
+                last_user_turn = page.locator(".conversation-message.user-turn").last
+                action_order = last_user_turn.locator("[data-action]").evaluate_all(
+                    "nodes => nodes.map(node => node.dataset.action)"
+                )
+                if action_order != ["copy-conversation-message", "edit-last-conversation-message"]:
+                    raise AssertionError(f"Last-message edit button is not immediately after copy: {action_order}")
+                edited_question = "edited: summarize the reordered follow-up"
+                last_user_turn.locator('[data-action="edit-last-conversation-message"]').click()
+                edit_input = page.locator("[data-last-message-edit-input]")
+                edit_input.wait_for(state="visible", timeout=3_000)
+                edit_input.fill(edited_question)
+                page.locator('[data-action="save-last-message-edit"]').click()
+                page.get_by_text(f"frontend submit regression passed: {edited_question}", exact=True).wait_for(
+                    timeout=10_000
+                )
+                user_turns = [text.strip() for text in page.locator(".user-turn-bubble > p").all_text_contents()]
+                if user_turns[-1:] != [edited_question] or queue_child in user_turns:
+                    raise AssertionError(f"Editing the last turn did not replace its superseded branch: {user_turns}")
+                if page.locator("#conversationTitle").inner_text().strip() != title_before_edit:
+                    raise AssertionError("Editing the last turn changed the first-turn conversation title")
+
+                active_conversation = page.locator(
+                    '.task-item.is-active[data-action="open-direct-conversation"]'
+                )
+                conversation_id = active_conversation.get_attribute("data-conversation-id")
+                if not conversation_id:
+                    raise AssertionError("Completed direct conversation did not receive a persistent id")
+                _open_new_task(page)
+                _open_history_conversation(page, conversation_id)
+                page.get_by_text(edited_question, exact=True).wait_for(timeout=5_000)
+                page.reload(wait_until="networkidle")
+                page.get_by_text(edited_question, exact=True).wait_for(timeout=8_000)
+                if page.locator("#conversationTitle").inner_text().strip() != title_before_edit:
+                    raise AssertionError("Reloading the edited conversation changed its stable title")
+
+                scroll_question = "long: verify the independent jump-to-latest control"
+                page.locator("#chatQuestionInput").fill(scroll_question)
+                page.locator("#chatAskForm button[type=submit]").click()
+                page.locator(".assistant-turn .answer-sentence").filter(
+                    has_text=f"frontend submit regression passed: {scroll_question}"
+                ).wait_for(timeout=10_000)
+                answer_area = page.locator("#answerArea")
+                answer_area.evaluate("area => { area.scrollTop = 0; area.dispatchEvent(new Event('scroll')); }")
+                jump_button = page.locator("#conversationJumpLatest")
+                jump_button.wait_for(state="visible", timeout=3_000)
+                jump_layout = jump_button.evaluate(
+                    """button => {
+                      const form = document.querySelector('#chatAskForm');
+                      const buttonBox = button.getBoundingClientRect();
+                      const formBox = form.getBoundingClientRect();
+                      return {
+                        outsideForm: !button.closest('form'),
+                        anchoredAboveComposer: buttonBox.top < formBox.top
+                          && buttonBox.top + buttonBox.height / 2 <= formBox.top + 2,
+                      };
+                    }"""
+                )
+                if not jump_layout["outsideForm"] or not jump_layout["anchoredAboveComposer"]:
+                    raise AssertionError(f"Jump-to-latest control is still embedded in the composer: {jump_layout}")
+                jump_button.click()
+                for _ in range(20):
+                    at_bottom = answer_area.evaluate(
+                        "area => area.scrollHeight - area.scrollTop - area.clientHeight < 16"
+                    )
+                    if at_bottom:
+                        break
+                    page.wait_for_timeout(100)
+                else:
+                    raise AssertionError("Jump-to-latest control did not reach the conversation bottom")
 
                 parallel_a = "hold: explain parallel conversation A"
                 parallel_b = "hold: explain parallel conversation B"
@@ -309,7 +452,7 @@ def verify() -> dict[str, Any]:
                 page.locator(
                     '#chatAskForm button[type=submit][data-composer-state="running"]'
                 ).wait_for(state="visible", timeout=8_000)
-                page.locator('.sidebar-action[data-action="new-task"]').click()
+                _open_new_task(page)
                 page.locator("#homeQuestionInput").fill(parallel_b)
                 page.locator("#homeAskForm button[type=submit]").click()
                 page.locator(
@@ -332,6 +475,12 @@ def verify() -> dict[str, Any]:
                     "enter_submit": True,
                     "follow_up_queue": True,
                     "follow_up_order": follow_up_order,
+                    "follow_up_drag": dragged_order,
+                    "queue_style": queue_style,
+                    "last_turn_edit": True,
+                    "conversation_persistence": True,
+                    "stable_title": title_before_edit,
+                    "independent_jump_to_latest": True,
                     "parallel_conversations": True,
                     "parallel_max_active": parallel_max_active,
                     "voice_to_text": True,

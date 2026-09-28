@@ -29,6 +29,17 @@ import xml.etree.ElementTree as ET
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+SOURCE_ROOT = PROJECT_ROOT / "src"
+for import_root in (PROJECT_ROOT, SOURCE_ROOT):
+    if str(import_root) not in sys.path:
+        sys.path.insert(0, str(import_root))
+
+from cryptography.hazmat.primitives import serialization
+
+from scansci_html.manifest_trust import decode_public_key, verify_manifest_signature
+from scansci_html.release_transport import open_release_url
+from scripts.sign_release_manifest import load_private_key
+
 CORE_RUNTIME_FORBIDDEN_SEGMENTS = frozenset({
     "torch",
     "transformers",
@@ -41,6 +52,7 @@ CORE_RUNTIME_FORBIDDEN_SEGMENTS = frozenset({
     "node.exe",
     "tectonic.exe",
 })
+MAX_RUNTIME_COMPONENT_BYTES = 16 * 1024**3
 FROZEN_V031_SCOPE_SHA256 = "a253baca5ae32f0edaba4baf5b2a77e1023d84db714014b5032768c8fb16acc4"
 
 
@@ -883,7 +895,11 @@ def validate_release_inputs(contract: dict[str, Any], scope: dict[str, Any]) -> 
     ):
         missing_component_channels = [
             key
-            for key in ("node_component_manifest_url", "tectonic_component_manifest_url")
+            for key in (
+                "runtime_manifest_url",
+                "node_component_manifest_url",
+                "tectonic_component_manifest_url",
+            )
             if not str(package.get(key, "")).strip()
         ]
         if missing_component_channels:
@@ -903,6 +919,12 @@ def validate_release_inputs(contract: dict[str, Any], scope: dict[str, Any]) -> 
             raise GateFailure("package update_package_url must use HTTPS")
         if "{version}" not in update_package_url:
             raise GateFailure("package update_package_url must contain {version} for immutable release assets")
+    release_public_key = str(package.get("release_public_key", "")).strip()
+    if release_public_key:
+        try:
+            decode_public_key(release_public_key)
+        except ValueError as error:
+            raise GateFailure(f"package release_public_key is invalid: {error}") from error
 
 
 def _template_command(parts: list[str], variables: dict[str, str]) -> list[str]:
@@ -1620,9 +1642,9 @@ class ReleaseGate:
 
     @property
     def signature_required(self) -> bool:
-        """Keep the formal signing rule separate from an explicitly unsigned beta."""
+        """Require signatures for every formal release regardless of mutable config."""
 
-        return self.profile == "release" and bool(self.contract["package"].get("signature_required", False))
+        return self.profile == "release"
 
     @property
     def requires_runtime_component_channels(self) -> bool:
@@ -1638,11 +1660,16 @@ class ReleaseGate:
     @staticmethod
     def _runtime_component_record(manifest: dict[str, Any], component_id: str) -> dict[str, Any]:
         if str(manifest.get("id", "")).strip() == component_id:
-            return manifest
-        components = manifest.get("components")
-        if isinstance(components, dict) and isinstance(components.get(component_id), dict):
-            return dict(components[component_id])
-        raise GateFailure(f"Runtime component manifest does not contain {component_id!r}")
+            source = manifest
+        else:
+            components = manifest.get("components")
+            if not isinstance(components, dict) or not isinstance(components.get(component_id), dict):
+                raise GateFailure(f"Runtime component manifest does not contain {component_id!r}")
+            source = dict(components[component_id])
+        return {
+            "version": source.get("version"),
+            "windows": source.get("windows"),
+        }
 
     @staticmethod
     def _validate_component_asset(component_id: str, record: dict[str, Any]) -> list[str]:
@@ -1655,7 +1682,11 @@ class ReleaseGate:
             overall_size = int(windows.get("size", 0))
         except (TypeError, ValueError) as error:
             raise GateFailure(f"Runtime component {component_id!r} package has an invalid size") from error
-        if not re.fullmatch(r"[A-Fa-f0-9]{64}", overall_checksum) or overall_size <= 0:
+        if (
+            not re.fullmatch(r"[A-Fa-f0-9]{64}", overall_checksum)
+            or overall_size <= 0
+            or overall_size > MAX_RUNTIME_COMPONENT_BYTES
+        ):
             raise GateFailure(f"Runtime component {component_id!r} package is missing SHA256 or size")
 
         def validate_download(download: dict[str, Any], label: str) -> str:
@@ -1676,7 +1707,13 @@ class ReleaseGate:
         if isinstance(parts, list) and parts:
             if not all(isinstance(part, dict) for part in parts):
                 raise GateFailure(f"Runtime component {component_id!r} has an invalid multipart package")
-            return [validate_download(dict(part), f"part {index}") for index, part in enumerate(parts, start=1)]
+            urls = [validate_download(dict(part), f"part {index}") for index, part in enumerate(parts, start=1)]
+            total_size = sum(int(dict(part).get("size", 0) or 0) for part in parts)
+            if total_size != overall_size or total_size > MAX_RUNTIME_COMPONENT_BYTES:
+                raise GateFailure(
+                    f"Runtime component {component_id!r} part sizes do not match its package size"
+                )
+            return urls
         return [validate_download(windows, "package")]
 
     def verify_runtime_component_channels(self) -> dict[str, Any]:
@@ -1686,12 +1723,13 @@ class ReleaseGate:
         manifests = {
             "node": str(package.get("node_component_manifest_url", "")).strip(),
             "tectonic": str(package.get("tectonic_component_manifest_url", "")).strip(),
+            "local-transformers": str(package.get("runtime_manifest_url", "")).strip(),
         }
         verified: dict[str, Any] = {}
         for component_id, manifest_url in manifests.items():
             try:
                 request = Request(manifest_url, headers={"User-Agent": "ScanSci-release-gate/1"})
-                with urlopen(request, timeout=20) as response:
+                with open_release_url(request, timeout=20, opener=urlopen) as response:
                     payload = json.loads(response.read().decode("utf-8-sig"))
             except Exception as error:
                 raise GateFailure(
@@ -1699,6 +1737,19 @@ class ReleaseGate:
                 ) from error
             if not isinstance(payload, dict):
                 raise GateFailure(f"Runtime component manifest for {component_id} must be a JSON object")
+            if self.profile == "release":
+                if payload.get("schema_version") != 1:
+                    raise GateFailure(f"Runtime component manifest for {component_id} must use schema_version 1")
+                try:
+                    verify_manifest_signature(
+                        payload,
+                        str(package.get("release_public_key", "")).strip(),
+                        required=True,
+                    )
+                except ValueError as error:
+                    raise GateFailure(
+                        f"Runtime component manifest signature is invalid for {component_id}: {error}"
+                    ) from error
             record = self._runtime_component_record(payload, component_id)
             asset_urls = self._validate_component_asset(component_id, record)
             # Probe each immutable asset without downloading it. A valid JSON
@@ -1710,7 +1761,7 @@ class ReleaseGate:
                         method="HEAD",
                         headers={"User-Agent": "ScanSci-release-gate/1"},
                     )
-                    with urlopen(request, timeout=20) as response:
+                    with open_release_url(request, timeout=20, opener=urlopen) as response:
                         status = int(response.getcode() or 200)
                     if status >= 400:
                         raise GateFailure(f"HTTP {status}")
@@ -1723,6 +1774,10 @@ class ReleaseGate:
                 "version": str(record.get("version", "")).strip(),
                 "asset_count": len(asset_urls),
             }
+            if component_id == "local-transformers":
+                snapshot = self.diagnostics_dir / "runtime-component-local-transformers.json"
+                _write_json(snapshot, {"id": component_id, **record})
+                verified[component_id]["snapshot"] = str(snapshot)
         return {"components": verified}
 
     def build_desktop(self) -> None:
@@ -1759,6 +1814,12 @@ class ReleaseGate:
             self.source_sha256,
             "-Clean",
         ]
+        update_manifest_url = str(package.get("update_manifest_url", "")).strip()
+        if update_manifest_url:
+            command.extend(["-UpdateManifestUrl", update_manifest_url])
+        release_public_key = str(package.get("release_public_key", "")).strip()
+        if release_public_key:
+            command.extend(["-ReleasePublicKey", release_public_key])
         runtime_manifest_url = str(package.get("runtime_manifest_url", "")).strip()
         if runtime_manifest_url:
             command.extend(["-RuntimeManifestUrl", runtime_manifest_url])
@@ -1781,6 +1842,39 @@ class ReleaseGate:
             command=command,
             echo_output=False,
         )
+
+    def sign_desktop_executable(self) -> dict[str, Any]:
+        """Sign the formal executable before any package identity is computed."""
+
+        if not self.signature_required:
+            return {"signature_required": False}
+        powershell = shutil.which("powershell") or shutil.which("pwsh")
+        if not powershell:
+            raise GateFailure("PowerShell is required to sign the Windows desktop executable")
+        step = self.command_step(
+            step_id="sign-desktop-executable",
+            title="正式 Windows 主程序预签名",
+            command=[
+                powershell,
+                "-NoProfile",
+                "-ExecutionPolicy",
+                "Bypass",
+                "-File",
+                str(PROJECT_ROOT / "scripts" / "sign_windows_executable.ps1"),
+                "-Artifact",
+                str(self.executable),
+            ],
+            required_result=self.executable,
+            echo_output=False,
+        )
+        details = {
+            "signature_required": True,
+            "source_executable_authenticode_status": "Valid",
+            "signed_executable_sha256": str(step.get("result_sha256", "")),
+        }
+        self.report["artifacts"].update(details)
+        self._persist()
+        return details
 
     def verify_package(self) -> dict[str, Any]:
         if not self.executable.is_file() or self.executable.stat().st_size <= 0:
@@ -1805,6 +1899,12 @@ class ReleaseGate:
         expected_runtime_manifest = str(self.contract["package"].get("runtime_manifest_url", "")).strip()
         if expected_runtime_manifest and str(build_info.get("runtime_manifest_url", "")).strip() != expected_runtime_manifest:
             raise GateFailure("Packaged build-info.json does not match the runtime component manifest")
+        expected_update_manifest = str(self.contract["package"].get("update_manifest_url", "")).strip()
+        if expected_update_manifest and str(build_info.get("update_manifest_url", "")).strip() != expected_update_manifest:
+            raise GateFailure("Packaged build-info.json does not match the update manifest")
+        expected_release_public_key = str(self.contract["package"].get("release_public_key", "")).strip()
+        if str(build_info.get("release_public_key", "")).strip() != expected_release_public_key:
+            raise GateFailure("Packaged build-info.json does not match the release manifest public key")
         for key in ("node_component_manifest_url", "tectonic_component_manifest_url"):
             expected_component_manifest = str(self.contract["package"].get(key, "")).strip()
             if expected_component_manifest and str(build_info.get(key, "")).strip() != expected_component_manifest:
@@ -1846,6 +1946,10 @@ class ReleaseGate:
         if forbidden:
             raise GateFailure("Core package contains optional runtime resources: " + ", ".join(forbidden))
         executable_sha256 = _sha256(self.executable)
+        if self.signature_required:
+            signed_sha256 = str(self.report.get("artifacts", {}).get("signed_executable_sha256", ""))
+            if signed_sha256.casefold() != executable_sha256.casefold():
+                raise GateFailure("Packaged executable changed after Authenticode signing")
         details = {
             "package_staging_dir": str(self.package_staging_root),
             "executable_path": str(self.executable),
@@ -1888,6 +1992,21 @@ class ReleaseGate:
             "-Channel",
             "stable",
         ]
+        runtime_snapshot = self.diagnostics_dir / "runtime-component-local-transformers.json"
+        if self.requires_runtime_component_channels:
+            if not runtime_snapshot.is_file():
+                raise GateFailure("Verified local-transformers manifest snapshot is missing")
+            command.extend(["-LocalRuntimeManifest", str(runtime_snapshot)])
+        manifest_private_key = os.environ.get("SCANSCI_RELEASE_MANIFEST_PRIVATE_KEY_FILE", "").strip()
+        if manifest_private_key:
+            command.extend(
+                [
+                    "-ManifestPrivateKey",
+                    str(Path(manifest_private_key).expanduser().resolve()),
+                    "-ManifestKeyId",
+                    str(self.contract["package"].get("release_key_id", "scansci-release-v1")),
+                ]
+            )
         self.command_step(
             step_id="build-update-bundle",
             title="Windows 完整更新包、blockmap 与 stable.json 构建",
@@ -1903,6 +2022,14 @@ class ReleaseGate:
             raise GateFailure(f"Update manifest is missing: {self.update_manifest}")
         manifest = _read_json(self.update_manifest)
         version = str(self.contract["version"])
+        if manifest.get("schema_version") != 1:
+            raise GateFailure("Update manifest must use schema_version 1")
+        release_public_key = str(self.contract["package"].get("release_public_key", "")).strip()
+        if release_public_key:
+            try:
+                verify_manifest_signature(manifest, release_public_key, required=True)
+            except ValueError as error:
+                raise GateFailure(f"Update manifest signature is invalid: {error}") from error
         if str(manifest.get("version", "")) != version:
             raise GateFailure("Update manifest does not match the release version")
         if str(manifest.get("channel", "")).casefold() != "stable":
@@ -1931,6 +2058,20 @@ class ReleaseGate:
             raise GateFailure("Update manifest blockmap SHA256 does not match the published blockmap")
         if int(blockmap_info.get("size", 0) or 0) != blockmap_path.stat().st_size:
             raise GateFailure("Update manifest blockmap size does not match the published blockmap")
+
+        runtime_component_version = ""
+        if self.requires_runtime_component_channels:
+            runtime_snapshot = self.diagnostics_dir / "runtime-component-local-transformers.json"
+            if not runtime_snapshot.is_file():
+                raise GateFailure("Verified local-transformers manifest snapshot is missing")
+            expected_runtime = self._runtime_component_record(
+                _read_json(runtime_snapshot),
+                "local-transformers",
+            )
+            actual_runtime = self._runtime_component_record(manifest, "local-transformers")
+            if actual_runtime != expected_runtime:
+                raise GateFailure("Update manifest local-transformers component differs from the verified channel")
+            runtime_component_version = str(actual_runtime.get("version", "")).strip()
 
         blockmap = _read_json(blockmap_path)
         block_size = int(blockmap.get("block_size", 0) or 0)
@@ -1981,6 +2122,8 @@ class ReleaseGate:
             "update_blockmap_sha256": _sha256(blockmap_path),
             "update_blockmap_bytes": blockmap_path.stat().st_size,
             "update_package_url": self._update_package_url(),
+            "runtime_component_version": runtime_component_version,
+            "manifest_signature_verified": bool(release_public_key),
         }
         self.report["artifacts"].update(details)
         self._persist()
@@ -2047,12 +2190,35 @@ class ReleaseGate:
             raise GateFailure(
                 "Formal release signing is not configured: SignTool.exe from the Windows SDK or Visual Studio is unavailable."
             )
+        public_key = str(self.contract.get("package", {}).get("release_public_key", "")).strip()
+        try:
+            expected_public_key = decode_public_key(public_key)
+        except ValueError as error:
+            raise GateFailure(f"Formal release manifest signing is not configured: {error}") from error
+        private_key_value = os.environ.get("SCANSCI_RELEASE_MANIFEST_PRIVATE_KEY_FILE", "").strip()
+        if not private_key_value:
+            raise GateFailure(
+                "Formal release manifest signing is not configured: set SCANSCI_RELEASE_MANIFEST_PRIVATE_KEY_FILE."
+            )
+        private_key_path = Path(private_key_value).expanduser().resolve()
+        try:
+            private_key = load_private_key(private_key_path)
+        except ValueError as error:
+            raise GateFailure(f"Formal release manifest signing is not configured: {error}") from error
+        actual_public_key = private_key.public_key().public_bytes(
+            encoding=serialization.Encoding.Raw,
+            format=serialization.PublicFormat.Raw,
+        )
+        if actual_public_key != expected_public_key:
+            raise GateFailure("Formal release manifest private key does not match package release_public_key")
         return {
             "signature_required": True,
             "certificate_reference_present": True,
             "timestamp_endpoint_present": True,
             "sign_tool_available": True,
             "private_key_validation": "deferred_to_build_script",
+            "manifest_private_key_present": True,
+            "manifest_public_key_matches": True,
         }
 
     def verify_installer_manifest(self) -> dict[str, Any]:
@@ -2108,6 +2274,8 @@ class ReleaseGate:
             str(installer),
             "--expected-build-id",
             self.build_id,
+            "--expected-version",
+            str(self.contract["version"]),
             "--output",
             str(output),
         ]
@@ -2424,6 +2592,7 @@ class ReleaseGate:
                 ]
             )
             if self.profile == "release":
+                steps.insert(steps.index("package-integrity"), "sign-desktop-executable")
                 steps[steps.index("build-installer"):steps.index("build-installer")] = [
                     "build-update-bundle",
                     "update-bundle-integrity",
@@ -2466,6 +2635,8 @@ class ReleaseGate:
                 self.run_configured_commands("real_verifications")
             if self.is_packaged_profile:
                 self.build_desktop()
+                if self.profile == "release":
+                    self.sign_desktop_executable()
                 self.internal_step("package-integrity", "包完整性、build_id 与 SHA256", self.verify_package)
                 if self.profile == "release":
                     self.build_update_bundle()

@@ -8,18 +8,22 @@ param(
     [string]$PackageProfile = "core",
     [string]$OutputDir = "",
     [string]$Name = "ScanSci",
-    [string]$Version = "0.4.1",
+    [string]$Version = "0.4.2",
     [string]$BuildId = "",
     # Populated only by scripts/release_gate.py. This binds an auditable
     # release candidate to the exact source fingerprint that passed its gate.
     [string]$ReleaseSourceSha256 = "",
     [string]$CacheKey = "",
+    [string]$UpdateManifestUrl = "https://github.com/Rimagination/scansci-pi/releases/latest/download/stable.json",
     # Keep direct/manual builds aligned with the public release contract. An
     # empty value here makes a core package advertise model downloads without
     # providing the runtime that executes them.
     [string]$RuntimeManifestUrl = "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.0/local-transformers.json",
     [string]$NodeComponentManifestUrl = "https://github.com/Rimagination/scansci-portal/releases/download/runtime-components-v1/node.json",
     [string]$TectonicComponentManifestUrl = "https://github.com/Rimagination/scansci-portal/releases/download/runtime-components-v1/tectonic.json",
+    # Base64-encoded raw 32-byte Ed25519 public key. The matching private key
+    # remains offline and is used only while packaging release manifests.
+    [string]$ReleasePublicKey = "",
     # Slim channel: do not embed node.exe or tectonic.exe in the bundle.
     # The Pi sidecar and slide LaTeX engine then resolve them through the
     # managed runtime components (see runtime_components.py) after one
@@ -36,6 +40,10 @@ $runtimeUri = [Uri]$RuntimeManifestUrl
 if (-not $runtimeUri.IsAbsoluteUri -or $runtimeUri.Scheme -ne "https") {
     throw "RuntimeManifestUrl must be an absolute HTTPS URL."
 }
+$updateUri = [Uri]$UpdateManifestUrl
+if (-not $updateUri.IsAbsoluteUri -or $updateUri.Scheme -ne "https") {
+    throw "UpdateManifestUrl must be an absolute HTTPS URL."
+}
 foreach ($componentManifest in @(
     @{ Name = "NodeComponentManifestUrl"; Value = $NodeComponentManifestUrl },
     @{ Name = "TectonicComponentManifestUrl"; Value = $TectonicComponentManifestUrl }
@@ -43,6 +51,16 @@ foreach ($componentManifest in @(
     $componentUri = [Uri]$componentManifest.Value
     if (-not $componentUri.IsAbsoluteUri -or $componentUri.Scheme -ne "https") {
         throw "$($componentManifest.Name) must be an absolute HTTPS URL."
+    }
+}
+if ($ReleasePublicKey) {
+    try {
+        $releasePublicKeyBytes = [Convert]::FromBase64String($ReleasePublicKey)
+    } catch {
+        throw "ReleasePublicKey must be a Base64-encoded Ed25519 public key."
+    }
+    if ($releasePublicKeyBytes.Length -ne 32) {
+        throw "ReleasePublicKey must decode to exactly 32 bytes."
     }
 }
 $entryPoint = Join-Path $projectRoot "scripts\scansci_desktop_entry.py"
@@ -57,7 +75,7 @@ $iconPath = Join-Path $assetSource "scansci.ico"
 $piBundle = Join-Path $projectRoot "pi-runtime\dist\main.mjs"
 $nodeCommand = Get-Command node.exe -ErrorAction SilentlyContinue
 if ($null -eq $nodeCommand) {
-    throw "Node.js 22 or newer is required to build the ScanSci Pi runtime."
+    throw "Node.js 22 or newer is required to build the ScanSci Harness Pi runtime."
 }
 $nodeExe = $nodeCommand.Source
 
@@ -73,7 +91,7 @@ if ($LASTEXITCODE -ne 0) {
     exit $LASTEXITCODE
 }
 if (-not (Test-Path -LiteralPath $piBundle -PathType Leaf)) {
-    throw "ScanSci Pi sidecar bundle was not generated: $piBundle"
+    throw "ScanSci Harness Pi sidecar bundle was not generated: $piBundle"
 }
 $resolvedBuildId = if ($BuildId) { $BuildId } else { "$(Get-Date -Format 'yyyyMMdd-HHmmss')" }
 if ($resolvedBuildId -notmatch '^[A-Za-z0-9._-]+$') {
@@ -114,7 +132,7 @@ $dependencyFiles = @(
 $dependencyHashes = $dependencyFiles | ForEach-Object {
     if (Test-Path -LiteralPath $_ -PathType Leaf) { (Get-FileHash -Algorithm SHA256 -LiteralPath $_).Hash } else { "missing" }
 }
-$cacheMaterial = "$PackageProfile|$Mode|$Name|$ExcludeRuntimes|$RuntimeManifestUrl|$NodeComponentManifestUrl|$TectonicComponentManifestUrl|$pythonVersion|$pyInstallerVersion|$sourceTreeHash|$($dependencyHashes -join '|')"
+$cacheMaterial = "$PackageProfile|$Mode|$Name|$ExcludeRuntimes|$UpdateManifestUrl|$RuntimeManifestUrl|$NodeComponentManifestUrl|$TectonicComponentManifestUrl|$ReleasePublicKey|$pythonVersion|$pyInstallerVersion|$sourceTreeHash|$($dependencyHashes -join '|')"
 if (-not $CacheKey) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($cacheMaterial)
     $digest = [Security.Cryptography.SHA256]::Create().ComputeHash($bytes)
@@ -145,9 +163,11 @@ $buildInfo = [ordered]@{
     commit = $commit
     package_profile = $PackageProfile
     exclude_runtimes = [bool]$ExcludeRuntimes
+    update_manifest_url = $UpdateManifestUrl
     runtime_manifest_url = $RuntimeManifestUrl
     node_component_manifest_url = $NodeComponentManifestUrl
     tectonic_component_manifest_url = $TectonicComponentManifestUrl
+    release_public_key = $ReleasePublicKey
     cache_key = $CacheKey
     source_tree_sha256 = $sourceTreeHash
     release_source_sha256 = $ReleaseSourceSha256.ToLowerInvariant()

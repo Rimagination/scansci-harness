@@ -1,5 +1,6 @@
 beautifulsoup4>=4.12
 cloakbrowser>=0.3.31
+cryptography>=44,<49
 keyring>=25.0
 litellm>=1.80,<2
 lxml>=5.0

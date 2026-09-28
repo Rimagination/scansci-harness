@@ -14,7 +14,7 @@ ScanSci-Pi 不是对现有 ScanSci 的完整重写，也不是 Pi 终端界面�
 3. 由 Python 主进程持有业务真相；Pi 运行在 Node.js sidecar 中，通过版本化 JSONL 协议通信。
 4. 先完成最小研究闭环和同模型评测，达到切换门槛后才迁移更多工具或考虑替代原项目。
 
-当前实现进度：现有桌面 UI、Pi SDK sidecar、protocol v7 双向工具回调、Python fail-closed dispatcher、模型感知上下文、动态工具、并行 hooks/取消、渐进 Skill、只读科研子代理、延迟 MCP、多模态和完整 session 控制已经落地。所有模型介导文本 Pi-first；托管网关、本地引擎或视觉能力不支持时必须产生显式 degradation/not_run，direct fallback 不计 Pi 成功。v0.4.0 的正式发布仍需 Task10 的完整回归、provider-real、打包/人工验收等相应证据；代码签名仍非本轮自动阻塞项。
+当前实现进度：现有桌面 UI、Pi SDK sidecar、protocol v7 双向工具回调、Python fail-closed dispatcher、模型感知上下文、动态工具、并行 hooks/取消、渐进 Skill、只读科研子代理、延迟 MCP、多模态和完整 session 控制已经落地。需要知识库、Skill、附件、联网、工具或工作流能力的模型介导文本 Pi-first；无能力依赖的 direct_chat 走 Host 精简快速通道。托管网关、本地引擎或视觉能力不支持时必须产生显式 degradation/not_run，direct fallback 不计 Pi 成功。v0.4.0 的正式发布仍需 Task10 的完整回归、provider-real、打包/人工验收等相应证据；代码签名仍非本轮自动阻塞项。
 
 ### v0.4.0 当前契约（取代旧阶段性限制）
 
@@ -200,7 +200,7 @@ sidecar → Python：
 | 工具 | 用途 | 权威执行方 |
 |---|---|---|
 | `get_workspace_summary` | 获取当前项目、来源和证据可用状态 | Python |
-| `search_local_evidence` | 返回句子级证据、稳定 evidence_id 和原文锚点 | Python |
+| `search_local_evidence` | 返回命中句、同一原文块的前后句、稳定 evidence_id 和原文锚点 | Python |
 | `build_verified_answer` | 调用现有确定性问答/引用验证链 | Python |
 | `report_evidence_gap` | 结构化报告证据不足，不生成伪结论 | Python |
 

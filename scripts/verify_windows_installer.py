@@ -107,9 +107,21 @@ def _wait_for_uninstall(install_dir: Path, *, timeout: float = 45.0) -> bool:
     return not install_dir.exists()
 
 
-def verify_installer(*, installer: Path, expected_build_id: str, require_signature: bool = False) -> dict[str, Any]:
+def verify_installer(
+    *,
+    installer: Path,
+    expected_build_id: str,
+    expected_version: str,
+    require_signature: bool = False,
+) -> dict[str, Any]:
     if not installer.is_file():
         raise RuntimeError(f"Installer is missing: {installer}")
+    installer_signature_status = _authenticode_status(installer) if require_signature else "not_required"
+    if require_signature and installer_signature_status.casefold() != "valid":
+        raise RuntimeError(
+            "Installer is not Authenticode-valid and will not be executed; "
+            f"status: {installer_signature_status}"
+        )
 
     with tempfile.TemporaryDirectory(prefix="scansci-installer-verify-", ignore_cleanup_errors=True) as temporary:
         root = Path(temporary)
@@ -166,6 +178,8 @@ def verify_installer(*, installer: Path, expected_build_id: str, require_signatu
             raise RuntimeError("Installed ScanSci diagnostics reported ok=false")
         if str(diagnostics_payload.get("build", {}).get("build_id", "")) != expected_build_id:
             raise RuntimeError("Installed ScanSci reports a different build id")
+        if str(diagnostics_payload.get("build", {}).get("version", "")) != expected_version:
+            raise RuntimeError("Installed ScanSci reports a different release version")
 
         uninstaller = install_dir / "unins000.exe"
         if not uninstaller.is_file():
@@ -200,6 +214,8 @@ def verify_installer(*, installer: Path, expected_build_id: str, require_signatu
             "ok": True,
             "installer": str(installer),
             "expected_build_id": expected_build_id,
+            "expected_version": expected_version,
+            "installer_authenticode_status": installer_signature_status,
             "installed_executable": str(executable),
             "installed_executable_authenticode_status": installed_signature_status,
             "runtime_build_id": diagnostics_payload.get("build", {}).get("build_id"),
@@ -214,6 +230,7 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--installer", required=True)
     parser.add_argument("--expected-build-id", required=True)
+    parser.add_argument("--expected-version", required=True)
     parser.add_argument("--output", required=True)
     parser.add_argument("--require-signature", action="store_true")
     args = parser.parse_args(argv)
@@ -222,6 +239,7 @@ def main(argv: list[str] | None = None) -> int:
         result = verify_installer(
             installer=Path(args.installer).resolve(),
             expected_build_id=args.expected_build_id,
+            expected_version=args.expected_version,
             require_signature=bool(args.require_signature),
         )
     except Exception as error:

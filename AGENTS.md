@@ -14,7 +14,7 @@
 
 ## Pi 与 Host 权责（v0.4.0）
 
-- Pi 是所有模型介导轮次的唯一编排面：模型在当前租约内自主规划、搜索并激活工具、并行只读调用、加载 Skill、委派科研子代理、使用延迟 MCP、多模态输入和会话控制。
+- Pi 是所有需要能力编排的模型轮次的唯一编排面：模型在当前租约内自主规划、搜索并激活工具、并行只读调用、加载 Skill、委派科研子代理、使用延迟 MCP、多模态输入和会话控制。没有知识库、Skill、附件、联网或工具意图的 `direct_chat` 由 Host 走精简直连快速通道；该通道不持有 capability lease，也不计入 Pi capability 成功。
 - Host 是不可转让的权威面：编译 `TaskContract v2`、签发/撤销 capability lease、逐次授权工具与 effect、持久化 Research Run/Artifact、验证证据与引用、执行后处理并发布 UI 事件。Pi、Skill、MCP 和子代理都不能扩大权限。
 - Python/Node 只写 `protocol v7`，并对 required features、当前 request/run、generation、schema 和租约 fail-closed 校验。兼容读取旧契约不得改变当前写入格式或放宽授权。
 - `direct fallback`、OCR/text degradation、Host 确定性事实和 effect 前拒绝必须显式记录；它们可以形成安全交付，但不计作 Pi capability 成功。provider 不支持或未配置时记录 `degraded`/`not_run`，不得伪造通过。

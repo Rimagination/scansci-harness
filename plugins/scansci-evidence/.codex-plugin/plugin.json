@@ -1,0 +1,24 @@
+{
+  "name": "scansci-evidence",
+  "version": "0.1.0",
+  "description": "Evidence-first local retrieval and citation contracts for ScanSci Harness.",
+  "author": {
+    "name": "Rimagination",
+    "url": "https://github.com/Rimagination"
+  },
+  "homepage": "https://github.com/Rimagination/scansci-pi/tree/main/plugins/scansci-evidence",
+  "repository": "https://github.com/Rimagination/scansci-pi",
+  "license": "MIT",
+  "keywords": ["evidence", "retrieval", "citations", "research", "scansci"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "ScanSci Evidence",
+    "shortDescription": "Find and cite bounded local evidence.",
+    "longDescription": "A small, host-owned evidence retrieval contract for grounded research answers. It keeps local retrieval, citation anchors, optional JEV reranking, and insufficiency reporting composable.",
+    "developerName": "Rimagination",
+    "category": "Productivity",
+    "capabilities": ["Evidence retrieval", "Citation grounding", "Optional JEV ranking"],
+    "websiteURL": "https://github.com/Rimagination/scansci-pi",
+    "defaultPrompt": "Use $evidence-retrieval to answer this question with traceable local evidence."
+  }
+}

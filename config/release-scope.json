@@ -1,13 +1,13 @@
 {
   "schema_version": 2,
-  "version": "0.4.1",
-  "p0_objective": "发布 v0.4.1 修复候选：延续 v0.4.0 的 Pi protocol v7 与 TaskContract v2 fail-closed 边界，修复托管模型纯文本工具标记未执行和对话生成状态条干扰用户的问题。",
+  "version": "0.4.2",
+  "p0_objective": "发布 v0.4.2 修复候选：延续 ScanSci Harness 与 Pi protocol v7 的生产边界，完成跨设备运行时下载、持久化更新偏好、更新失败回滚、发布通道校验，并保留直接对话多轮、稳定标题、队列和编辑重做能力。",
   "acceptance": [
     {
       "id": "pi-routing",
       "report_axis": "routing",
       "threshold": 40,
-      "requirement": "至少 40 个中英双语模型介导用例 100% 可达 Pi；Host 确定性事实与效应前拒绝必须单独标记，direct fallback 与静默降级均不计 Pi 成功。"
+      "requirement": "至少 40 个中英双语路由用例完成可复核决策：凡需要知识库、Skill、附件、联网、工具或工作流能力的轮次 100% 可达 Pi；无能力依赖的 direct_chat 进入 Host 精简快速通道。ScanSci Harness 只做 turn/contract/lease 绑定和事件透传，模型规划与工具循环唯一归 Pi；Host 确定性事实、direct_chat 快速通道、direct fallback 与静默降级必须分别标记，后两者不计 Pi 成功。"
     },
     {
       "id": "pi-dynamic-tools",
@@ -25,7 +25,7 @@
       "id": "pi-long-context",
       "report_axis": "long_context",
       "threshold": 20,
-      "requirement": "在至少 100K token、20 轮会话中 20/20 找回哨兵，压缩、恢复和模型窗口均不越界。"
+      "requirement": "在至少 100K token、20 轮会话中 20/20 找回哨兵，压缩、恢复和模型窗口均不越界；Host 与浏览器不得固定截断最近 16 条消息，重启后仍能恢复当前项和后续队列。"
     },
     {
       "id": "pi-skills",
@@ -43,7 +43,7 @@
       "id": "pi-mcp",
       "report_axis": "mcp",
       "threshold": 10,
-      "requirement": "deferred stdio 与 deferred streamable HTTP 均保持启动连接数 0；10/10 搜索→连接→激活→调用通过，未知 effect 和全部未授权写入拒绝；旧 direct 配置只作显式兼容且不计本轴证据。"
+      "requirement": "deferred stdio 与 deferred streamable HTTP 均保持启动连接数 0；10/10 搜索→连接→激活→调用通过，未知 effect 和全部未授权写入拒绝；新 provider 只通过语义 capability manifest 接入且不增加 Harness 分支；旧 direct 配置只作显式兼容且不计本轴证据。"
     },
     {
       "id": "pi-multimodal",

@@ -1,21 +1,24 @@
 {
-  "name": "scansci-desktop",
+  "name": "scansci-harness",
   "private": true,
-  "version": "0.4.1",
-  "description": "Evidence-first ScanSci desktop workbench with a Pi-powered agent runtime.",
+  "version": "0.4.2",
+  "description": "Evidence-first ScanSci Harness desktop workbench with Pi as the agent runtime.",
   "scripts": {
     "build:pi-runtime": "esbuild pi-runtime/src/main.ts --bundle --platform=node --format=esm --target=node22 --banner:js=\"import { createRequire as __scansciCreateRequire } from 'node:module'; const require = __scansciCreateRequire(import.meta.url);\" --outfile=pi-runtime/dist/main.mjs",
     "vendor": "python scripts/vendor_web_assets.py",
     "render:slide-plan": "node scripts/render_slide_plan.mjs"
   },
   "dependencies": {
-    "@earendil-works/pi-ai": "0.80.10",
-    "@earendil-works/pi-coding-agent": "0.80.10",
+    "@earendil-works/pi-ai": "0.84.3",
+    "@earendil-works/pi-coding-agent": "0.84.3",
     "@modelcontextprotocol/sdk": "1.29.0",
     "gpt-tokenizer": "2.9.0",
     "pdfjs-dist": "6.1.200",
     "pptxgenjs": "4.0.1",
     "typebox": "1.1.38"
+  },
+  "overrides": {
+    "@earendil-works/pi-telemetry": "0.84.3"
   },
   "devDependencies": {
     "esbuild": "0.28.1"

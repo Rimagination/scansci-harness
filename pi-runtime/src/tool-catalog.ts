@@ -1,6 +1,9 @@
 export type CatalogRisk = "read_only" | "reversible" | "high";
 export type CatalogExecutionMode = "parallel" | "sequential";
 
+export const DISCOVERY_DECISION_SCHEMA_VERSION = "scansci.discovery-decision.v1";
+export const DEFAULT_DISCOVERY_THRESHOLD = 0.65;
+
 export interface CatalogToolDefinition {
   name: string;
   label: string;
@@ -21,6 +24,8 @@ export interface ToolCatalogEntry {
 
 export interface ToolCatalogMatch extends ToolCatalogEntry {
   score: number;
+  confidence: number;
+  match_basis: string[];
   active: boolean;
 }
 
@@ -76,6 +81,7 @@ const REVERSIBLE_TOOLS = new Set([
   "create_pdf",
   "create_spreadsheet",
   "create_presentation",
+  "generate_image",
   "compile_latex",
   "edit_section",
   "edit_slide",
@@ -146,6 +152,7 @@ const TOOL_GROUPS: Record<string, string> = {
   create_pdf: "artifacts",
   create_spreadsheet: "artifacts",
   create_presentation: "artifacts",
+  generate_image: "artifacts",
   compile_latex: "artifacts",
   edit_section: "artifacts",
   edit_slide: "artifacts",
@@ -167,6 +174,7 @@ const TOOL_ALIASES: Record<string, string[]> = {
   browser_access: ["rendered page", "logged in browser", "浏览器", "动态网页"],
   download_and_index: ["fetch papers", "acquire full text", "下载论文", "建立索引"],
   create_presentation: ["pptx", "slides", "演示文稿", "幻灯片"],
+  generate_image: ["text to image", "image generation", "illustration", "文生图", "生图", "生成图片"],
 };
 
 function normalize(value: unknown): string {
@@ -226,20 +234,46 @@ export function buildToolCatalog(
     .sort((left, right) => left.name.localeCompare(right.name));
 }
 
-function matchScore(entry: ToolCatalogEntry, query: string): number {
+function matchEvidence(entry: ToolCatalogEntry, query: string): { score: number; basis: string[] } {
   const needle = normalize(query);
-  if (!needle) return 1;
+  if (!needle) return { score: 1, basis: ["catalog"] };
   const fields = tokensFor(entry);
-  if (normalize(entry.name) === needle) return 1_000;
-  if (entry.aliases.some((alias) => normalize(alias) === needle)) return 900;
+  if (normalize(entry.name) === needle) return { score: 1_000, basis: ["exact_name"] };
+  if (entry.aliases.some((alias) => normalize(alias) === needle)) {
+    return { score: 900, basis: ["exact_alias"] };
+  }
   const words = needle.split(/\s+/).filter(Boolean);
   let score = 0;
+  const basis = new Set<string>();
   for (const field of fields) {
-    if (field.includes(needle)) score = Math.max(score, 500);
+    if (field.includes(needle)) {
+      score = Math.max(score, 500);
+      basis.add("phrase_contains");
+    }
     const hits = words.filter((word) => field.includes(word)).length;
-    score = Math.max(score, hits * 100);
+    if (hits) {
+      score = Math.max(score, hits * 100);
+      basis.add("token_overlap");
+    }
   }
-  return score;
+  return { score, basis: [...basis] };
+}
+
+function confidenceForScore(score: number, explicitNames: boolean): number {
+  if (explicitNames) return 1;
+  if (score >= 1_000) return 0.99;
+  if (score >= 900) return 0.95;
+  if (score >= 500) return 0.86;
+  if (score >= 200) return 0.72;
+  if (score >= 100) return 0.58;
+  return 0;
+}
+
+export function normalizeDiscoveryThreshold(value: unknown): number {
+  const numeric = Number(value);
+  return Number.isFinite(numeric)
+    ? Math.max(0, Math.min(1, numeric))
+    : DEFAULT_DISCOVERY_THRESHOLD;
 }
 
 export function searchToolCatalog(
@@ -274,8 +308,18 @@ export function searchToolCatalog(
     candidates = catalog.filter((entry) => authorized(entry.name));
   }
   const query = String(options.query || "");
+  const explicitNames = requestedNames.length > 0;
   const matches = candidates
-    .map((entry) => ({ ...entry, score: matchScore(entry, query), active: active.has(entry.name) }))
+    .map((entry) => {
+      const evidence = matchEvidence(entry, query);
+      return {
+        ...entry,
+        score: evidence.score,
+        confidence: confidenceForScore(evidence.score, explicitNames),
+        match_basis: evidence.basis,
+        active: active.has(entry.name),
+      };
+    })
     .filter((entry) => entry.score > 0)
     .sort((left, right) => right.score - left.score || left.name.localeCompare(right.name))
     .slice(0, limit);

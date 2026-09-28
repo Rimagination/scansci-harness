@@ -48,6 +48,7 @@ python -m pip install -e ".[desktop,local-gpu,rerank]"
 
 ```json
 {
+  "schema_version": 1,
   "windows": {
     "url": "https://download.example/ScanSci-0.4.0-windows-x64.zip",
     "sha256": "<完整 ZIP 的 SHA256>",
@@ -58,7 +59,8 @@ python -m pip install -e ".[desktop,local-gpu,rerank]"
       "size": 12345,
       "block_size": 65536
     }
-  }
+  },
+  "signature": {"algorithm": "ed25519", "key_id": "scansci-release-v1", "value": "<Base64 签名>"}
 }
 ```
 
@@ -91,7 +93,7 @@ python .\scripts\verify_update_channel.py `
   --expected-version 0.4.0
 ```
 
-审计会核对版本、HTTPS 地址、完整包大小、SHA256、blockmap 身份和 HTTP Range。Range 不可用不会破坏更新通道，结果会明确标记使用完整包回退。
+审计会核对 schema、Ed25519 签名、版本、HTTPS 地址、逐跳重定向目标、完整包大小、SHA256、blockmap 身份和 HTTP Range。Range 不可用不会破坏更新通道，结果会明确标记使用完整包回退。
 
 ## 构建本地 AI 组件
 

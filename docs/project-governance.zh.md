@@ -81,6 +81,14 @@ ScanSci 的论文长期母本是 `clean HTML`，不是 PDF、Markdown 或出版�
 | `cnki_reader.py` | CNKI HTML/导出结构读取 |
 | `credentials.py` | 本地凭据读取边界，禁止写入文档或日志 |
 
+### 外部文献 provider 接口
+
+文献下载 provider 保持在独立插件中，通过 MCP 进入 Host 能力目录，再由 Pi 按需发现和激活。ScanSci Harness 只透传当前租约内的能力描述，不识别具体 provider 或 tool 名称。ScanSci Host 维护连接记录、provider 语义 manifest、effect policy、lease 和结果边界；插件维护检索渠道、登录态、下载策略、解析和版本发布。当前 `scansci-pdf` 使用 `literature` provider contract，稳定交付 `discover_papers`、`verify_doi`、`download_papers` 三个语义能力。`download_papers` 表示 provider 交付候选下载产物，宿主自有的 `download_and_index` 仍负责 ResearchRun、全文清洗和证据入库。
+
+provider manifest 只允许声明这三个稳定语义到具体 MCP tool name 的映射。tool effect 由 Host 根据语义表生成，未知工具继续拒绝。下载属于 `reversible`，需用户显式授权 `allow_reversible`；新增、修改、删除等普通写操作仍需 `allow_write` 与对应任务审批。插件内部更换来源链路、浏览器策略或重试实现时，不需要修改 Harness。
+
+外部结果进入 Pi 前经过有界归一化，文件路径只保留工作区内的候选产物；下游证据层消费 Host 已验证的 clean HTML/evidence 对象，不能直接把第三方 MCP 原始响应当成已核验全文。
+
 治理规则：
 
 - 本层可以联网、访问浏览器、解析 provider 响应，但不能做 RAG 检索、回答生成或向量库决策。
@@ -118,6 +126,7 @@ ScanSci 的论文长期母本是 `clean HTML`，不是 PDF、Markdown 或出版�
 - 证据层可以提供索引字段，但不应绑定某个 reranker、LLM 或综述模板。
 - 向量索引目录是可选的存储覆盖；变更目录时必须使用 SQLite 一致性备份、更新 workspace 路径，并保留旧目录作为回退副本。
 - 资料增量索引或向量目录迁移不得因路径变化或旧 generation 被标记为 stale 就丢弃缓存；必须按证据文本摘要复用未变向量，只为新增/变更证据重新嵌入。
+- 文献下载后的入库、资料导入与界面自动刷新只建立基础全文索引并复用现有向量，不自动预热检索模型或启动新的语义索引任务；首次建库同样遵守。用户点击优化索引或明确安装检索组件后，才执行重型索引。
 - 上层输出的每个关键结论都应该能回指到这里的 evidence id 或 quote id。
 
 ## 核心层：RAG
@@ -242,21 +251,51 @@ NotebookLM-like 产品的优点应主要吸收到本层：notebook/source/note/l
 
 ## 编排层和 CLI
 
-### Pi 编排层与 Host 权威层
+### 最小 ScanSci Harness、Pi 编排层与 Host 权威层
 
-v0.4.0 把编排拆成两类职责，二者不得混写：
+v0.4.2 把运行边界收敛成三类职责，三者不得混写：
 
-- **Pi 编排层**消费当前上下文与授权目录，由模型决定研究路线、工具发现与只读并行、Skill 指令加载、科研子代理委派、延迟 MCP 激活、多模态消息以及压缩/分叉等会话动作。
+- **ScanSci Harness 薄边界**规范化 turn、校验 TaskContract、绑定 Host 会话和租约，并把事件双向透传。它固定连接 Pi，不承担研究路线规划、工具循环或业务工作流分派。
+- **Pi 编排层**是所有需要能力编排的模型轮次的唯一编排面。它消费当前上下文与授权目录，由模型决定研究路线、工具发现与只读并行、Skill 指令加载、科研子代理委派、延迟 MCP 激活、多模态消息以及压缩/分叉等会话动作。
+- **Host 直接对话快速通道**只服务没有知识库、Skill、附件、联网或工具意图的 `direct_chat`。Host 仍编译 TaskContract、执行输入边界和后处理，但不给该轮签发 capability lease；它使用精简系统提示和关闭自适应隐藏思考的 provider 直连，不能读取工具、Skill 或 MCP。
 - **Host 权威层**拥有 Workspace、Evidence Store、ResearchRunStore、任务契约、租约、审批 token、effect policy、证据/引用验证、Artifact 提交与发布审计；任何 Pi 输出都只是请求或候选，不是授权事实。
 
-两层通过 `protocol v7` 和当前 request/run/generation 绑定；搜索、激活、调用、结果提交都重新授权。空租约、未知工具、未知 MCP effect、过期请求、越界 URI 或 schema 不匹配一律 fail-closed。Skill 只增加指令，不增加证据或权限；子代理最多 3 个且只有父租约的只读子集；MCP annotations 只能抬高风险，不能降低 Host policy。
+Harness 通过 `scansci.harness.v1` 接收 `scansci.task-contract.v2`，再由 Pi `protocol v7` 与当前 request/run/generation 绑定；搜索、激活、调用、结果提交都重新授权。空租约、未知工具、未知 MCP effect、过期请求、越界 URI 或 schema 不匹配一律 fail-closed。Skill 只增加指令，不增加证据或权限；子代理最多 3 个且只有父租约的只读子集；MCP annotations 只能抬高风险，不能降低 Host policy。
 
-Host 的确定性产品事实、effect 前拒绝、引用后处理和 evidence gate 继续保留。它们若绕过模型调用，不算模型介导轮次，也不计入 Pi routing；任何 direct fallback 或 capability degradation 都必须在报告中显式出现。
+Host 的确定性产品事实、effect 前拒绝、引用后处理和 evidence gate 继续保留。它们若绕过模型调用，不算模型介导轮次，也不计入 Pi routing；计划内的 `direct_chat` 快速通道、错误后的 `direct fallback` 和 capability degradation 必须在运行元数据中区分记录。
+
+ScanSci 对 `pi-jev` 采用受限接入：`search_tools` 负责租约内的按需工具发现，`search_skills`/`load_skill` 负责渐进式指令发现，`TaskProfile`、`TaskContract` 与 `agent_advisor` 负责 Host 侧结构化判断。发现结果使用 `scansci.discovery-decision.v1`，本地启发式分数、fallback 和未配置外部 provider 都显式记录。详细边界见 [`docs/pi-jev-integration.zh.md`](pi-jev-integration.zh.md)。
+
+#### 最小内核与插件优先约束
+
+- Harness 中禁止出现具体模型名、provider 名、插件名、出版社名和领域工作流分支。新增模型、API 服务或插件只增加 catalog、transport adapter 或 capability manifest。
+- 插件通过稳定语义能力和 JSON Schema 描述输入输出；Host 根据语义分配 effect 与租约，Pi 通过统一的搜索→激活→调用流程按需使用。插件升级、替换实现或增加来源链路不要求修改 Harness。
+- 启动时不连接 deferred MCP，不把全部工具 schema 塞进上下文。只有 Pi 判断任务需要后才发现和激活，从而控制 token、网络连接和等待成本。
+- 插件缺失、模型能力较弱或 provider 暂时不可用时，Host 发布结构化 availability/degradation 事件；无关能力继续工作，UI 只展示一个可执行的提示面。
+- Host 只消费有界、可验证的标准结果 envelope。插件原始响应不能直接扩大权限、写入证据库或改变 ResearchRun 状态。
+- 任何让 Harness 解释插件业务结果、替 Pi 规划下一步或按模型名称分支的改动，都视为架构回归，并由定向契约测试阻止。
+
+图像生成也遵守同一边界：模型目录用 `image` capability 描述服务，Pi 只看到稳定的 `generate_image` 工具，Host 根据独立的图像模型角色解析 provider、通过 transport 调用同步或异步接口、校验返回内容并把文件提交到工作区产物目录。同步服务使用 OpenAI-compatible `/images/generations`；并行智算云 WanX 使用 `/p003/text2image` 单次提交和 `/p003/tasks/{task_id}` 有界只读查询。API Key 只在 Host 凭据边界内读取；provider 环境变量是按请求解析的只读覆盖，未设置时回退到 workspace-scoped keyring。增加并行智算云、替换 CogView 版本或接入其他兼容服务时，只更新 provider catalog/transport；Harness 不增加服务商或模型名称分支。
+
+输入框提供统一模型菜单，图像生成模型标记为“生图”，内部与默认对话模型分别保存。用户明确选择生图模型并提交文字时，Host 执行已确定的图像服务操作，不再请求聊天模型规划；该操作标记 `host-explicit-image`，不计入 Pi 模型自主编排能力。自主研究中是否需要生图仍由 Pi 通过 `generate_image` 决定。显式生图按每条请求的 provider/model 快照执行，不修改全局图像角色，不把纯生图模型发送到聊天接口；失败、取消或结果不明时不自动重复付费请求，历史中保留模型与图像产物。
+
+#### 直接对话会话状态契约 v2
+
+需要能力编排的直接对话由 Pi 执行模型介导轮次；普通 `direct_chat` 可由 Host 快速通道直接调用 provider。Host 始终拥有可恢复的会话投影，Pi session 只承载实际进入 Pi 的执行上下文。两者通过稳定的 `conversation_id`、`session_id`、`message_id` 和父消息引用绑定，职责如下：
+
+- Host 持久化消息、单调修订号、顺序事件、当前执行项、后续队列、状态和编辑分支；Pi session 只承载运行上下文，不能替代用户可见历史。
+- 浏览器必须提交完整的宿主历史投影，不能用固定的最近 16 条消息静默截断多轮对话；本地存储当前最多保留 128 条消息，模型窗口由 Pi 压缩和服务端上下文预算处理。
+- 队列新增、编辑、删除和拖动按同一任务串行写入，避免较旧请求晚到后覆盖新顺序。应用重启后，未完成的当前项和队列恢复为暂停状态，由用户明确继续。
+- 标题只从首轮用户意图生成一次，后续追问不改标题；回复语言跟随最新用户消息的主要语言。
+- 编辑最后一条用户消息和失败重试都创建新分支并启用新的 Pi session；旧消息快照、失败结果和分支来源继续保留，不能原地伪造历史。
+- 保留的事件按 `sequence` 追加；达到本地上限后只压缩最旧事件，并记录 `compacted_before_sequence`，保留区间内的事件不得改写。
 
 少数模块可以跨层编排，但它们只负责把层串起来，不应该把所有细节写在自己里面。
 
 | 模块 | 角色 |
 |---|---|
+| `scansci_harness.py` | 固定的 Host→Pi turn 校验、租约绑定和事件透传边界 |
+| `pi_agent.py` / `pi-runtime` | Pi protocol v7 唯一模型编排面与工具循环 |
 | `cli.py` | 命令入口和参数路由 |
 | `evidence_agent.py` | 确定性的 evidence/workbench/workspace 状态编排，输出 status/next JSON |
 | `evidence_agent_runtime.py` | 本地小模型 harness：observe/decide/act loop、human gate、run manifest |

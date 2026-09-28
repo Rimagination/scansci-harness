@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://scansci.local/schemas/pi-capability-release-report-v2.json",
-  "title": "ScanSci Pi capability release evidence",
+  "title": "ScanSci Harness Pi capability release evidence",
   "type": "object",
   "additionalProperties": false,
   "required": [

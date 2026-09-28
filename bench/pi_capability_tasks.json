@@ -14,10 +14,11 @@
         "proof_batches": [{
           "id": "routing-bilingual-40",
           "source": "junit",
-          "selector": "test_every_bilingual_model_turn_is_pi_reachable_with_full_read_inventory",
+          "selector": "test_bilingual_turns_use_pi_only_when_the_task_profile_requires_it",
           "case_prefix": "routing-",
           "case_count": 40,
-          "minimum_matches": 40
+          "minimum_matches": 40,
+          "routing_policy": "pi_for_capability_bearing_turns_direct_chat_fast_lane_for_plain_conversation"
         }]
       },
       "cases": [
