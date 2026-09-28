@@ -868,7 +868,10 @@ def main(argv: list[str] | None = None) -> int:
             mode=args.mode,
             output=output,
             workspace=Path(args.workspace).expanduser().resolve(),
-            timeout_seconds=max(5.0, min(float(args.timeout_seconds), 300.0)),
+            # The real probe shares one deadline across twenty provider turns;
+            # managed-gateway latency (tens of seconds per turn) needs a
+            # multi-hour ceiling, not the 300s that fit a fast gateway day.
+            timeout_seconds=max(5.0, min(float(args.timeout_seconds), 3600.0)),
             test_evidence=(Path(args.test_evidence).expanduser().resolve() if args.test_evidence else None),
         )
     except Exception as error:
