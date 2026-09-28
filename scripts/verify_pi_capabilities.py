@@ -602,11 +602,13 @@ def run_real_provider_probe(
         model_record={"context_window": "32K", "capabilities": ["reasoning", "tool", "vision"]},
         api_surface=provider["api_surface"],
     )
-    tiny_png = base64.b64encode(
-        b"\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01"
-        b"\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\rIDAT\x08\xd7c\xf8\xcf\xc0\xf0\x1f"
-        b"\x00\x05\x00\x01\xff\x89\x99=\x1d\x00\x00\x00\x00IEND\xaeB`\x82"
-    ).decode("ascii")
+    # A 64x64 RGB PNG.  Some real vision stacks (Ollama's qwen3-vl projector)
+    # reject degenerate 1x1 images; the capability contract needs a
+    # well-formed image, not a specific pixel count.
+    tiny_png = (
+        "iVBORw0KGgoAAAANSUhEUgAAAEAAAABACAIAAAAlC+aJAAABN0lEQVR4nNXCO0sVAACG4VePl9I0zSyvmanHvOf93gEHwSFoEBqEhvgchIbAQXAIHAQHwUFoEByChsBBaBAc2trc3Nzc2tzcGvod78MDwb0s1eqUp16dQprVqUiHOpXpUacqg+pUZ1ydB5lT52FK6tRkVZ3avFPnUdbVqcuGOvX5pM7jbKnT"
+        "kC/qNGZHnSf5qk5T9tV5mkN1mnOszrOcqPM839VpyU91WnOuTlsu1GnPb3U68kedzlyp8yLX6nTlRp2XuVWnO3/VeZU7dXpyr05v/qnTl4I6xdSo059GdV6nRZ2BdKkzmKI6QxlRZzhT6oxkUZ3RrKgzljV13uS9OuP5oM5EPqozmU11pvJZnelsqzOTXXVms6fOXA7Umc+ROgv5ps5iTtVZyg91lnOmztv8UqeUS/X/6khA4l8TJdIAAAAASUVORK5CYII="
+    )
     image = {"type": "image", "data": tiny_png, "mimeType": "image/png"}
     client = PiAgentClient(workspace=workspace, evidence_db=evidence_db)
     run_dir = diagnostics_root(workspace) / "runs"
