@@ -10,7 +10,11 @@
   <img alt="Evidence first" src="https://img.shields.io/badge/Research-evidence--first-0b1b3a?style=flat-square">
 </p>
 
-<p align="center"><strong>证据优先的科研 AI 工作台。</strong> 找论文、核验证据、写综述、做幻灯片；每一步都能回到原文，证据不足时明确说明。</p>
+<p align="center">
+  <strong>证据优先的科研 AI 工作台：从找论文到交付成果，每一步都能回到原文。</strong><br>
+  多源检索并获取全文，在本地知识库做句子级证据召回、原文高亮与引用核验，支撑证据问答和文献综述。<br>
+  Pi Agent 按任务编排模型、工具与技能，进一步制作学术幻灯片；证据不足时明确说明，不编造。
+</p>
 
 <p align="center">
   <a href="https://github.com/Rimagination/scansci-harness#user-content-核心能力">核心能力</a> ·
