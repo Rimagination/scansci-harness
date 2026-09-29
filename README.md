@@ -13,9 +13,9 @@
 <p align="center"><strong>证据优先的科研 AI 工作台。</strong> 找论文、核验证据、写综述、做幻灯片；每一步都能回到原文，证据不足时明确说明。</p>
 
 <p align="center">
-  <a href="#核心能力">核心能力</a> ·
-  <a href="#界面预览">界面预览</a> ·
-  <a href="#快速开始">快速开始</a> ·
+  <a href="https://github.com/Rimagination/scansci-harness#user-content-核心能力">核心能力</a> ·
+  <a href="https://github.com/Rimagination/scansci-harness#user-content-界面预览">界面预览</a> ·
+  <a href="https://github.com/Rimagination/scansci-harness#user-content-快速开始">快速开始</a> ·
   <a href="https://github.com/Rimagination/scansci-harness/releases">下载</a>
 </p>
 
