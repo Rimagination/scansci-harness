@@ -120,6 +120,27 @@ function nativeOllamaMessages(value: unknown): unknown[] {
     const message = { ...item };
     if (message.role === "developer") message.role = "system";
     if (message.content === null || message.content === undefined) message.content = "";
+    // OpenAI multimodal arrays (text + image_url data URLs) must become the
+    // native form: a plain string plus per-message base64 ``images``.  The
+    // array cannot pass through — Ollama's /api/chat rejects it outright.
+    if (Array.isArray(message.content)) {
+      const textParts: string[] = [];
+      const images: string[] = [];
+      for (const part of message.content) {
+        if (!isRecord(part)) continue;
+        if (typeof part.text === "string" && part.text) {
+          textParts.push(part.text);
+          continue;
+        }
+        const imageUrl = isRecord(part.image_url) ? String(part.image_url.url || "") : "";
+        if (imageUrl) {
+          const comma = imageUrl.indexOf(",");
+          images.push(comma >= 0 && imageUrl.startsWith("data:") ? imageUrl.slice(comma + 1) : imageUrl);
+        }
+      }
+      message.content = textParts.join("\n").trim();
+      if (images.length) message.images = images;
+    }
     if (message.role === "tool" && typeof message.name === "string" && message.name) {
       message.tool_name = message.name;
       delete message.name;
