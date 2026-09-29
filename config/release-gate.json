@@ -225,7 +225,7 @@
       "result_file": "pi-capabilities-real.json",
       "result_kind": "pi_capability_report",
       "console": "log",
-      "timeout_seconds": 2700
+      "timeout_seconds": 1800
     },
     {
       "id": "dual-model-agent",
