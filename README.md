@@ -1,8 +1,23 @@
-# ScanSci Harness
+<p align="center">
+  <img src="assets/scansci-harness-mark.svg" alt="ScanSci Harness 标识" width="88" height="88">
+</p>
 
-<img src="assets/scansci-harness-mark.svg" alt="ScanSci Harness 标识" width="64" height="64">
+<h1 align="center">ScanSci Harness</h1>
 
-**证据优先的科研 AI 工作台。** 找论文、读资料、核验证据、写综述、做幻灯片——每一步都绑定原文出处，证据不足时明确说明，不编造。
+<p align="center">
+  <img alt="Windows desktop" src="https://img.shields.io/badge/Windows-desktop-087f70?style=flat-square">
+  <img alt="Powered by Pi" src="https://img.shields.io/badge/Agent-Pi-078ba9?style=flat-square">
+  <img alt="Evidence first" src="https://img.shields.io/badge/Research-evidence--first-0b1b3a?style=flat-square">
+</p>
+
+<p align="center"><strong>证据优先的科研 AI 工作台。</strong> 找论文、核验证据、写综述、做幻灯片；每一步都能回到原文，证据不足时明确说明。</p>
+
+<p align="center">
+  <a href="#核心能力">核心能力</a> ·
+  <a href="#界面预览">界面预览</a> ·
+  <a href="#快速开始">快速开始</a> ·
+  <a href="https://github.com/Rimagination/scansci-harness/releases">下载</a>
+</p>
 
 ## 核心能力
 
@@ -41,7 +56,7 @@
 ### 安全与可控
 
 - Agent 默认只能使用白名单科研工具，Shell 和文件修改工具默认关闭。
-- API 密钥保存在系统凭据管理器（Windows Credential Manager），不写入配置文件或日志。
+- API 密钥保存在系统凭据管理器（Windows Credential Manager），不写入���置文件或日志。
 - 任务支持暂停、续接、自动纠错和 checkpoint，中途失败不丢失进度。
 
 ## 界面预览
