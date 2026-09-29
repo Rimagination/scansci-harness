@@ -1,6 +1,6 @@
-# ScanSci Pi
+# ScanSci Harness
 
-![ScanSci Pi product banner](assets/scansci-pi-banner.png)
+<img src="assets/scansci-harness-mark.svg" alt="ScanSci Harness 标识" width="64" height="64">
 
 **证据优先的科研 AI 工作台。** 找论文、读资料、核验证据、写综述、做幻灯片——每一步都绑定原文出处，证据不足时明确说明，不编造。
 
@@ -46,13 +46,13 @@
 
 ## 界面预览
 
-<img src="assets/scansci-pi-home.png" alt="ScanSci Pi 首页与科研工作入口" width="100%">
+<img src="assets/scansci-pi-home.png" alt="ScanSci Harness 首页与科研工作入口" width="100%">
 
 ## 快速开始
 
 ### Windows 安装包
 
-从 [GitHub Releases](https://github.com/Rimagination/scansci-pi/releases) 下载测试版安装包。安装前请核对发布页的 SHA-256；当前测试版可能显示"未知发布者"或 SmartScreen 提示。
+从 [GitHub Releases](https://github.com/Rimagination/scansci-harness/releases) 下载测试版安装包。安装前请核对发布页的 SHA-256；当前测试版可能显示"未知发布者"或 SmartScreen 提示。
 
 桌面版更新支持 blockmap 差分下载：有可用的上一版缓存且下载服务支持 HTTP `Range` 时，只下载变化区块；否则自动回退到经过 SHA-256 校验的完整 ZIP。主程序更新不会重新下载独立的 `local-transformers` 运行组件。
 
