@@ -276,21 +276,23 @@ def test_load_skill_rejects_symlink_escape_and_non_text_resource(tmp_path: Path)
 
     record = _skill_record(tmp_path, "safe-reader")
     package = Path(str(record["package_path"]))
+    (package / "references").mkdir()
+    (package / "references" / "binary.bin").write_bytes(b"\x00\x01\x02")
+    runtime = ProgressiveSkillRuntime(tmp_path / "workspace.sqlite", records=[record])
+    with pytest.raises(SkillAccessError, match="text|文本"):
+        runtime.load_skill("safe-reader", resource="references/binary.bin")
+
     outside = tmp_path / "outside.md"
     outside.write_text("outside secret", encoding="utf-8")
     link = package / "references" / "escape.md"
-    link.parent.mkdir()
     try:
         link.symlink_to(outside)
     except OSError:
         pytest.skip("symlink creation is unavailable on this Windows host")
-    (package / "references" / "binary.bin").write_bytes(b"\x00\x01\x02")
     runtime = ProgressiveSkillRuntime(tmp_path / "workspace.sqlite", records=[record])
 
     with pytest.raises(SkillAccessError, match="symlink|escape|符号|边界"):
         runtime.load_skill("safe-reader", resource="references/escape.md")
-    with pytest.raises(SkillAccessError, match="text|文本"):
-        runtime.load_skill("safe-reader", resource="references/binary.bin")
 
 
 def test_load_skill_enforces_individual_and_cumulative_byte_limits(tmp_path: Path) -> None:

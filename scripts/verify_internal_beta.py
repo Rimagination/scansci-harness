@@ -111,7 +111,7 @@ def _check_evidence_answer(app: NotebookWebApp) -> dict[str, Any]:
         app.dispatch(
             "POST",
             "/api/ask",
-            json.dumps({"question": "What did Galunisertib reduce?"}).encode("utf-8"),
+            json.dumps({"question": "What did Galunisertib reduce?", "idempotency_key": "internal-beta-evidence-answer-1", "retrieval_quality": "balanced"}).encode("utf-8"),
         )
     )
     reader = dict(answer["reader_answer"])

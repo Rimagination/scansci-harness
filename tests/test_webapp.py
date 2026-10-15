@@ -1321,7 +1321,7 @@ def test_research_document_ui_distinguishes_reviewable_evidence_from_hard_absten
 def test_chat_attachments_reuse_file_type_icons_in_draft_and_history(tmp_path: Path):
     app, _workspace, _evidence = _build_app(tmp_path)
     script = app.dispatch("GET", "/app.js").body.decode("utf-8")
-    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8").replace("\r\n", "\n")
 
     assert "function fileTypeIconMarkup(path)" in script
     assert "const kind = localResourceKind(path);" in script

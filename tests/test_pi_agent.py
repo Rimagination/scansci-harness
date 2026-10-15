@@ -2802,6 +2802,9 @@ def test_repeated_skill_load_transmits_content_and_custom_state_once(tmp_path: P
             base_url=f"http://127.0.0.1:{server.server_port}/v1",
             api_key="fixture-key",
             model_id="fixture-model",
+            model_runtime=pi_agent.ModelRuntimeDescriptor.for_testing(
+                context_window_tokens=200 * 1024,
+            ).to_dict(),
             thinking_level="off",
             task_mode="general",
             task_contract={
