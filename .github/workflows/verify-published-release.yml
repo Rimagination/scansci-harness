@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
     inputs:
       version:
-        description: Published release tag, for example v0.4.2
+        description: Published signed stable release tag, for example v0.4.2
         required: true
         type: string
 
@@ -15,6 +15,7 @@ permissions:
 
 jobs:
   verify-windows-release:
+    if: ${{ github.event_name == 'workflow_dispatch' || !github.event.release.prerelease }}
     runs-on: windows-latest
     env:
       RELEASE_TAG: ${{ github.event.release.tag_name || inputs.version }}
@@ -81,3 +82,89 @@ jobs:
           path: |
             published-update-channel.json
             published-installer-verification.json
+
+  verify-windows-preview:
+    if: ${{ github.event_name == 'release' && github.event.release.prerelease }}
+    runs-on: windows-latest
+    env:
+      RELEASE_TAG: ${{ github.event.release.tag_name }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Download public preview
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Path published-preview | Out-Null
+          gh release download $env:RELEASE_TAG `
+            --dir published-preview `
+            --pattern "ScanSci-*-windows-x64-setup.exe" `
+            --pattern "candidate-manifest.json" `
+            --pattern "SHA256SUMS.txt"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Verify preview evidence, install, and uninstall
+        shell: pwsh
+        run: |
+          if ($env:RELEASE_TAG -notmatch '^v[0-9]+\.[0-9]+\.[0-9]+-preview\.[1-9][0-9]*$') {
+            throw "Unsigned prerelease must use a vX.Y.Z-preview.N tag."
+          }
+          $acceptedPreviews = @{
+            "v0.4.2-preview.1" = @{
+              source_commit = "b4822799c1343a16fe055cfaac9ac01a2ad00f70"
+              release_source_sha256 = "a3863c10649f6a3673496bd8a52814e13f20e0b2b65f2da4c0b32036e1d15cbc"
+              installer_sha256 = "aaa8464b513f794d0a5c6fbacbd46594c10d1f5982cbca8ab76d04254d1ad7bc"
+            }
+          }
+          $accepted = $acceptedPreviews[$env:RELEASE_TAG]
+          if (-not $accepted) { throw "Preview release has no reviewed source and installer digest." }
+          $manifest = Get-Content -Raw -LiteralPath "published-preview/candidate-manifest.json" | ConvertFrom-Json
+          if ($manifest.schema_version -ne 1 -or $manifest.channel -ne "candidate" -or
+              $env:RELEASE_TAG -notlike "v$($manifest.version)-preview.*" -or
+              -not $manifest.build_id -or $manifest.source_commit -ne $accepted.source_commit -or
+              $manifest.release_source_sha256 -ne $accepted.release_source_sha256) {
+            throw "Published preview metadata does not match the release tag."
+          }
+          git merge-base --is-ancestor $manifest.source_commit HEAD
+          if ($LASTEXITCODE -ne 0) { throw "Candidate source commit is not an ancestor of the release tag." }
+          $changedFiles = @(git diff --name-only $manifest.source_commit HEAD)
+          if (@($changedFiles | Where-Object { $_ -ne '.github/workflows/verify-published-release.yml' }).Count -ne 0) {
+            throw "Application source changed after the candidate installer was built."
+          }
+          $installers = @(Get-ChildItem -LiteralPath published-preview -Filter "ScanSci-*-windows-x64-setup.exe")
+          if ($installers.Count -ne 1 -or $installers[0].Name -ne $manifest.installer.name) {
+            throw "Published preview must contain exactly the installer named in candidate-manifest.json."
+          }
+          $installer = $installers[0]
+          if ($installer.Length -ne $manifest.installer.size) { throw "Published preview installer size does not match the manifest." }
+          $actualSha256 = (Get-FileHash -LiteralPath $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          if ($actualSha256 -ne $accepted.installer_sha256 -or
+              $actualSha256 -ne ([string]$manifest.installer.sha256).ToLowerInvariant()) {
+            throw "Published preview installer SHA256 does not match the reviewed digest and manifest."
+          }
+          $expectedSum = "$actualSha256  $($installer.Name)"
+          $actualSum = (Get-Content -Raw -LiteralPath "published-preview/SHA256SUMS.txt").Trim()
+          if ($actualSum -cne $expectedSum) { throw "Published preview SHA256SUMS.txt does not match the installer." }
+          $signature = Get-AuthenticodeSignature -LiteralPath $installer.FullName
+          if ($signature.Status -ne "NotSigned" -or $manifest.installer.authenticode -ne "NotSigned") {
+            throw "Published preview must be explicitly labeled unsigned."
+          }
+          python scripts/verify_windows_installer.py `
+            --installer $installer.FullName `
+            --expected-build-id $manifest.build_id `
+            --expected-version $manifest.version `
+            --output published-preview-verification.json
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Upload preview verification evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: published-preview-verification-${{ env.RELEASE_TAG }}
+          path: published-preview-verification.json
