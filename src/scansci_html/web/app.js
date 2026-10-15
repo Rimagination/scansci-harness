@@ -3165,7 +3165,7 @@ function runtimeComponentCardMarkup(componentId, { compact = false } = {}) {
           ? (component.job?.error || component.job?.message || "可以重试，或选择本地组件文件。")
           : component.install_available
             ? "仅在你确认后下载；不会随启动自动安装。"
-            : "可直接复用系统安装，也可选择已下载的官方组件 ZIP。";
+            : component.install_unavailable_reason || "可直接复用系统安装，也可选择已下载的官方组件 ZIP。";
   const progress = active
     ? `<div class="runtime-component-progress" role="progressbar" aria-label="${escapeHtml(definition.title)}安装进度" aria-valuemin="0" aria-valuemax="100" aria-valuenow="${component.progress}"><span class="${progressWidthClass(component.progress)}"></span></div>`
     : "";
@@ -13497,7 +13497,7 @@ function renderLegacyLocalModelsSettings() {
       ? runtimeJob.error || runtimeJob.message || "安装未完成；继续安装会复用已下载内容。"
     : runtime.install_available
       ? "由 ScanSci 提供并按需安装；核心程序保持轻量，安装完成后可下载本地模型。"
-      : "当前发行渠道未提供本地运行能力；可连接 Ollama、LM Studio 使用已有模型，也可稍后手动安装。";
+      : runtime.install_unavailable_reason || "当前发行渠道未提供本地运行能力；可连接 Ollama、LM Studio 使用已有模型，也可稍后手动安装。";
   const capabilityLabel = (kind) => ({ chat: "对话", embedding: "嵌入", reranking: "重排", vision: "视觉", audio: "语音" }[kind] || "通用");
   const usableInstalledCount = installedItems.filter((item) => item.ready && item.runtime_compatible !== false).length;
   const incompleteInstalledCount = installedItems.filter((item) => !item.ready).length;
@@ -13680,7 +13680,7 @@ function localRuntimeChannelRecoveryMarkup(runtime = state.localRuntime || {}) {
   const checked = Boolean(report?.checked_at);
   const available = Boolean(report?.available);
   const summary = !checked
-    ? "自动下载通道尚未检查"
+    ? runtime.install_unavailable_reason || "自动下载通道尚未检查"
     : available
       ? "自动下载通道可用"
       : "自动下载暂不可用，可手动安装";

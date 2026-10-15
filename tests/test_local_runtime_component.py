@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 from pathlib import Path
+import sys
 import threading
 import time
 from types import SimpleNamespace
@@ -234,6 +235,28 @@ def test_remote_runtime_manifest_requires_signature_when_release_key_is_pinned(
     payload = json.dumps(manifest).encode("utf-8")
     with pytest.raises(ValueError, match="缺少 Ed25519 签名"):
         component._read_json(component.manifest_url)
+
+
+def test_unsigned_packaged_build_blocks_automatic_runtime_component_download(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(local_runtime_component, "urlopen", lambda *_args, **_kwargs: pytest.fail("manifest was requested"))
+    component = LocalRuntimeComponent(
+        root=tmp_path / "installed",
+        manifest_url="https://downloads.example.test/runtime.json",
+        release_public_key="",
+    )
+
+    status = component.status()
+    assert status["install_available"] is False
+    assert status["manual_install_available"] is True
+    assert "签名公钥" in status["install_unavailable_reason"]
+    with pytest.raises(RuntimeError, match="签名公钥"):
+        component.install()
+    assert component.start_install()["state"] == "failed"
+    assert "签名公钥" in component.check_manifest_channels()["channels"][0]["error"]
 
 
 def test_remote_runtime_manifest_cannot_select_a_local_package(tmp_path: Path) -> None:

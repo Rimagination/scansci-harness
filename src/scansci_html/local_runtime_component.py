@@ -137,6 +137,11 @@ class LocalRuntimeComponent:
         if release_public_key is None:
             release_public_key = os.getenv(RELEASE_PUBLIC_KEY_ENV, "") or build.get("release_public_key", "")
         self.release_public_key = str(release_public_key or "").strip()
+        self._automatic_install_error = (
+            "此安装包缺少组件清单签名公钥；请从官方 Release 下载组件并选择本地文件安装。"
+            if getattr(sys, "frozen", False) and not self.release_public_key
+            else ""
+        )
         packaged_core_fallback = (
             self.default_manifest_url
             if bool(build.get("frozen")) and str(build.get("package_profile", "")) == "core"
@@ -708,12 +713,13 @@ class LocalRuntimeComponent:
             "required_version": self.minimum_component_version,
             "recommended_version": self.component_version,
             "minimum_version": self.minimum_component_version,
-            "update_available": bool(update_available and self.manifest_urls),
+            "update_available": bool(update_available and self.manifest_urls and not self._automatic_install_error),
             "update_required": update_required,
             "installed": bool(installed or source_dependencies_ready or embedded_runtime),
             "mode": mode,
             "executable": str(executable or ""),
-            "install_available": bool(self.manifest_urls),
+            "install_available": bool(self.manifest_urls and not self._automatic_install_error),
+            "install_unavailable_reason": self._automatic_install_error,
             "manifest_configured": bool(self.manifest_urls),
             "manifest_url": self.manifest_url,
             "manifest_urls": list(self.manifest_urls),
@@ -739,15 +745,15 @@ class LocalRuntimeComponent:
         with self._install_lock:
             if self._install_thread is not None and self._install_thread.is_alive():
                 return dict(self._install_job)
-            if not self.manifest_urls:
+            if not self.manifest_urls or self._automatic_install_error:
                 now = int(time.time())
                 self._install_job = {
                     "job_id": self.install_job_id,
                     "state": "failed",
                     "phase": "unavailable",
                     "progress": 0.0,
-                    "message": "自动下载清单不可用，可选择本地组件安装",
-                    "error": f"{self.display_name}尚未安装；自动下载清单不可用。请选择官方 ZIP 后从本地文件安装。",
+                    "message": "自动下载不可用，可选择本地组件安装",
+                    "error": self._automatic_install_error or f"{self.display_name}尚未安装；自动下载清单不可用。请选择官方 ZIP 后从本地文件安装。",
                     "current_file": "",
                     "completed_bytes": 0,
                     "total_bytes": 0,
@@ -1068,11 +1074,15 @@ class LocalRuntimeComponent:
             return None
         if not self.manifest_url:
             raise RuntimeError(f"{self.display_name}尚未安装，当前发行渠道也没有提供组件下载清单。")
+        if self._automatic_install_error:
+            raise RuntimeError(self._automatic_install_error)
         raise RuntimeError(f"{self.display_name}尚未安装。请前往设置 → 本地模型确认安装。")
 
     def install(self, progress_callback=None) -> dict[str, Any]:
         """Download, verify, and atomically activate one runtime version."""
 
+        if self._automatic_install_error:
+            raise RuntimeError(self._automatic_install_error)
         if not self.manifest_urls:
             raise RuntimeError(f"当前发行渠道没有配置{self.display_name}下载清单。")
         with self._process_install_lock():
@@ -1526,6 +1536,8 @@ class LocalRuntimeComponent:
         validate_release_url(url, allow_file=allow_file)
 
     def _read_json(self, url: str) -> dict[str, Any]:
+        if self._automatic_install_error:
+            raise ValueError(self._automatic_install_error)
         allow_file = urlparse(url).scheme.casefold() == "file"
         self._validate_url(url, allow_file=allow_file)
         req = Request(url, headers={"Accept": "application/json", "User-Agent": "ScanSci local runtime"})
