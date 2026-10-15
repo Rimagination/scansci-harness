@@ -1916,7 +1916,7 @@ def _clean_document_title(value: object) -> str:
 
 def _looks_mojibake(value: str) -> bool:
     text = str(value or "")
-    if "�" in text:
+    if "\ufffd" in text:
         return True
     markers = ("锛", "鐨", "涓", "绔", "鏂", "瀹", "纭", "閿", "Ã", "Â")
     return sum(text.count(marker) for marker in markers) >= 2
