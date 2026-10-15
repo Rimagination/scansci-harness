@@ -16,7 +16,7 @@ from typing import Any, Iterable
 from urllib import parse, request
 
 from .model_downloads import ModelInstallManager, download_snapshot
-from .ollama_runtime import OLLAMA_VISION_CATALOG_ITEM
+from .ollama_runtime import OLLAMA_CHAT_CATALOG_ITEMS, OLLAMA_VISION_CATALOG_ITEM
 from .local_runtime_compatibility import ModelCompatibilityStore
 from .local_runtime_contract import COMPONENT_VERSION
 
@@ -499,7 +499,7 @@ def _remote_catalog(query: str, limit: int) -> list[dict[str, Any]]:
 def market_catalog(query: str = "", *, limit: int = 30) -> dict[str, Any]:
     clean = str(query or "").strip()
     installed = {item["id"]: item for item in installed_models()}
-    curated_rows = [*_CURATED, OLLAMA_VISION_CATALOG_ITEM]
+    curated_rows = [*_CURATED, *OLLAMA_CHAT_CATALOG_ITEMS, OLLAMA_VISION_CATALOG_ITEM]
     if clean:
         needle = clean.casefold()
         curated_rows = [
@@ -526,7 +526,7 @@ def market_catalog(query: str = "", *, limit: int = 30) -> dict[str, Any]:
         rows = [*curated_rows, *remote]
         return {"items": _merge_catalog(rows, installed, clean), "source": "curated" if not clean else "huggingface"}
     except Exception as exc:  # network catalog is optional
-        rows = curated_rows or [*_CURATED, OLLAMA_VISION_CATALOG_ITEM]
+        rows = curated_rows or [*_CURATED, *OLLAMA_CHAT_CATALOG_ITEMS, OLLAMA_VISION_CATALOG_ITEM]
         return {"items": _merge_catalog(rows, installed, clean), "source": "curated-cache", "warning": str(exc)}
 
 

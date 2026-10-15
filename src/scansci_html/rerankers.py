@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections import Counter
 import importlib
 import re
-from typing import Any, Protocol
+from typing import Any, Callable, Protocol
 
 import requests
 
@@ -238,6 +238,7 @@ class SiliconFlowReranker:
         session: Any | None = None,
         fallback: Reranker | None = None,
         instruction: str = "",
+        authorization_check: Callable[[], None] | None = None,
     ) -> None:
         self.base_url = str(base_url or "").strip().rstrip("/")
         self.api_key = str(api_key or "").strip()
@@ -250,6 +251,7 @@ class SiliconFlowReranker:
         if not self.model_name:
             raise ValueError("SiliconFlow reranker requires a model name")
         self.session = session or requests.Session()
+        self.authorization_check = authorization_check
         self.fallback = fallback or LexicalReranker()
         self.instruction = str(instruction or "").strip()
         if not self.instruction and self.model_name.casefold().startswith("qwen/qwen3-reranker"):
@@ -273,6 +275,8 @@ class SiliconFlowReranker:
             }
             if self.instruction:
                 payload["instruction"] = self.instruction
+            if self.authorization_check:
+                self.authorization_check()
             response = self.session.post(
                 f"{self.base_url}/rerank",
                 headers={
@@ -281,7 +285,10 @@ class SiliconFlowReranker:
                 },
                 json=payload,
                 timeout=self.timeout,
+                allow_redirects=False,
             )
+            if 300 <= getattr(response, "status_code", 200) < 400:
+                raise RuntimeError("Reranker provider redirected the request")
             response.raise_for_status()
             payload = response.json()
             raw_results = payload.get("results") if isinstance(payload, dict) else None
@@ -518,6 +525,7 @@ def build_reranker(
     api_key: str = "",
     timeout: float = 30.0,
     session: Any | None = None,
+    authorization_check: Callable[[], None] | None = None,
 ) -> Reranker:
     name = (provider or "local").strip().lower()
     if name in {"local", "lexical"}:
@@ -543,6 +551,7 @@ def build_reranker(
             timeout=timeout,
             session=session,
             instruction=instruction,
+            authorization_check=authorization_check,
         )
     if name in {"qwen3", "qwen3-reranker", "qwen-reranker"}:
         return Qwen3Reranker(

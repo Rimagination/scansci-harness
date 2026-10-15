@@ -8,14 +8,14 @@ def test_desktop_build_defaults_to_lightweight_core_and_reuses_dependency_keyed_
     script = (ROOT / "scripts" / "build_desktop.ps1").read_text(encoding="utf-8-sig")
 
     assert '[string]$PackageProfile = "core"' in script
-    assert '[string]$UpdateManifestUrl = "https://github.com/Rimagination/scansci-pi/releases/latest/download/stable.json"' in script
+    assert '[string]$UpdateManifestUrl = "https://github.com/Rimagination/scansci-harness/releases/latest/download/stable.json"' in script
     assert 'https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.0/local-transformers.json' in script
     assert '[string]$NodeComponentManifestUrl' in script
     assert '[string]$TectonicComponentManifestUrl' in script
     assert '[string]$ReleasePublicKey = ""' in script
     assert 'Slim channel: do not embed node.exe or tectonic.exe in the bundle.' in script
     assert 'build\\desktop-cache\\$cacheName' in script
-    assert '$ExcludeRuntimes|$UpdateManifestUrl|$RuntimeManifestUrl|$NodeComponentManifestUrl|$TectonicComponentManifestUrl' in script
+    assert '$ExcludeRuntimes|$ElectronBackend|$UpdateManifestUrl|$RuntimeManifestUrl|$NodeComponentManifestUrl|$TectonicComponentManifestUrl' in script
     assert '$sourceTreeHash' in script
     assert 'source_tree_sha256 = $sourceTreeHash' in script
     assert 'release_source_sha256 = $ReleaseSourceSha256.ToLowerInvariant()' in script

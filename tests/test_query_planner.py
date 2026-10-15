@@ -40,3 +40,8 @@ def test_chinese_multi_dimension_question_keeps_explicit_facets():
         "植被群落",
         "土壤碳储量",
     ]
+
+
+def test_chinese_impact_facets_drop_structural_de():
+    plan = plan_query("光伏板对土壤水分和温度的影响")
+    assert [facet["id"] for facet in plan["required_facets"]] == ["土壤水分", "温度"]

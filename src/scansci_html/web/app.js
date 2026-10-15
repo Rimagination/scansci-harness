@@ -8,7 +8,7 @@ const state = {
   systemOcrStatus: { loading: false, requestedKey: "", provider: "tesseract", checkedAt: "", available: false, message: "尚未检测 OCR" },
   presets: { providers: [], local_models: [] },
   modelHealth: { checked_at: "", providers: {}, models: {}, loading: false },
-  localModelMarket: { installed: [], catalog: [], source: "", query: "", loading: false, loaded: false },
+  localModelMarket: { installed: [], catalog: [], recommendation: null, source: "", query: "", loading: false, loaded: false },
   localModelInstall: { jobs: [], active: null },
   localRuntime: { installed: false, install_available: false, manual_install_available: true, mode: "missing", channels: null },
   runtimeComponents: {
@@ -17,10 +17,16 @@ const state = {
   },
   ollama: { reachable: false, model_ready: false, model_id: "minicpm-v4.6", error: "" },
   localRuntimeManualOpen: false,
+  strataPreflight: null,
+  strataProbeRunning: false,
+  strataProbeError: "",
+  strataDraftUrl: "",
+  strataCandidateConnection: null,
   downloadStatusError: "",
   onboardingOpen: false,
   onboardingStep: "welcome",
   onboardingMode: "",
+  onboardingGuideFromWelcome: false,
   resourceGuideStep: 0,
   onboardingPersisting: false,
   pendingLocalModelResource: "",
@@ -164,6 +170,7 @@ const state = {
   webSearchMode: ["auto", "on", "off"].includes(window.localStorage.getItem("scansci.web-search.mode"))
     ? window.localStorage.getItem("scansci.web-search.mode")
     : "auto",
+  agentMode: window.localStorage.getItem("scansci.agent-mode") === "true",
   researchWorkflow: "",
   // “证据综述” is a delivery choice inside evidence Q&A, not a new
   // restrictive top-level mode. Normal free-form use remains untouched.
@@ -203,6 +210,8 @@ let confirmDialogPreviousFocus = null;
 let onboardingReturnFocus = null;
 let localModelInstallPollTimer = 0;
 let localRuntimeInstallPollTimer = 0;
+let translationRunId = window.localStorage.getItem("scansci.translation.run-id") || "";
+const translationWatchers = new Set();
 const runtimeComponentInstallPollTimers = new Map();
 let notionWizardResolve = null;
 let notionWizardScopeRestore = null;
@@ -438,6 +447,43 @@ function applyAppearancePreferences() {
     if (value) element.textContent = value;
   });
   refreshEvidenceReaderTheme();
+  syncEmbeddedBrowserTheme();
+}
+
+function syncEmbeddedBrowserTheme() {
+  const api = window.pywebview?.api;
+  if (typeof api?.set_browser_theme !== "function") return;
+  const style = window.getComputedStyle(document.documentElement);
+  const token = (name) => style.getPropertyValue(name).trim();
+  api.set_browser_theme({
+    canvas: token("--canvas"),
+    surface: token("--surface"),
+    ink: token("--ink"),
+    muted: token("--muted"),
+    rule: token("--rule"),
+    control: token("--control-background"),
+    accent: token("--accent"),
+  }).catch(() => {});
+}
+
+function updateEmbeddedBrowserButton(open) {
+  document.documentElement.classList.toggle("embedded-browser-open", Boolean(open));
+  const button = document.querySelector('[data-action="toggle-embedded-browser"]');
+  if (!button) return;
+  button.setAttribute("aria-pressed", String(Boolean(open)));
+  button.setAttribute("aria-label", open ? "收起内置浏览器" : "打开内置浏览器");
+  button.title = open ? "收起内置浏览器" : "打开内置浏览器";
+}
+
+async function openEmbeddedBrowser(address = "") {
+  const api = window.pywebview?.api;
+  if (typeof api?.open_browser !== "function") {
+    if (address) window.open(address, "_blank", "noopener");
+    return;
+  }
+  const result = await api.open_browser(address);
+  if (!result?.ok) throw new Error(result?.message || "内置浏览器暂时不可用");
+  updateEmbeddedBrowserButton(result.open);
 }
 
 function collectAppearanceForm() {
@@ -564,60 +610,9 @@ async function streamChat(payload, onEvent, { signal } = {}) {
   }
 }
 
-function waitForStreamRetry(delaySeconds, signal) {
-  const delay = Math.max(0, Number(delaySeconds || 0)) * 1000;
-  return new Promise((resolve, reject) => {
-    if (signal?.aborted) {
-      reject(new DOMException("The streaming request was aborted.", "AbortError"));
-      return;
-    }
-    let timer = window.setTimeout(done, delay);
-    const onAbort = () => {
-      window.clearTimeout(timer);
-      signal?.removeEventListener("abort", onAbort);
-      reject(new DOMException("The streaming request was aborted.", "AbortError"));
-    };
-    function done() {
-      signal?.removeEventListener("abort", onAbort);
-      resolve();
-    }
-    signal?.addEventListener("abort", onAbort, { once: true });
-  });
-}
-
-async function streamChatWithRecovery(payload, onEvent, { signal, onRetry, maxAttempts = 2 } = {}) {
-  const attempts = payload.image_model ? 1 : Math.max(1, Number(maxAttempts) || 1);
-  let generatedImageReceived = false;
-  for (let attempt = 1; attempt <= attempts; attempt += 1) {
-    try {
-      return await streamChat(payload, (eventType, event) => {
-        if (eventType === "CUSTOM" && event.name === "generated_image") generatedImageReceived = true;
-        onEvent(eventType, event);
-      }, { signal });
-    } catch (error) {
-      const failure = error?.failure && typeof error.failure === "object" ? error.failure : null;
-      const providerRateLimited = ["provider_rate_limited", "rate_limit_exceeded", "upstream_rate_limited"]
-        .includes(String(failure?.code || ""));
-      const providerTransportUnavailable = [
-        "model_transport_unavailable",
-        "upstream_timeout",
-        "upstream_connection_failed",
-      ].includes(String(failure?.code || ""));
-      const retryable = error?.name !== "AbortError"
-        && !generatedImageReceived
-        && failure?.retryable !== false
-        && !providerRateLimited
-        && !providerTransportUnavailable
-        && (failure || error?.code === "chat_failed" || !error?.code);
-      if (!retryable || attempt >= attempts) throw error;
-      const requested = Number(failure?.retry_after_seconds || failure?.retry_after || 0);
-      const delay = Math.min(30, Math.max(requested, 6 * attempt));
-      onRetry?.({ error, attempt, delay });
-      onEvent?.("status", { subtype: "retry", attempt, delay_ms: Math.round(delay * 1000) });
-      await waitForStreamRetry(delay, signal);
-    }
-  }
-  throw new Error("The streaming response could not be completed.");
+function streamChatWithRecovery(payload, onEvent, { signal } = {}) {
+  // A transport failure cannot prove that the server has not executed an effect.
+  return streamChat(payload, onEvent, { signal });
 }
 
 function scheduleDirectConversationRender(conversationId = state.directConversationId, { forceFollow = false } = {}) {
@@ -683,6 +678,145 @@ function followLatestConversationMessage({ smooth = false } = {}) {
   updateConversationScrollAffordance();
 }
 
+const conversationTurnNavState = { entries: [], signature: "", hovered: -1, renderFrame: 0, activeFrame: 0, waveFrame: 0, waveY: 0 };
+
+function conversationTurnPreviewText(value, limit = 220) {
+  const text = String(value || "").replace(/\s+/g, " ").trim();
+  return text.length > limit ? `${text.slice(0, limit - 1)}…` : text;
+}
+
+function collectConversationTurns() {
+  const turns = [];
+  byId("answerArea")?.querySelectorAll(".conversation-message").forEach((message) => {
+    if (message.classList.contains("is-user")) {
+      const bubble = message.querySelector(".user-turn-bubble");
+      const question = bubble?.querySelector("p")?.textContent || bubble?.querySelector("textarea")?.value || bubble?.textContent;
+      turns.push({ element: message, question: conversationTurnPreviewText(question, 220), answer: "" });
+    } else if (message.classList.contains("is-assistant") && turns.length) {
+      const turn = turns[turns.length - 1];
+      const answer = message.querySelector(".answer-sentence, .run-result")?.textContent
+        || message.querySelector(".message-body")?.textContent;
+      if (answer && !turn.answer) turn.answer = conversationTurnPreviewText(answer, 280);
+    }
+  });
+  if (turns.length && !turns[0].answer) {
+    turns[0].answer = conversationTurnPreviewText(byId("answerArea")?.querySelector(".run-result")?.textContent, 280);
+  }
+  return turns;
+}
+
+function scheduleConversationTurnNav() {
+  if (conversationTurnNavState.renderFrame) return;
+  conversationTurnNavState.renderFrame = window.requestAnimationFrame(() => {
+    conversationTurnNavState.renderFrame = 0;
+    renderConversationTurnNav();
+  });
+}
+
+function renderConversationTurnNav() {
+  const nav = byId("conversationTurnNav");
+  const list = byId("conversationTurnList");
+  const area = byId("answerArea");
+  if (!nav || !list || !area) return;
+  const entries = collectConversationTurns();
+  conversationTurnNavState.entries = entries;
+  if (state.activeView !== "conversation" || entries.length < 2 || area.clientWidth < 900 || area.clientHeight < 200 || area.scrollHeight <= area.clientHeight + 10) {
+    nav.hidden = true;
+    conversationTurnNavState.signature = "";
+    hideConversationTurnPreview();
+    return;
+  }
+  const signature = `${state.activeTaskId || state.directConversationId}|${entries.map((entry) => entry.question).join("\u001f")}`;
+  if (signature !== conversationTurnNavState.signature) {
+    conversationTurnNavState.signature = signature;
+    list.innerHTML = entries.map((entry, index) => {
+      return `<button type="button" class="conversation-turn-marker" data-action="jump-conversation-turn" data-turn-index="${index}" aria-label="跳转到第 ${index + 1} 轮：${escapeHtml(conversationTurnPreviewText(entry.question, 52) || "附件提问")}"><span class="conversation-turn-stroke" aria-hidden="true"></span></button>`;
+    }).join("");
+    hideConversationTurnPreview();
+  }
+  const mainRect = nav.parentElement.getBoundingClientRect();
+  const areaRect = area.getBoundingClientRect();
+  nav.style.top = `${areaRect.top - mainRect.top + 8}px`;
+  nav.style.height = `${Math.max(0, area.clientHeight - 16)}px`;
+  nav.hidden = false;
+  if (conversationTurnNavState.hovered >= 0) showConversationTurnPreview(conversationTurnNavState.hovered);
+  updateConversationTurnNavActive();
+}
+
+function updateConversationTurnNavActive() {
+  const nav = byId("conversationTurnNav");
+  const area = byId("answerArea");
+  if (!nav || nav.hidden || !area) return;
+  if (conversationTurnNavState.entries.some((entry) => !entry.element.isConnected)) {
+    scheduleConversationTurnNav();
+    return;
+  }
+  const boundary = area.getBoundingClientRect().top + area.clientHeight * 0.42;
+  let active = 0;
+  conversationTurnNavState.entries.forEach((entry, index) => {
+    if (entry.element.getBoundingClientRect().top <= boundary) active = index;
+  });
+  nav.querySelectorAll(".conversation-turn-marker").forEach((button, index) => {
+    button.classList.toggle("is-current", index === active);
+    if (index === active) button.setAttribute("aria-current", "location");
+    else button.removeAttribute("aria-current");
+  });
+  const list = byId("conversationTurnList");
+  if (list) {
+    const rowTop = active * 20;
+    if (rowTop < list.scrollTop + 10) list.scrollTop = Math.max(0, rowTop - 20);
+    else if (rowTop + 20 > list.scrollTop + list.clientHeight - 10) list.scrollTop = rowTop + 30 - list.clientHeight;
+  }
+}
+
+function scheduleConversationTurnNavActive() {
+  if (conversationTurnNavState.activeFrame) return;
+  conversationTurnNavState.activeFrame = window.requestAnimationFrame(() => {
+    conversationTurnNavState.activeFrame = 0;
+    updateConversationTurnNavActive();
+  });
+}
+
+function showConversationTurnPreview(index) {
+  const entry = conversationTurnNavState.entries[index];
+  const nav = byId("conversationTurnNav");
+  const button = byId("conversationTurnList")?.querySelector(`[data-turn-index="${index}"]`);
+  const preview = byId("conversationTurnPreview");
+  if (!entry || !nav || nav.hidden || !button || !preview) return;
+  byId("conversationTurnList")?.querySelector('[aria-describedby="conversationTurnPreview"]')?.removeAttribute("aria-describedby");
+  conversationTurnNavState.hovered = index;
+  byId("conversationTurnPreviewQuestion").textContent = entry.question || "附件提问";
+  byId("conversationTurnPreviewAnswer").textContent = entry.answer || "正在等待回答…";
+  preview.hidden = false;
+  const desired = button.getBoundingClientRect().top - nav.getBoundingClientRect().top + 10 - preview.offsetHeight / 2;
+  preview.style.top = `${Math.max(4, Math.min(desired, nav.clientHeight - preview.offsetHeight - 4))}px`;
+  button.setAttribute("aria-describedby", "conversationTurnPreview");
+}
+
+function hideConversationTurnPreview() {
+  conversationTurnNavState.hovered = -1;
+  if (conversationTurnNavState.waveFrame) window.cancelAnimationFrame(conversationTurnNavState.waveFrame);
+  conversationTurnNavState.waveFrame = 0;
+  const preview = byId("conversationTurnPreview");
+  if (preview) preview.hidden = true;
+  byId("conversationTurnNav")?.classList.remove("is-hovering");
+  byId("conversationTurnList")?.querySelectorAll(".conversation-turn-marker").forEach((button) => {
+    button.style.removeProperty("--wave-width");
+    button.removeAttribute("aria-describedby");
+  });
+}
+
+function jumpConversationTurn(index) {
+  const area = byId("answerArea");
+  const target = conversationTurnNavState.entries[Number(index)]?.element;
+  if (!area || !target?.isConnected) return;
+  state.conversationAutoFollow = false;
+  hideConversationTurnPreview();
+  const top = target.getBoundingClientRect().top - area.getBoundingClientRect().top + area.scrollTop - 18;
+  area.scrollTo({ top: Math.max(0, top), behavior: window.matchMedia?.("(prefers-reduced-motion: reduce)")?.matches ? "auto" : "smooth" });
+  updateConversationScrollAffordance();
+}
+
 function escapeHtml(value = "") {
   return String(value).replace(/[&<>'"]/g, (character) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", "'": "&#39;", '"': "&quot;" }[character]));
 }
@@ -711,7 +845,8 @@ function localResourceExtension(path = "") {
 function localResourceKind(path = "", { folder = false } = {}) {
   const value = String(path || "").trim();
   const extension = localResourceExtension(value);
-  if (folder || /[\\/]$/.test(value) || !extension) return "folder";
+  if (folder || /[\\/]$/.test(value)) return "folder";
+  if (!extension) return "file";
   return Object.entries(localResourceKinds).find(([, extensions]) => extensions.has(extension))?.[0] || "file";
 }
 
@@ -733,6 +868,11 @@ function localResourceIcon(kind = "file") {
     file: "file",
   };
   return icons[kind] || "file";
+}
+
+function fileTypeIconMarkup(path) {
+  const kind = localResourceKind(path);
+  return `<span class="local-artifact-icon is-${kind}" aria-hidden="true">${uiIcon(localResourceIcon(kind))}</span>`;
 }
 
 const siteUrlTrailingPunctuation = /[),.;:!?，。！？；：、》）】』」]+$/u;
@@ -1086,6 +1226,7 @@ const uiIconPaths = {
   "arrow-left": '<path d="m11 6-6 6 6 6M5.5 12h13"></path>',
   "arrow-right": '<path d="m13 6 6 6-6 6M18.5 12h-13"></path>',
   "chevron-down": '<path d="m7 9 5 5 5-5"></path>',
+  "chevron-left": '<path d="m15 18-6-6 6-6"></path>',
   "chevron-right": '<path d="m9 7 5 5-5 5"></path>',
   plus: '<path d="M12 5v14M5 12h14"></path>',
   minus: '<path d="M5 12h14"></path>',
@@ -1094,6 +1235,7 @@ const uiIconPaths = {
   x: '<path d="m7 7 10 10M17 7 7 17"></path>',
   refresh: '<path d="M19 8.5A7.5 7.5 0 1 0 19.5 14"></path><path d="M19.5 4.5v4.8h-4.8"></path>',
   "triangle-alert": '<path d="m21.7 18.2-8-14a2 2 0 0 0-3.4 0l-8 14A2 2 0 0 0 4 21h16a2 2 0 0 0 1.7-2.8Z"></path><path d="M12 9v4M12 17h.01"></path>',
+  "circle-alert": '<circle cx="12" cy="12" r="10"></circle><path d="M12 8v4M12 16h.01"></path>',
   "loader-circle": '<path d="M12 3a9 9 0 1 0 9 9"></path>',
   "map-pin": '<path d="M20 10c0 5-8 11-8 11S4 15 4 10a8 8 0 1 1 16 0Z"></path><circle cx="12" cy="10" r="2.5"></circle>',
   "git-branch": '<circle cx="6" cy="5" r="2"></circle><circle cx="18" cy="6" r="2"></circle><circle cx="6" cy="19" r="2"></circle><path d="M6 7v10M8 11h4a6 6 0 0 0 6-3"></path>',
@@ -1108,7 +1250,9 @@ const uiIconPaths = {
   "folder-open": '<path d="m6 14 1.5-2.9A2 2 0 0 1 9.24 10H20a2 2 0 0 1 1.94 2.5l-1.54 6a2 2 0 0 1-1.95 1.5H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h3.9a2 2 0 0 1 1.69.9l.81 1.2a2 2 0 0 0 1.67.9H18a2 2 0 0 1 2 2v2"></path>',
   image: '<rect width="18" height="18" x="3" y="3" rx="2" ry="2"></rect><circle cx="9" cy="9" r="2"></circle><path d="m21 15-3.086-3.086a2 2 0 0 0-2.828 0L6 21"></path>',
   book: '<path d="M4.5 5.5A2.5 2.5 0 0 1 7 3h11v16H7a2.5 2.5 0 0 0-2.5 2.5v-16Z"></path><path d="M4.5 18.5A2.5 2.5 0 0 1 7 16h11"></path>',
+  "book-open": '<path d="M12 7v14"></path><path d="M3 18V5a2 2 0 0 1 2-2h4a3 3 0 0 1 3 3v15a3 3 0 0 0-3-3H3Z"></path><path d="M21 18V5a2 2 0 0 0-2-2h-4a3 3 0 0 0-3 3v15a3 3 0 0 1 3-3h6Z"></path>',
   "message-circle": '<path d="M19.5 11.5a7.5 7.5 0 0 1-8 7.5 8.4 8.4 0 0 1-3.5-.8L4.5 19l.9-3a7.5 7.5 0 1 1 14.1-4.5Z"></path>',
+  bot: '<path d="M12 8V4H8"></path><rect width="16" height="12" x="4" y="8" rx="2"></rect><path d="M2 14h2"></path><path d="M20 14h2"></path><path d="M15 13v2"></path><path d="M9 13v2"></path>',
   link: '<path d="M10 13.8 8.2 15.6a3.4 3.4 0 1 1-4.8-4.8l3-3a3.4 3.4 0 0 1 4.8 0"></path><path d="m14 10.2 1.8-1.8a3.4 3.4 0 1 1 4.8 4.8l-3 3a3.4 3.4 0 0 1-4.8 0"></path><path d="m8.5 15.5 7-7"></path>',
   pen: '<path d="m5 19 1.4-4.5L15.8 5a2.1 2.1 0 0 1 3 3l-9.4 9.5L5 19Z"></path><path d="m13.8 7 3.2 3.2"></path>',
   presentation: '<path d="M2 3h20"></path><path d="M21 3v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V3"></path><path d="m7 21 5-5 5 5"></path>',
@@ -1120,6 +1264,7 @@ const uiIconPaths = {
   server: '<rect x="4" y="4.5" width="16" height="6" rx="1.5"></rect><rect x="4" y="13.5" width="16" height="6" rx="1.5"></rect><path d="M7.5 7.5h.01M7.5 16.5h.01M11 7.5h5M11 16.5h5"></path>',
   terminal: '<polyline points="4 17 10 11 4 5"></polyline><line x1="12" x2="20" y1="19" y2="19"></line>',
   globe: '<circle cx="12" cy="12" r="8.5"></circle><path d="M3.8 12h16.4M12 3.5c2.2 2.2 3.3 5 3.3 8.5S14.2 18.3 12 20.5C9.8 18.3 8.7 15.5 8.7 12S9.8 5.7 12 3.5Z"></path>',
+  sparkles: '<path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z"></path><path d="M20 3v4M22 5h-4M4 17v2M5 18H3"></path>',
   sun: '<circle cx="12" cy="12" r="4"></circle><path d="M12 2.5v2M12 19.5v2M2.5 12h2M19.5 12h2M5.3 5.3l1.4 1.4M17.3 17.3l1.4 1.4M18.7 5.3l-1.4 1.4M6.7 17.3l-1.4 1.4"></path>',
   moon: '<path d="M20.5 14.8A8.5 8.5 0 1 1 9.2 3.5a6.7 6.7 0 0 0 11.3 11.3Z"></path>',
   "shield-check": '<path d="M20 13c0 5-3.5 7.5-8 9-4.5-1.5-8-4-8-9V5l8-3 8 3v5"></path><path d="m9 12 2 2 4-4"></path>',
@@ -1147,6 +1292,9 @@ const uiIconPaths = {
   "more-horizontal": '<path d="M5 12h.01M12 12h.01M19 12h.01"></path>',
   trash: '<path d="M4 7h16M9 7V4h6v3M7 7l1 13h8l1-13M10 11v5M14 11v5"></path>',
 };
+uiIconPaths["globe-2"] = uiIconPaths.globe;
+uiIconPaths.gpu = uiIconPaths.cpu;
+uiIconPaths["refresh-cw"] = uiIconPaths.refresh;
 
 function uiIcon(name, className = "") {
   const path = uiIconPaths[name] || uiIconPaths.info;
@@ -1410,7 +1558,8 @@ function evidenceReaderFrameUrl(value = "") {
 function refreshEvidenceReaderTheme() {
   const frame = byId("evidenceReaderFrame");
   const reader = state.activeEvidence?.reader_url;
-  if (frame && reader && state.contextPanel === "evidence") frame.src = evidenceReaderFrameUrl(reader);
+  const originalActive = byId("evidenceReaderPanel")?.querySelector('[data-action="show-evidence-original"].is-active');
+  if (frame && reader && state.contextPanel === "evidence" && !originalActive) frame.src = evidenceReaderFrameUrl(reader);
 }
 
 function citationMarkerMarkup(citationId) {
@@ -1488,15 +1637,17 @@ function evidenceMeta(record = {}) {
   return String(record.section || "").trim();
 }
 
-function evidenceDetailsMarkup(record = {}) {
+function evidenceDetailsMarkup(record = {}, compact = false) {
   const rows = [
+    ...(compact ? [["文献", sourceTitle(record)]] : []),
     ["DOI", record.doi],
     ["证据 ID", record.evidence_id],
   ]
     .map(([label, value]) => [String(label), String(value || "").trim()])
-    .filter(([, value]) => value);
+  .filter(([, value]) => value);
   if (!rows.length) return "";
-  return `<details class="evidence-source-details"><summary>来源详情${uiIcon("chevron-right", "evidence-source-details-chevron")}</summary><dl>${rows.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("")}</dl></details>`;
+  const summary = compact ? '<summary aria-label="来源详情" title="来源详情">?</summary>' : `<summary>来源详情${uiIcon("chevron-right", "evidence-source-details-chevron")}</summary>`;
+  return `<details class="evidence-source-details${compact ? " is-compact" : ""}">${summary}<dl>${rows.map(([label, value]) => `<div><dt>${escapeHtml(label)}</dt><dd>${escapeHtml(value)}</dd></div>`).join("")}</dl></details>`;
 }
 
 function clearCitationPreviewTimer() {
@@ -1532,10 +1683,14 @@ function citationContextMarkup(citation = {}, maxChars = 680) {
 function showCitationPreview(citation, marker) {
   const preview = byId("citationPreview");
   if (!preview || !citation || !marker) return;
+  if (state.contextPanel === "evidence") {
+    hideCitationPreview();
+    return;
+  }
   clearCitationPreviewTimer();
-  const quote = compact(citation.exact_quote || "当前引用未保存原文摘录。", 460);
+  const quote = compact(citation.exact_quote || "当前引用未保存原文摘录。", 220);
   const meta = evidenceMeta(citation);
-  const context = citationContextMarkup(citation, 460);
+  const context = citationContextMarkup(citation, 220);
   const hint = safeReaderUrl(citation)
     ? "点击脚标可在本应用中查看全文与高亮原文。"
     : citationPublicSourceUrl(citation)
@@ -1545,7 +1700,7 @@ function showCitationPreview(citation, marker) {
   preview.classList.add("is-visible");
   preview.setAttribute("aria-hidden", "false");
   const rect = marker.getBoundingClientRect();
-  const width = Math.min(360, Math.max(240, window.innerWidth - 32));
+  const width = Math.min(320, Math.max(240, window.innerWidth - 32));
   preview.style.width = `${width}px`;
   const previewHeight = preview.offsetHeight;
   const left = Math.min(Math.max(16, rect.left), Math.max(16, window.innerWidth - width - 16));
@@ -1568,7 +1723,43 @@ function openSourceReader(source) {
   }, { returnPanel: "sources", sourceOnly: true });
 }
 
+function locateEvidenceReaderQuote(readerDocument, citation) {
+  const quote = String(citation.exact_quote || citation.matched_text || "").replace(/\s+/g, "");
+  const fullText = readerDocument?.querySelector("[data-scansci-source-text]");
+  const textNode = fullText?.firstChild;
+  if (quote.length < 12 || textNode?.nodeType !== 3) return false;
+  const source = textNode.textContent || "";
+  const offsets = [];
+  const normalized = [];
+  for (let index = 0; index < source.length; index += 1) {
+    if (/\s/.test(source[index])) continue;
+    offsets.push(index);
+    normalized.push(source[index]);
+  }
+  const searchable = normalized.join("");
+  const start = searchable.indexOf(quote);
+  if (start < 0 || searchable.indexOf(quote, start + 1) >= 0) return false;
+  const highlight = readerDocument.createElement("mark");
+  highlight.id = String(citation.html_anchor || "");
+  highlight.dataset.scansciFallbackMatch = "true";
+  const range = readerDocument.createRange();
+  range.setStart(textNode, offsets[start]);
+  range.setEnd(textNode, offsets[start + quote.length - 1] + 1);
+  range.surroundContents(highlight);
+  fullText.closest("details")?.setAttribute("open", "");
+  readerDocument.querySelector(".empty")?.setAttribute("hidden", "");
+  return true;
+}
+
+function centerEvidenceReaderAnchor() {
+  const anchor = String(state.activeEvidence?.html_anchor || "");
+  const frame = byId("evidenceReaderFrame");
+  if (!anchor || state.contextPanel !== "evidence" || !frame?.contentDocument) return;
+  frame.contentDocument.getElementById(anchor)?.scrollIntoView({ block: "center", inline: "nearest" });
+}
+
 function showEvidenceReader(citation, options = {}) {
+  hideCitationPreview();
   const target = byId("evidenceReaderPanel");
   const reader = safeReaderUrl(citation);
   if (!target || !reader) {
@@ -1580,11 +1771,69 @@ function showEvidenceReader(citation, options = {}) {
   state.activeEvidence = { ...citation, reader_url: reader, sourceOnly: Boolean(options.sourceOnly) };
   const quote = String(citation.exact_quote || "已打开来源全文；被回答使用的原文会以高亮显示。") || "已打开来源全文。";
   const meta = evidenceMeta(citation);
-  const anchorNote = citation.html_anchor ? "已定位至该回答使用的原文片段" : "正在显示来源全文";
+  const anchorNote = citation.html_anchor ? "正在定位该回答使用的原文片段" : "正在显示来源全文";
+  const context = citationContextMarkup(citation, 460);
+  const details = evidenceDetailsMarkup(citation, true);
   const original = String(citation.original_url || "");
   const tabs = original ? `<div class="evidence-reader-tabs"><button type="button" class="is-active" data-action="show-evidence-blocks">证据定位</button><button type="button" data-action="show-evidence-original" data-original-url="${escapeHtml(original)}">原始文件</button></div>` : "";
-  target.innerHTML = `<header class="evidence-reader-head"><button type="button" class="evidence-reader-back" data-action="close-evidence-reader" aria-label="返回来源列表">←</button><div><span>${options.sourceOnly ? "来源全文" : "引用证据"}</span><h2>${escapeHtml(sourceTitle(citation))}</h2><p>${escapeHtml(meta || anchorNote)}</p></div></header>${tabs}<div class="evidence-reader-summary"><span>${escapeHtml(anchorNote)}</span><blockquote>${escapeHtml(compact(quote, 680))}</blockquote>${evidenceDetailsMarkup(citation)}</div><div class="evidence-reader-frame-wrap"><iframe class="evidence-reader-frame" id="evidenceReaderFrame" title="${escapeHtml(sourceTitle(citation))} 的来源全文" src="${escapeHtml(evidenceReaderFrameUrl(reader))}" sandbox="allow-same-origin"></iframe></div>`;
+  target.innerHTML = `<header class="evidence-reader-head"><button type="button" class="evidence-reader-back" data-action="close-evidence-reader" aria-label="返回来源列表">←</button><div><span>${options.sourceOnly ? "来源全文" : "原文全文 · 命中定位"}</span><p>${escapeHtml(!options.sourceOnly && meta ? `命中章节：${meta}` : anchorNote)}</p></div>${details}</header>${tabs}<div class="evidence-reader-summary" hidden role="status"><span class="evidence-reader-fallback-label">原文暂时无法显示；以下是保存的证据摘录</span>${options.sourceOnly ? "" : context || `<blockquote>${escapeHtml(compact(quote, 680))}</blockquote>`}</div><div class="evidence-reader-frame-wrap"><iframe class="evidence-reader-frame" id="evidenceReaderFrame" title="${escapeHtml(sourceTitle(citation))} 的来源全文" src="${escapeHtml(evidenceReaderFrameUrl(reader))}" sandbox="allow-same-origin"></iframe></div>`;
   setContextPanel("evidence");
+  const frame = target.querySelector(".evidence-reader-frame");
+  const fallback = target.querySelector(".evidence-reader-summary");
+  const frameWrap = target.querySelector(".evidence-reader-frame-wrap");
+  const heading = target.querySelector(".evidence-reader-head span");
+  const subtitle = target.querySelector(".evidence-reader-head p");
+  const showReaderState = (available, located, mode = "anchor") => {
+    fallback.hidden = available && located;
+    frameWrap.hidden = !available;
+    if (!options.sourceOnly) {
+      if (mode === "text") {
+        heading.textContent = "转换文本 · 引文定位";
+        subtitle.textContent = located
+          ? "原证据锚点不可用，已按引文文字定位"
+          : "证据块索引不可用，可浏览转换文本";
+      } else if (mode === "original") {
+        heading.textContent = "原始文件";
+        subtitle.textContent = available ? "正在显示原始文件" : "原始文件无法显示";
+      } else {
+        heading.textContent = "原文全文 · 证据定位";
+        subtitle.textContent = !located && available ? "当前来源无法定位这条引用" : meta ? `命中章节：${meta}` : anchorNote;
+      }
+    }
+    if (!fallback.hidden) {
+      let message = available
+        ? "当前来源无法定位这条引用；以下是保存的证据摘录"
+        : options.sourceOnly ? "来源全文暂时无法显示" : "原文暂时无法显示；以下是保存的证据摘录";
+      if (mode === "original" && !available) {
+        message = options.sourceOnly ? "原始文件无法显示" : "原始文件无法显示；以下是保存的证据摘录";
+      }
+      fallback.querySelector(".evidence-reader-fallback-label").textContent = message;
+    }
+  };
+  frame.addEventListener("load", () => {
+    if (target.querySelector('.evidence-reader-tabs button.is-active')?.dataset.action === "show-evidence-original") {
+      const failed = frame.contentDocument?.contentType === "application/json";
+      showReaderState(!failed, !failed, "original");
+      return;
+    }
+    const readerDocument = frame.contentDocument;
+    const available = Boolean(readerDocument?.querySelector('style[data-scansci-reader-theme="true"]'));
+    const anchorLocated = Boolean(citation.html_anchor && readerDocument?.getElementById(citation.html_anchor));
+    const textLocated = available && !anchorLocated && Boolean(citation.html_anchor)
+      && locateEvidenceReaderQuote(readerDocument, citation);
+    const located = !citation.html_anchor || anchorLocated || textLocated;
+    const textMode = Boolean(readerDocument?.querySelector("[data-scansci-source-text]"))
+      && !readerDocument?.querySelector("[data-evidence-id]");
+    if (textMode) {
+      readerDocument.querySelector("[data-scansci-source-text]")?.closest("details")?.setAttribute("open", "");
+      readerDocument.querySelector(".empty")?.setAttribute("hidden", "");
+    }
+    const firstTab = target.querySelector('[data-action="show-evidence-blocks"]');
+    if (firstTab) firstTab.textContent = textLocated || textMode ? "转换文本" : "证据定位";
+    showReaderState(available, located, textLocated || (textMode && !anchorLocated) ? "text" : "anchor");
+    if (available && located && citation.html_anchor) window.requestAnimationFrame(centerEvidenceReaderAnchor);
+  });
+  frame.addEventListener("error", () => showReaderState(false, false));
 }
 
 function closeEvidenceReader() {
@@ -2149,6 +2398,11 @@ function renderUpdateSurfaces() {
 }
 
 async function refreshAppUpdate({ quiet = false } = {}) {
+  if (window.pywebview?.api?.toggle_browser && !window.pywebview?.api?.install_update) {
+    state.update = { state: "idle", available: false, message: "Electron 预览版暂不支持自动更新。" };
+    renderUpdateSurfaces();
+    return;
+  }
   if (!quiet) {
     state.update = { ...state.update, state: "checking", message: "正在检查 ScanSci 更新。" };
     renderUpdateSurfaces();
@@ -2218,6 +2472,7 @@ const BOOTSTRAP_PROVIDER_DEFINITIONS = [
   { id: "gemini", name: "Google Gemini", category: "国际模型", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", modelId: "gemini-3.1-pro-preview", modelName: "Gemini 3.1 Pro" },
   { id: "vertex-ai", name: "Google Vertex AI", category: "国际模型", modelId: "gemini-3.1-pro-preview", modelName: "Gemini 3.1 Pro" },
   { id: "openrouter", name: "OpenRouter", category: "模型聚合", baseUrl: "https://openrouter.ai/api/v1", modelId: "openai/gpt-5.2", modelName: "OpenAI GPT-5.2" },
+  { id: "l0veyou", name: "l0veyou", category: "模型聚合", baseUrl: "https://l0veyou.com/v1", modelId: "openai/gpt-6-luna", modelName: "GPT-6 Luna", capabilities: ["reasoning"] },
   { id: "opencode-go", name: "OpenCode Go", category: "订阅模型", baseUrl: "https://opencode.ai/zen/go/v1", apiSurface: "auto", modelId: "glm-5.3-flash", modelName: "GLM-5.3 Flash" },
   { id: "nvidia", name: "NVIDIA NIM", category: "国际模型", baseUrl: "https://integrate.api.nvidia.com/v1", modelId: "meta/llama-3.3-70b-instruct", modelName: "Llama 3.3 70B Instruct" },
   { id: "deepseek", name: "DeepSeek", category: "国内直连", baseUrl: "https://api.deepseek.com", modelId: "deepseek-v4-flash", modelName: "DeepSeek V4 Flash" },
@@ -2364,23 +2619,6 @@ function mergeProviderCatalogIntoSettings(settings, presets) {
   return { ...base, providers: mergedProviders };
 }
 
-function renderRuntimeBadge() {
-  const badge = byId("runtimeModeBadge");
-  if (!badge || !state.settings) return;
-  const desktop = Boolean(window.pywebview?.api);
-  const temporary = state.settings.workspace_profile === "temporary";
-  const mode = desktop ? "desktop" : temporary ? "preview" : "browser";
-  badge.dataset.mode = mode;
-  badge.textContent = desktop ? "桌面软件" : temporary ? "浏览器预览" : "浏览器模式";
-  badge.title = desktop
-    ? "ScanSci 桌面软件：本机密钥保存在系统凭据管理器，同一工作区会自动复用。"
-    : temporary
-      ? "临时预览工作区与桌面软件隔离，知识库和密钥不会互相覆盖。"
-      : "浏览器正在使用当前工作区；同一工作区已保存的本机密钥可复用。文件夹原位置绑定需使用桌面软件。";
-  badge.setAttribute("aria-label", badge.title);
-  badge.hidden = false;
-}
-
 async function initialize() {
   const bootstrapWarnings = [];
   const safeBootstrapRequest = async (path, fallback, label) => {
@@ -2427,7 +2665,6 @@ async function initialize() {
     // catalog contains no credentials; user-specific values still come from
     // the successful /api/settings response and remain authoritative.
     state.settings = mergeProviderCatalogIntoSettings(settings, state.presets);
-    renderRuntimeBadge();
     state.autoCheckUpdates = state.settings?.general?.updates?.auto_check !== false;
     state.selectedProviderId = state.settings.active_model?.provider_id || state.settings.providers?.[0]?.id || "";
     applyAppearancePreferences();
@@ -2547,6 +2784,7 @@ async function initialize() {
 async function ensureActiveKnowledgeIndex(requestedNotebookId = "", { force = false } = {}) {
   const notebookId = String(requestedNotebookId || state.notebook?.notebook_id || "").trim();
   if (!notebookId) return;
+  if (knowledgeSourceKind((state.workspace?.notebooks || []).find((item) => item.notebook_id === notebookId)) === "translation") return;
   try {
     // Retrying the vector index must not reload already prepared model
     // weights. Model retries have their own explicit action below.
@@ -2978,6 +3216,7 @@ function scheduleLocalAiStatusPoll(notebookId) {
 async function refreshLocalAiStatus(notebookId = state.notebook?.notebook_id || "", { prepare = false, force = false } = {}) {
   const id = String(notebookId || "").trim();
   if (!id) return null;
+  if (knowledgeSourceKind((state.workspace?.notebooks || []).find((item) => item.notebook_id === id)) === "translation") return null;
   const previous = state.localAiStatuses[id] || {};
   try {
     const result = await request(`/api/notebooks/${encodeURIComponent(id)}/local-ai-status`, {
@@ -3101,6 +3340,7 @@ async function chooseRuntimeComponentFiles(componentId) {
 async function refreshKnowledgeIndexStatus(notebookId = state.notebook?.notebook_id || "") {
   const id = String(notebookId || "").trim();
   if (!id) return null;
+  if (knowledgeSourceKind((state.workspace?.notebooks || []).find((item) => item.notebook_id === id)) === "translation") return null;
   try {
     const status = await request(`/api/notebooks/${encodeURIComponent(id)}/evidence-index`);
     state.knowledgeIndexStatuses[id] = status;
@@ -3129,6 +3369,7 @@ function renderWorkspace() {
 
 function knowledgeKind(notebook = state.notebook) {
   const kind = String(notebook?.metadata?.library_kind || "folder");
+  if (kind === "translation") return { key: kind, label: "翻译库", icon: "book" };
   if (kind === "zotero") return { key: kind, label: "Zotero", icon: "library" };
   if (kind === "obsidian") return { key: kind, label: "Obsidian", icon: "book" };
   if (kind === "notion") return { key: kind, label: "Notion", icon: "book" };
@@ -3158,6 +3399,7 @@ function sanitizeKnowledgeScopeIds(ids = state.knowledgeScopeIds || []) {
 
 function unavailableKnowledgeAction(notebook) {
   switch (knowledgeSourceKind(notebook)) {
+    case "translation": return "knowledge-scope-unavailable";
     case "zotero": return "choose-zotero-library";
     case "obsidian": return "choose-obsidian-vault";
     case "notion": return "connect-notion";
@@ -3167,6 +3409,7 @@ function unavailableKnowledgeAction(notebook) {
 
 function unavailableKnowledgeLabel(notebook) {
   switch (knowledgeSourceKind(notebook)) {
+    case "translation": return "暂无译文";
     case "zotero": return "连接 Zotero";
     case "obsidian": return "选择 Vault";
     case "notion": return "连接 Notion";
@@ -3227,6 +3470,10 @@ function knowledgeLocalBindingSummary(notebook) {
 function knowledgeConnectionStatus(notebook) {
   const metadata = notebook?.metadata || {};
   const kind = knowledgeSourceKind(notebook);
+  if (kind === "translation") {
+    const files = Number(notebook?.translation_files?.length || 0);
+    return { state: files ? "connected" : "empty", label: files ? `已关联 · ${files} 份译文 PDF` : "暂无译文" };
+  }
   const count = Number(notebook?.counts?.sources || 0);
   const bindings = knowledgeLocalBindings(notebook);
   const zotero = metadata.zotero || {};
@@ -3248,6 +3495,7 @@ function knowledgeConnectionStatus(notebook) {
       label: `${connected ? "已连接" : "已有资料"} · ${count} 个可检索文档`,
     };
   }
+  if (kind === "translation") return { state: "empty", label: "暂无译文" };
   if (connected && indexing) return { state: "indexing", label: "已连接 · 正在建立索引" };
   if (connected && kind === "zotero") {
     return {
@@ -3600,6 +3848,7 @@ function renderKnowledgeScopeDialog() {
 }
 
 function knowledgeLogoUrl(kind) {
+  if (kind === "translation") return "/pdf-document.svg";
   if (kind === "zotero") return "/zotero-logo.svg";
   if (kind === "obsidian") return "/obsidian-logo.svg";
   if (kind === "notion") return "/notion-logo.png";
@@ -3654,10 +3903,19 @@ function composerModelAvailability(model, provider) {
   const enabled = model.enabled !== false;
   const available = model.available !== false && String(model.readiness || "production") === "production";
   const selectable = enabled && available && isProviderUsable(provider);
+  const detail = selectable
+    ? "文生图 · 仅使用本条文字描述"
+    : !enabled
+      ? "该模型已停用，可在模型服务中重新启用。"
+      : !available
+        ? model.unavailable_reason || "该图像模型当前不可用，请在模型服务中检查状态。"
+        : provider?.auth_mode === "key" && !provider.api_key_configured
+          ? `${provider.name} 未配置 API 密钥，请在模型服务中填写。`
+          : state.modelHealth?.providers?.[provider?.id]?.detail || "图像服务尚未就绪，请在模型服务中检查状态。";
   return {
     visible: Boolean(provider?.enabled), selectable,
     label: selectable ? "" : !enabled ? "已停用" : !available ? "不可用" : "待配置",
-    detail: selectable ? "文生图 · 仅使用本条文字描述" : model.unavailable_reason || "请在模型服务中检查模型状态和图像服务配置。",
+    detail,
   };
 }
 
@@ -3929,6 +4187,7 @@ function renderModelSelectors() {
   });
   renderThinkingSelectors();
   setWebSearchMode(state.webSearchMode, { announce: false });
+  setAgentMode(state.agentMode, { announce: false });
   renderContextUsage();
   if (selectedComposerImageModel()) {
     ["homeQuestionInput", "chatQuestionInput"].forEach(id => {
@@ -4007,6 +4266,7 @@ function composerModelMenuMarkup(current = {}) {
     const local = isLocalModelProvider(provider);
     if (!local && !isProviderUsable(provider) && !(provider.enabled && provider.models?.some(m => m.capabilities?.includes("image")))) continue;
     const models = (provider.models || [])
+      .filter((model) => model.show_in_composer !== false)
       .map((model) => ({ model, availability: composerModelAvailability(model, provider) }))
       .filter(({ model, availability }) => availability.visible && (local || availability.selectable || model.capabilities?.includes("image")));
     if (!models.length) continue;
@@ -4028,9 +4288,13 @@ function composerModelMenuMarkup(current = {}) {
         model.capabilities?.includes("vision") ? '<span class="composer-model-tag">\u89c6\u89c9</span>' : "",
         model.capabilities?.includes("audio") ? '<span class="composer-model-tag">\u8bed\u97f3</span>' : "",
       ].join("");
-      const detail = availability.selectable && !model.capabilities?.includes("image") ? "" : availability.detail;
-      const status = availability.selectable ? "" : `<span class="composer-model-status">${escapeHtml(availability.label)}</span>`;
-      return `<button type="button" class="composer-model-option ${selected ? "is-selected" : ""} ${availability.selectable ? "" : "is-unavailable"}" data-action="select-composer-model" data-model-value="${escapeHtml(`${provider.id}::${model.id}`)}" role="option" aria-selected="${selected ? "true" : "false"}" ${availability.selectable ? "" : "disabled aria-disabled=\"true\""} title="${escapeHtml(detail)}"><span class="composer-model-option-main"><strong>${escapeHtml(model.name || model.id)}</strong>${detail ? `<small>${escapeHtml(detail)}</small>` : ""}</span><span class="composer-model-option-meta">${tags}${status}</span><span class="composer-model-check" aria-hidden="true">${uiIcon("check")}</span></button>`;
+      const name = escapeHtml(model.name || model.id);
+      if (!availability.selectable) {
+        const reason = escapeHtml(availability.detail || availability.label || "模型暂不可用，请到模型服务检查状态。");
+        return `<details class="composer-model-reason"><summary class="composer-model-option is-unavailable" aria-label="查看 ${name} 不可用的原因"><span class="composer-model-option-main"><strong>${name}</strong></span><span class="composer-model-option-meta">${tags}<span class="composer-model-warning" title="${reason}" aria-hidden="true">${uiIcon("circle-alert")}</span></span></summary><div class="composer-model-reason-detail">${reason}</div></details>`;
+      }
+      const detail = model.capabilities?.includes("image") ? availability.detail : "";
+      return `<button type="button" class="composer-model-option ${selected ? "is-selected" : ""}" data-action="select-composer-model" data-model-value="${escapeHtml(`${provider.id}::${model.id}`)}" role="option" aria-selected="${selected ? "true" : "false"}" title="${escapeHtml(detail)}"><span class="composer-model-option-main"><strong>${name}</strong>${detail ? `<small>${escapeHtml(detail)}</small>` : ""}</span><span class="composer-model-option-meta">${tags}</span><span class="composer-model-check" aria-hidden="true">${uiIcon("check")}</span></button>`;
     }).join("");
     const singleName = group.entries.length === 1 ? group.entries[0].model.name || group.entries[0].model.id : "";
     const groupLabel = singleName && String(group.name || "").localeCompare(String(singleName), undefined, { sensitivity: "base" }) === 0
@@ -4038,22 +4302,13 @@ function composerModelMenuMarkup(current = {}) {
       : `<span>${escapeHtml(group.name)}</span>`;
     return `<section class="composer-model-group">${groupLabel}${rows}</section>`;
   }).join("");
-  const empty = groups || '<div class="composer-model-empty">暂无可用的对话或生图模型</div>';
+  const empty = groups || '<div class="composer-model-empty">对话候选中暂无模型，可在模型服务中重新显示</div>';
   const webMode = Object.hasOwn(webSearchLabels, state.webSearchMode) ? state.webSearchMode : "auto";
   const webOptions = [
     ["auto", "自动"],
     ["on", "开启"],
     ["off", "关闭"],
   ].map(([value, label]) => `<button type="button" class="web-search-option ${webMode === value ? "is-selected" : ""}" data-action="select-web-search" data-web-search-value="${value}" role="option" aria-selected="${webMode === value ? "true" : "false"}">${label}</button>`).join("");
-  const installedSnapshots = Array.isArray(state.localModelMarket?.installed) ? state.localModelMarket.installed : [];
-  const readyConversationSnapshots = installedSnapshots.filter((item) => {
-    if (!item?.ready || item?.runtime_compatible === false) return false;
-    const capabilities = Array.isArray(item?.capabilities) ? item.capabilities : [];
-    return capabilities.includes("chat") || capabilities.includes("vision") || item?.kind === "vision";
-  }).length;
-  const localInventoryNote = installedSnapshots.length
-    ? `<p class="composer-model-note">\u672c\u673a\u5df2\u53d1\u73b0 ${installedSnapshots.length} \u4e2a\u6a21\u578b\u5feb\u7167\uff1b\u5176\u4e2d ${readyConversationSnapshots} \u4e2a\u53ef\u4f5c\u4e3a\u5bf9\u8bdd/\u89c6\u89c9\u5165\u53e3\u3002\u6682\u4e0d\u53ef\u7528\u7684\u5bf9\u8bdd\u6a21\u578b\u4f1a\u663e\u793a\u539f\u56e0\uff1b\u5d4c\u5165\u3001\u91cd\u6392\u548c\u8bed\u97f3\u7b49\u4e13\u7528\u6a21\u578b\u7531 Agent \u6309\u9700\u8c03\u7528\u3002</p>`
-    : "";
   return `<div class="composer-settings-panel">
     ${selectedComposerImageModel() ? "" : `<section class="composer-settings-section web-search-picker" data-web-search-picker>
       <header><span data-ui-icon="globe"></span><span>联网搜索</span></header>
@@ -4064,11 +4319,11 @@ function composerModelMenuMarkup(current = {}) {
       <div class="composer-thinking-popover composer-segmented-control" role="listbox" aria-label="调整思考等级"></div>
     </section>`}
     <section class="composer-settings-models">
-      <header><span>可用模型</span></header>
+      <header><span>模型</span></header>
       ${empty}
       <div class="composer-model-manage"><button type="button" data-action="open-settings" data-settings-panel="models">${uiIcon("plus")}管理模型</button></div>
     </section>
-  </div>`.replace('<div class="composer-model-manage">', `${localInventoryNote}<div class="composer-model-manage">`);
+  </div>`;
 }
 
 async function setActiveComposerModel(value) {
@@ -4079,7 +4334,7 @@ async function setActiveComposerModel(value) {
   if (!providerId || !modelId) return;
   const provider = state.settings?.providers?.find(p => p.id === providerId);
   const model = provider?.models?.find(m => m.id === modelId);
-  if (!model || !composerModelAvailability(model, provider).selectable) throw Error("所选模型尚不可用，请先完成模型服务配置。");
+  if (!model || model.show_in_composer === false || !composerModelAvailability(model, provider).selectable) throw Error("所选模型尚不可用，请先完成模型服务配置。");
   state.composerImageModel = model.capabilities?.includes("image") ? String(value) : "";
   window.localStorage.setItem("scansci.composer.image-model", state.composerImageModel);
   if (state.composerImageModel) {
@@ -4164,10 +4419,11 @@ function composerImagePreviewMarkup(images = []) {
 function composerSourcePreviewMarkup(sources = []) {
   if (!sources.length) return "";
   return `<div class="user-source-preview">${sources.map((source) => {
-    const label = `${uiIcon("file-plus")}${escapeHtml(source.name || "附件")}`;
+    const name = source.name || "附件";
+    const label = `${fileTypeIconMarkup(name)}<span class="source-file-name">${escapeHtml(name)}</span>`;
     return source.file_url
-      ? `<button type="button" data-action="open-ingestion-source" data-source-url="${escapeHtml(source.file_url)}" data-source-name="${escapeHtml(source.name || "附件")}">${label}</button>`
-      : `<span>${label}</span>`;
+      ? `<button type="button" class="user-source-file" data-action="open-ingestion-source" data-source-url="${escapeHtml(source.file_url)}" data-source-name="${escapeHtml(name)}" title="${escapeHtml(name)}">${label}</button>`
+      : `<span class="user-source-file" title="${escapeHtml(name)}">${label}</span>`;
   }).join("")}</div>`;
 }
 
@@ -4176,7 +4432,7 @@ function renderComposerImages(key) {
   if (!target) return;
   const images = state.composerImages[key] || [];
   target.hidden = !images.length;
-  target.innerHTML = images.map((image) => `<figure class="composer-image-card"><img src="${escapeHtml(image.data_url)}" alt="${escapeHtml(image.name)}" /><figcaption>${escapeHtml(image.name)}</figcaption><button type="button" data-action="remove-composer-image" data-composer-key="${key}" data-image-id="${escapeHtml(image.id)}" aria-label="移除 ${escapeHtml(image.name)}">×</button></figure>`).join("");
+  target.innerHTML = images.map((image) => `<figure class="composer-image-card"><img src="${escapeHtml(image.data_url)}" alt="${escapeHtml(image.name)}" /><figcaption>${escapeHtml(image.name)}</figcaption><button type="button" data-action="remove-composer-image" data-composer-key="${key}" data-image-id="${escapeHtml(image.id)}" aria-label="移除 ${escapeHtml(image.name)}">${uiIcon("x")}</button></figure>`).join("");
 }
 
 function fileToDataUrl(file, errorMessage = "无法读取附件") {
@@ -4270,7 +4526,7 @@ function renderComposerSources(key) {
   if (!target) return;
   const sources = state.composerSources[key] || [];
   target.hidden = !sources.length;
-  const cards = sources.map((source) => `<article class="composer-source-card ${sourceSuffix(source.name) === ".pdf" ? "is-pdf" : ""}"><img src="${sourceSuffix(source.name) === ".pdf" ? "/pdf-document.svg" : "/knowledge-personal.svg"}" alt="" /><span><strong>${escapeHtml(source.name)}</strong><small>${escapeHtml(sourceTypeLabel(source.name))} · ${escapeHtml(formatFileSize(source.size))}</small></span><button type="button" data-action="remove-composer-source" data-composer-key="${escapeHtml(key)}" data-source-id="${escapeHtml(source.id)}" aria-label="移除 ${escapeHtml(source.name)}">×</button></article>`).join("");
+  const cards = sources.map((source) => `<article class="composer-source-card">${fileTypeIconMarkup(source.name)}<span><strong title="${escapeHtml(source.name)}">${escapeHtml(source.name)}</strong><small>${escapeHtml(sourceTypeLabel(source.name))} · ${escapeHtml(formatFileSize(source.size))}</small></span><button type="button" data-action="remove-composer-source" data-composer-key="${escapeHtml(key)}" data-source-id="${escapeHtml(source.id)}" aria-label="移除 ${escapeHtml(source.name)}">${uiIcon("x")}</button></article>`).join("");
   const firstName = sources[0]?.name || "当前文件";
   const suggestions = sources.length === 1
     ? `<nav class="composer-file-suggestions" aria-label="基于文件继续"><button type="button" data-action="use-file-suggestion" data-composer-key="${escapeHtml(key)}" data-file-name="${escapeHtml(firstName)}" data-suggestion="总结">总结</button><button type="button" data-action="use-file-suggestion" data-composer-key="${escapeHtml(key)}" data-file-name="${escapeHtml(firstName)}" data-suggestion="提取要点">提取要点</button><button type="button" data-action="use-file-suggestion" data-composer-key="${escapeHtml(key)}" data-file-name="${escapeHtml(firstName)}" data-suggestion="生成综述">生成综述</button></nav>`
@@ -4514,7 +4770,7 @@ async function browserRecordingToWavFile(recordedBlob, stem) {
 
 function composerAudioPreviewMarkup(audio = []) {
   if (!audio.length) return "";
-  return `<div class="user-audio-preview-list">${audio.map((item) => `<span class="user-audio-preview"><span>${uiIcon("file-audio")}</span><strong>${escapeHtml(item.name || "语音")}</strong></span>`).join("")}</div>`;
+  return `<div class="user-audio-preview-list">${audio.map((item) => `<span class="user-audio-preview">${fileTypeIconMarkup(item.name || "语音.wav")}<strong>${escapeHtml(item.name || "语音")}</strong></span>`).join("")}</div>`;
 }
 
 function renderComposerRecordingControl(key) {
@@ -4544,7 +4800,7 @@ function renderComposerAudio(key) {
   const audio = state.composerAudio[key] || [];
   if (target) {
     target.hidden = !audio.length;
-    target.innerHTML = audio.map((item) => `<article class="composer-audio-card"><span class="composer-audio-icon">${uiIcon("file-audio")}</span><span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(formatFileSize(item.size))}</small></span><button type="button" data-action="remove-composer-audio" data-composer-key="${escapeHtml(key)}" data-audio-id="${escapeHtml(item.id)}" aria-label="移除 ${escapeHtml(item.name)}">×</button></article>`).join("");
+    target.innerHTML = audio.map((item) => `<article class="composer-audio-card">${fileTypeIconMarkup(item.name)}<span><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(formatFileSize(item.size))}</small></span><button type="button" data-action="remove-composer-audio" data-composer-key="${escapeHtml(key)}" data-audio-id="${escapeHtml(item.id)}" aria-label="移除 ${escapeHtml(item.name)}">${uiIcon("x")}</button></article>`).join("");
   }
   renderComposerRecordingControl(key);
 }
@@ -4912,6 +5168,7 @@ function installContextPanelResizer() {
     byId("conversationLayout")?.classList.remove("is-resizing-context-panel");
     if (event?.pointerId !== undefined && resizer.hasPointerCapture(event.pointerId)) resizer.releasePointerCapture(event.pointerId);
     applyContextPanelWidth({ persist: true });
+    window.requestAnimationFrame(centerEvidenceReaderAnchor);
   };
   resizer.addEventListener("pointerdown", (event) => {
     if (event.button !== 0 || !canResizeContextPanel()) return;
@@ -4947,8 +5204,12 @@ function installContextPanelResizer() {
       setCurrentContextPanelWidth(maxContextPanelWidth());
     } else return;
     applyContextPanelWidth({ persist: true });
+    window.requestAnimationFrame(centerEvidenceReaderAnchor);
   });
-  window.addEventListener("resize", () => applyContextPanelWidth());
+  window.addEventListener("resize", () => {
+    applyContextPanelWidth();
+    window.requestAnimationFrame(centerEvidenceReaderAnchor);
+  });
 }
 
 async function controlDesktopWindow(method) {
@@ -5012,6 +5273,7 @@ function setView(name, { record = true } = {}) {
   byId("workbench").classList.toggle("is-settings", name === "settings");
   updateSidebarNavigation();
   document.querySelectorAll(".app-view").forEach((view) => view.classList.toggle("is-active", view.dataset.view === name));
+  if (name === "conversation") scheduleConversationTurnNav();
   document.documentElement.scrollTop = 0;
   if (name === "settings") {
     renderSettings();
@@ -5019,9 +5281,6 @@ function setView(name, { record = true } = {}) {
     if (settingsContent) {
       settingsContent.scrollTop = 0;
       settingsContent.scrollLeft = 0;
-    }
-    if (state.activeSettings === "local-models" && !state.localModelMarket?.loaded && !state.localModelMarket?.loading) {
-      void refreshLocalModelMarket().catch((error) => toast(error.message, true));
     }
   }
   if (name === "mode") renderMode();
@@ -5047,6 +5306,14 @@ function updateSidebarNavigation() {
 function openMode(mode) {
   state.activeMode = mode;
   setView("mode");
+  if (mode === "library" && knowledgeSourceKind(state.notebook) === "translation") void refreshTranslationLibrary();
+}
+
+async function refreshTranslationLibrary() {
+  const workspace = await request("/api/workspace");
+  state.workspace = workspace;
+  state.notebook = (workspace.notebooks || []).find((item) => item.notebook_id === state.notebook?.notebook_id) || state.notebook;
+  if (state.activeView === "mode" && state.activeMode === "library") renderMode();
 }
 
 function openSettings(panel = "general") {
@@ -5200,6 +5467,7 @@ function setContextPanel(kind = "sources") {
   panel?.classList.toggle("is-hidden", hidden);
   if (panel) panel.setAttribute("aria-label", evidence ? "引用证据" : review ? "研究稿件" : preset.landmarkLabel);
   byId("conversationLayout")?.classList.toggle("is-review-workbench", review);
+  byId("conversationLayout")?.classList.toggle("is-evidence-reading", evidence);
   byId("conversationLayout")?.classList.toggle("is-direct-conversation", unavailable);
   byId("conversationLayout")?.classList.toggle("is-context-collapsed", userCollapsed);
   const toggle = byId("contextPanelToggle");
@@ -5240,6 +5508,7 @@ function toggleEvidencePanelExpanded() {
     setCurrentContextPanelWidth(Math.max(state.contextPanelWidth + 160, Math.round(maxContextPanelWidth() * 0.72)));
   }
   syncEvidencePanelExpansion();
+  window.requestAnimationFrame(centerEvidenceReaderAnchor);
 }
 
 function toggleContextPanel() {
@@ -5423,6 +5692,7 @@ async function deleteTask(runId) {
   if (!confirmed) return;
   state.historyMenuRunId = "";
   await request(`/api/runs/${encodeURIComponent(runId)}/delete`, { method: "POST", body: "{}" });
+  window.localStorage.removeItem(`scansci.task.followup.${runId}`);
   state.runs = state.runs.filter((item) => item.run_id !== runId);
   state.archivedRuns = state.archivedRuns.filter((item) => item.run_id !== runId);
   if (state.activeTaskId === runId) startTask();
@@ -5555,6 +5825,7 @@ function createDirectChatJobState({
     restartForSteer: false,
     cancelRequested: false,
     pauseRequested: false,
+    resumePending: false,
     pausedMessage,
     pausedTurn,
     sessionStats: null,
@@ -5655,6 +5926,7 @@ function directTurnConfiguration({
     question: String(question || "").trim(),
     key: key === "home" ? "home" : "chat",
     directChatMode,
+    model: modelIdentitySnapshot(),
     imageModel: selectedComposerImageModel(),
     selectedSkillIds: [...selectedSkillIds],
     selectedSkills: [...selectedSkills],
@@ -5668,6 +5940,7 @@ function directTurnConfiguration({
     knowledgeScopePayloads: selectedKnowledge.length ? activeKnowledgeScopePayloads() : [],
     thinkingLevel: currentThinkingLevel(),
     webSearch: state.webSearchMode,
+    agentMode: state.agentMode && !selectedComposerImageModel(),
     deliveryMode: "follow-up",
     createdAt: new Date().toISOString(),
   };
@@ -5762,6 +6035,9 @@ function persistedDirectTurn(raw) {
     question: String(raw.question || "").trim(),
     key: raw.key === "home" ? "home" : "chat",
     directChatMode: String(raw.directChatMode || "general"),
+    model: raw.model?.provider_id && raw.model?.model_id
+      ? { provider_id: String(raw.model.provider_id), model_id: String(raw.model.model_id) }
+      : null,
     imageModel: raw.imageModel || null,
     selectedSkillIds: Array.isArray(raw.selectedSkillIds) ? raw.selectedSkillIds : [],
     selectedSkills: Array.isArray(raw.selectedSkills) ? raw.selectedSkills : [],
@@ -5774,7 +6050,8 @@ function persistedDirectTurn(raw) {
     knowledgeScope: raw.knowledgeScope || null,
     knowledgeScopePayloads: Array.isArray(raw.knowledgeScopePayloads) ? raw.knowledgeScopePayloads : [],
     thinkingLevel: String(raw.thinkingLevel || currentThinkingLevel()),
-    webSearch: Boolean(raw.webSearch),
+    webSearch: ["auto", "on", "off"].includes(raw.webSearch) ? raw.webSearch : "auto",
+    agentMode: raw.agentMode === true,
     deliveryMode: raw.deliveryMode === "steer" ? "steer" : "follow-up",
     createdAt: String(raw.createdAt || new Date().toISOString()),
   };
@@ -5937,24 +6214,23 @@ async function generateDirectConversationTitle(job, firstQuestion, hasImages = f
         conversation_id: job.conversationId,
         question: String(firstQuestion || ""),
         has_images: Boolean(hasImages),
+        model: job.messages.find((message) => message?.role === "assistant")?.model,
       }),
     });
     const title = compact(String(result?.title || "").trim(), 120);
     if (!title) return;
+    const titleSource = String(result?.source || "model");
+    await request("/api/chat/history/" + encodeURIComponent(job.conversationId) + "/title", {
+      method: "POST",
+      body: JSON.stringify({ title, title_source: titleSource }),
+    });
     job.title = title;
-    job.titleSource = String(result?.source || "model");
+    job.titleSource = titleSource;
     upsertDirectConversation(directJobSummary(job));
     if (String(state.directConversationId || "") === String(job.conversationId)) {
       const heading = byId("conversationTitle");
       if (heading) heading.textContent = compact(title, 80);
     }
-    await request("/api/chat/history/" + encodeURIComponent(job.conversationId) + "/title", {
-      method: "POST",
-      body: JSON.stringify({
-        title,
-        title_source: job.titleSource,
-      }),
-    });
   } catch (error) {
     // The provisional first-line title remains useful when the naming call is
     // unavailable. A title request must never turn a completed chat into an
@@ -6158,6 +6434,7 @@ function restoreDirectChatJob(conversation) {
 
 async function runDirectChatTurn(job, turn) {
   if (!job || job.cancelRequested || job.pauseRequested || !turn?.question) return;
+  const selectedModel = modelIdentitySnapshot(turn.model);
   job.status = "starting";
   job.currentTurn = turn;
   job.runId = "";
@@ -6173,6 +6450,10 @@ async function runDirectChatTurn(job, turn) {
   job.piQueue = { steering: [], follow_up: [], pending_count: 0 };
   job.lastAgentControl = null;
   const priorMessages = job.messages.filter((message) => !message.streaming);
+  const priorAssistantModel = [...priorMessages].reverse().find((message) => message.role === "assistant")?.model;
+  if (priorAssistantModel?.provider_id && priorAssistantModel?.model_id && (
+    priorAssistantModel.provider_id !== selectedModel.provider_id || priorAssistantModel.model_id !== selectedModel.model_id
+  )) job.sessionId = "";
   const parentMessage = priorMessages[priorMessages.length - 1] || null;
   const userMessage = {
     message_id: turn.queueId,
@@ -6180,6 +6461,7 @@ async function runDirectChatTurn(job, turn) {
     role: "user",
     content: turn.question,
     mode: turn.directChatMode,
+    agent_mode: turn.agentMode === true,
     image_model: turn.imageModel || null,
     knowledgeScopes: turn.knowledgeScopes,
     skills: turn.selectedSkills,
@@ -6199,8 +6481,9 @@ async function runDirectChatTurn(job, turn) {
     processing_started_at: startedAt,
     mode: turn.directChatMode,
     trace: [],
+    reasoning: "",
     knowledgeScopes: turn.knowledgeScopes,
-    model: modelIdentitySnapshot(turn.imageModel),
+    model: selectedModel,
     created_at: new Date().toISOString(),
   };
   job.currentStartedAt = startedAt;
@@ -6215,18 +6498,26 @@ async function runDirectChatTurn(job, turn) {
     renderDirectConversation({ forceFollow: true });
   }
   upsertDirectConversation(directJobSummary(job));
-  persistDirectChatJob(job).catch((error) => console.warn("Running direct conversation could not be saved", error));
   renderTasks();
   let completed = false;
   try {
+    await persistDirectChatJob(job);
+    if (job.pauseRequested) {
+      const stopped = new Error("已暂停");
+      stopped.name = "AbortError";
+      throw stopped;
+    }
     await streamChatWithRecovery(
       {
         messages: promptMessages,
+        idempotency_key: turn.queueId,
         images: turn.images,
         audio: turn.audio,
         source_files: turn.sourceFiles,
         thinking_level: turn.thinkingLevel,
         chat_mode: turn.directChatMode,
+        model: { provider_id: selectedModel.provider_id, model_id: selectedModel.model_id },
+        agent_mode: turn.agentMode === true,
         ...(turn.imageModel ? { image_model: turn.imageModel, image_request_id: turn.queueId } : {}),
         web_search: turn.webSearch,
         ...(turn.notebookId ? { notebook_id: turn.notebookId } : {}),
@@ -6248,6 +6539,11 @@ async function runDirectChatTurn(job, turn) {
         }
         if (eventType === "delta" || eventType === "TEXT_MESSAGE_CONTENT") {
           streamingMessage.content += String(payload.content || payload.delta || "");
+          scheduleDirectConversationRender(job.conversationId);
+          return;
+        }
+        if (eventType === "CUSTOM" && payload.name === "model_reasoning") {
+          streamingMessage.reasoning = payload.value?.reset ? "" : streamingMessage.reasoning + String(payload.value?.delta || "");
           scheduleDirectConversationRender(job.conversationId);
           return;
         }
@@ -6397,6 +6693,8 @@ async function runDirectChatTurn(job, turn) {
             usage: result.message?.usage || streamingMessage.usage,
             artifacts: result.message?.artifacts || streamingMessage.artifacts,
             trace: result.message?.trace || streamingMessage.trace,
+            reasoning: result.message?.reasoning || streamingMessage.reasoning,
+            reasoning_open: streamingMessage.reasoning_open,
             created_at: result.message?.created_at || new Date().toISOString(),
             processing_ms: Math.max(0, Math.round(performance.now() - startedAt)),
           };
@@ -6415,19 +6713,7 @@ async function runDirectChatTurn(job, turn) {
           scheduleDirectConversationRender(job.conversationId);
         }
       },
-      {
-        signal: job.controller.signal,
-        onRetry: () => {
-          job.status = "retrying";
-          streamingMessage.content = "";
-          streamingMessage.error = "";
-          streamingMessage.failure = null;
-          streamingMessage.streaming = true;
-          job.runtimeTrace = [];
-          streamingMessage.trace = [...job.interventionTrace];
-          scheduleDirectConversationRender(job.conversationId, { forceFollow: true });
-        },
-      },
+      { signal: job.controller.signal },
     );
     if (!completed) throw new Error("模型流在最终回复到达前结束。");
   } catch (error) {
@@ -6519,7 +6805,7 @@ async function pauseDirectChatJob(conversationId = state.directConversationId) {
   job.pauseRequested = true;
   const runId = job.runId;
   job.controller?.abort();
-  request("/api/chat/pause", {
+  if (runId) request("/api/chat/pause", {
     method: "POST",
     body: JSON.stringify({ run_id: runId }),
   }).catch(() => {});
@@ -6529,21 +6815,109 @@ async function pauseDirectChatJob(conversationId = state.directConversationId) {
 
 async function resumeDirectChatJob(conversationId = state.directConversationId) {
   const job = directChatJob(conversationId);
-  if (!job || job.status !== "paused" || !job.pausedTurn) return;
-  const turn = job.pausedTurn;
-  const pausedMessage = job.pausedMessage;
-  const userMessage = [...job.messages].reverse().find((message) => (
-    message.role === "user"
-    && (message.message_id === turn.queueId || message.created_at === turn.createdAt)
-  ));
-  job.messages = job.messages.filter((message) => message !== pausedMessage && message !== userMessage);
-  job.pausedMessage = null;
-  job.pausedTurn = null;
-  job.pauseRequested = false;
-  job.status = "queued";
-  syncActiveDirectChatState();
-  renderTasks();
-  void runDirectChatTurn(job, turn);
+  if (!job || job.status !== "paused" || !job.pausedTurn || job.resumePending) return;
+  job.resumePending = true;
+  try {
+    const turn = job.pausedTurn;
+    const snapshot = await request(`/api/chat/submissions/${encodeURIComponent(turn.queueId)}?conversation_id=${encodeURIComponent(job.conversationId)}`);
+    if (snapshot.state === "running") {
+      toast("原请求仍在结束中，请稍后再检查。", true);
+      return;
+    }
+    const terminal = snapshot.terminal;
+    if (["completed", "failed"].includes(snapshot.state) && terminal && job.pausedMessage) {
+      const result = terminal.result || terminal;
+      const message = job.pausedMessage;
+      const previousMessage = { ...message };
+      const previousSessionId = job.sessionId;
+      message.paused = false;
+      message.streaming = false;
+      if (snapshot.state === "completed") {
+        Object.assign(message, result.message || {}, {
+          message_id: message.message_id,
+          parent_message_id: message.parent_message_id,
+          error: "",
+          failure: null,
+        });
+        job.sessionId = String(result.agent_runtime?.session?.session_id || job.sessionId || "");
+        job.status = job.queue.length ? "queued" : "completed";
+      } else {
+        message.error = String(terminal.message || terminal.error || "上一轮执行失败");
+        message.failure = terminal.failure || null;
+        job.status = job.queue.length ? "queued" : "failed";
+      }
+      job.pausedTurn = null;
+      job.pausedMessage = null;
+      job.currentTurn = null;
+      try {
+        await persistDirectChatJob(job);
+      } catch (error) {
+        Object.assign(message, previousMessage);
+        job.sessionId = previousSessionId;
+        job.status = "paused";
+        job.pausedTurn = turn;
+        job.pausedMessage = message;
+        job.currentTurn = turn;
+        throw error;
+      }
+      const nextTurn = job.queue.shift() || null;
+      if (nextTurn) void runDirectChatTurn(job, nextTurn);
+      else directChatJobs.delete(job.conversationId);
+      syncActiveDirectChatState();
+      scheduleDirectConversationRender(job.conversationId);
+      renderTasks();
+      return;
+    }
+    if (!["uncertain", "unreplayable", "missing", "abandoned"].includes(snapshot.state)) {
+      toast("无法确认暂停轮次的状态，请查看历史后再操作。", true);
+      return;
+    }
+    const confirmed = await requestConfirmation({
+      eyebrow: "重新生成",
+      title: "重新生成这一轮？",
+      message: "上一轮可能已经执行工具。请先检查已生成的文件或其他结果；重新生成可能再次执行相同操作。",
+      confirmLabel: "重新生成",
+      danger: true,
+    });
+    if (!confirmed) return;
+    if (snapshot.state === "missing") {
+      const fenced = await request(`/api/chat/submissions/${encodeURIComponent(turn.queueId)}/abandon`, {
+        method: "POST",
+        body: JSON.stringify({ conversation_id: job.conversationId }),
+      });
+      if (fenced.state !== "abandoned") {
+        toast("原请求状态已变化，请再次检查。", true);
+        return;
+      }
+    }
+    const userIndex = job.messages.findIndex((message) => message?.role === "user" && message.message_id === turn.queueId);
+    if (userIndex < 0) {
+      toast("找不到暂停轮次的原始消息，请重新输入。", true);
+      return;
+    }
+    const newTurn = {
+      ...turn,
+      queueId: globalThis.crypto?.randomUUID?.() || `turn-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+      createdAt: new Date().toISOString(),
+    };
+    job.branchId = globalThis.crypto?.randomUUID?.() || `branch-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    job.branchFromMessageId = turn.queueId;
+    job.branchReason = "resume_paused_turn";
+    job.messages = job.messages.slice(0, userIndex).filter((message) => message && !message.streaming);
+    job.sessionId = "";
+    job.pausedMessage = null;
+    job.pausedTurn = null;
+    job.currentTurn = null;
+    job.pauseRequested = false;
+    job.status = "queued";
+    syncActiveDirectChatState();
+    renderTasks();
+    void runDirectChatTurn(job, newTurn);
+  } catch (error) {
+    toast(error.message, true);
+  } finally {
+    job.resumePending = false;
+  }
 }
 
 // Keep the legacy action available for older rendered controls.
@@ -6666,16 +7040,29 @@ async function legacyAskQuestion(event, inputId) {
   if (["writing", "deep-research"].includes(mode)) renderReviewDocument({ title: question, status: "planning", progress: 0 }, null);
   try {
     if (isDirectConversation) {
-      const userMessage = { role: "user", content: question, images, audio, created_at: new Date().toISOString() };
+      const userMessage = {
+        role: "user", content: question, images, audio,
+        message_id: globalThis.crypto?.randomUUID?.() || `chat-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+        created_at: new Date().toISOString(),
+      };
       const messages = [...state.directMessages, userMessage];
       const startedAt = performance.now();
-      streamingMessage = { role: "assistant", content: "", streaming: true, processing_started_at: startedAt, model: modelIdentitySnapshot(), created_at: new Date().toISOString() };
+      streamingMessage = { role: "assistant", content: "", reasoning: "", streaming: true, processing_started_at: startedAt, model: modelIdentitySnapshot(), created_at: new Date().toISOString() };
       state.directMessages = [...messages, streamingMessage];
       renderDirectConversation();
       let completed = false;
-      await streamChatWithRecovery({ messages, audio, thinking_level: currentThinkingLevel(), web_search: state.webSearchMode }, (eventType, event) => {
+      await streamChatWithRecovery({
+        messages, audio, model: streamingMessage.model, thinking_level: currentThinkingLevel(),
+        web_search: state.webSearchMode,
+        idempotency_key: userMessage.message_id,
+      }, (eventType, event) => {
         if (eventType === "delta") {
           streamingMessage.content += String(event.content || "");
+          scheduleDirectConversationRender();
+          return;
+        }
+        if (eventType === "CUSTOM" && event.name === "model_reasoning") {
+          streamingMessage.reasoning = event.value?.reset ? "" : streamingMessage.reasoning + String(event.value?.delta || "");
           scheduleDirectConversationRender();
           return;
         }
@@ -6685,6 +7072,8 @@ async function legacyAskQuestion(event, inputId) {
             ...event.message,
             model: modelIdentitySnapshot(event.model || event.message?.model || streamingMessage.model),
             usage: event.message?.usage || streamingMessage.usage,
+            reasoning: event.message?.reasoning || streamingMessage.reasoning,
+            reasoning_open: streamingMessage.reasoning_open,
             created_at: event.message?.created_at || new Date().toISOString(),
             processing_ms: Math.max(0, Math.round(performance.now() - startedAt)),
           };
@@ -6737,6 +7126,7 @@ async function legacyAskQuestion(event, inputId) {
       }, {
         onRetry: () => {
           streamingMessage.content = "";
+          streamingMessage.reasoning = "";
           streamingMessage.error = "";
           streamingMessage.failure = null;
           streamingMessage.streaming = true;
@@ -6862,7 +7252,7 @@ async function askQuestion(event, inputId) {
       : `请阅读《${sourceFiles[0].name}》并概括最重要的信息。`
     : images.length ? "请分析我粘贴的图片。" : audio.length ? "请根据我上传的语音回答。" : "");
   if (!question) return;
-  if (inputId === "homeQuestionInput" && state.onboardingOpen && state.onboardingMode === "welcome") {
+  if (state.onboardingOpen && state.onboardingMode === "welcome") {
     await finishFirstRun("已开始研究", { focusComposer: false });
   }
   let mode = ["research", "academic"].includes(selectedMode) ? resolveResearchComposerMode(question) : selectedMode;
@@ -6904,13 +7294,13 @@ async function askQuestion(event, inputId) {
   const selectedKnowledge = imageSelection ? [] : selectedKnowledgeNotebooks();
   const searchableKnowledgeSelected = selectedKnowledge.some((notebook) => Number(notebook.counts?.sources || 0) > 0);
   const writingArtifactRoute = !imageSelection && !isTaskFollowUp && !isReviewWorkflow && !images.length && !sourceFiles.length && !audio.length
-    ? academicWritingArtifactRoute(mode, question, { searchableKnowledgeSelected })
+    ? (state.agentMode ? null : academicWritingArtifactRoute(mode, question, { searchableKnowledgeSelected }))
     : null;
   let routedTask = null;
   // General input stays general by default.  For an explicit, multi-step
   // product request the host may offer a durable route; the server repeats
   // this decision when creating the run, so this preview is never authority.
-  if (!imageSelection && selectedMode === "general" && !activeConversationJob && !hasExistingDirectHistory && !isTaskFollowUp && !isReviewWorkflow && !images.length && !sourceFiles.length && !audio.length) {
+  if (!state.agentMode && !imageSelection && selectedMode === "general" && !activeConversationJob && !hasExistingDirectHistory && !isTaskFollowUp && !isReviewWorkflow && !images.length && !sourceFiles.length && !audio.length) {
     try {
       const decision = await previewFreeformTask(question, selectedSkillIds);
       if (decision?.route === "durable_run" && decision?.workflow_type) {
@@ -7096,6 +7486,10 @@ async function askQuestion(event, inputId) {
       return;
     }
     if (isTaskFollowUp && activeRun) {
+      if (!input.value.trim()) {
+        input.value = question;
+        input.dispatchEvent(new Event("input", { bubbles: true }));
+      }
       renderFailedTaskFollowUp(activeRun, question, error, selectedSkills);
     } else if (isDirectConversation && streamingMessage) {
       streamingMessage.streaming = false;
@@ -7313,21 +7707,25 @@ function compactProcessTrace(message) {
   return unique.slice(-8);
 }
 
-function processTraceMarkup(message, duration) {
+function processTraceMarkup(message, duration, messageIndex = null) {
   const trace = compactProcessTrace(message);
+  const reasoning = String(message.reasoning || "");
   const rawTraceCount = Array.isArray(message.trace) ? message.trace.length : trace.length;
   const live = Boolean(message.streaming && Number(message.processing_started_at || 0));
-  if (!trace.length && !live && duration <= 0) return "";
+  if (!trace.length && !reasoning && !live && duration <= 0) return "";
   const liveDuration = live ? Math.max(0, performance.now() - Number(message.processing_started_at)) : duration;
   const latest = trace.length ? trace[trace.length - 1] : null;
-  const phase = latest?.title ? escapeHtml(latest.title) : "";
+  const phase = latest?.title ? escapeHtml(latest.title) : reasoning ? (live ? "思考中" : "模型思考") : "";
   const phasePrefix = phase ? `${phase} · ` : "";
   const recordCount = rawTraceCount > 0 ? ` · ${rawTraceCount} 条记录` : "";
   const status = live
     ? `${phasePrefix}已处理 <time data-processing-timer="${escapeHtml(String(message.processing_started_at))}">${formatProcessingDuration(liveDuration)}</time>${recordCount}`
     : duration > 0 ? `${phasePrefix}已处理 <time>${formatProcessingDuration(duration)}</time>${recordCount}` : `${phase || "正在处理"}${recordCount}`;
   const rows = trace.map((item) => `<li><strong>${escapeHtml(item.title || "处理步骤")}</strong><span>${escapeHtml(item.detail || "")}</span></li>`).join("");
-  return `<details class="answer-processing ${live ? "is-live" : ""}" aria-label="本次对话处理过程"><summary>${status}${uiIcon("chevron-right", "answer-processing-chevron")}</summary>${rows ? `<ol>${rows}</ol>` : ""}</details>`;
+  const thought = reasoning ? `<div class="answer-reasoning" aria-label="模型思考内容">${escapeHtml(reasoning)}</div>` : "";
+  const isOpen = typeof message.reasoning_open === "boolean" ? message.reasoning_open : live && (trace.length || reasoning);
+  const indexAttribute = messageIndex === null ? "" : ` data-message-index="${messageIndex}"`;
+  return `<details class="answer-processing ${live ? "is-live" : ""}"${indexAttribute} ${isOpen ? "open" : ""} aria-label="本次对话处理过程"><summary>${status}${uiIcon("chevron-right", "answer-processing-chevron")}</summary>${rows ? `<ol>${rows}</ol>` : ""}${thought}</details>`;
 }
 
 function reuseImagePrompt(prompt) {
@@ -7421,8 +7819,8 @@ function renderDirectLiveControls() {
     surface.classList.remove("has-queue");
     form?.classList.add("has-live-direct-job");
     form?.classList.remove("has-queued-direct-turn");
-    if (input) input.placeholder = paused ? "点击播放键继续当前回复" : "输入下一条消息";
-    if (send) send.setAttribute("aria-label", paused ? "继续回复" : "发送下一条消息");
+    if (input) input.placeholder = paused ? "点击播放键检查结果或重新生成" : "输入下一条消息";
+    if (send) send.setAttribute("aria-label", paused ? "检查暂停结果" : "发送下一条消息");
     renderComposerSendButtons();
     return;
   }
@@ -7440,8 +7838,8 @@ function renderDirectLiveControls() {
   surface.innerHTML = `<div class="direct-live-queue"><ol aria-label="后续消息队列，共 ${job.queue.length} 条">${queueRows}</ol></div>`;
   form?.classList.add("has-live-direct-job");
   form?.classList.add("has-queued-direct-turn");
-  if (input) input.placeholder = paused ? "点击播放键继续当前回复" : "输入下一条消息";
-  if (send) send.setAttribute("aria-label", paused ? "继续回复" : "加入后续队列");
+  if (input) input.placeholder = paused ? "点击播放键检查结果或重新生成" : "输入下一条消息";
+  if (send) send.setAttribute("aria-label", paused ? "检查暂停结果" : "加入后续队列");
   renderComposerSendButtons();
 }
 
@@ -7731,6 +8129,7 @@ function directTurnFromHistoryMessage(message, question, messages = state.direct
     question: String(question || "").trim(),
     key: "chat",
     directChatMode,
+    model: modelIdentitySnapshot(),
     imageModel: message?.image_model || null,
     selectedSkillIds,
     selectedSkills,
@@ -7744,6 +8143,7 @@ function directTurnFromHistoryMessage(message, question, messages = state.direct
     knowledgeScopePayloads: [],
     thinkingLevel: currentThinkingLevel(),
     webSearch: state.webSearchMode,
+    agentMode: message?.agent_mode === true,
     deliveryMode: "follow-up",
     createdAt: new Date().toISOString(),
   };
@@ -7820,7 +8220,7 @@ function saveEditingLastConversationMessage() {
   toast("已按修改后的消息重新生成");
 }
 
-function retryDirectMessage(index) {
+async function retryDirectMessage(index) {
   if (composerSubmissionInFlight || directChatJob()) {
     toast("当前对话仍在处理；可将这条重试加入后续队列，或先停止当前回复。", true);
     return;
@@ -7837,23 +8237,81 @@ function retryDirectMessage(index) {
     toast("找不到这条消息对应的问题，请重新输入。", true);
     return;
   }
-
-  const turn = directTurnFromHistoryMessage(user, user.content, state.directMessages);
-  turn.branchId = globalThis.crypto?.randomUUID?.() || `branch-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-  turn.branchFromMessageId = String(user.message_id || "");
-  turn.branchReason = "retry_failed_assistant";
-  state.directMessages = state.directMessages
-    .slice(0, userIndex)
-    .filter((message) => message && !message.streaming);
-  state.sessionId = null;
-  state.sessionStats = null;
-  state.sessionTokens = 0;
-  state.contextUsagePercent = 0;
-  window.localStorage.removeItem("scansci.active.session");
-  state.conversationAutoFollow = true;
-  renderDirectConversation({ forceFollow: true });
-  beginDirectChatJob(turn);
-  toast("正在重新生成，失败的尝试已保留在分支记录中");
+  const conversationId = String(state.directConversationId || "");
+  try {
+    const snapshot = await request(`/api/chat/submissions/${encodeURIComponent(user.message_id)}?conversation_id=${encodeURIComponent(conversationId)}`);
+    if (directChatJob(conversationId) || state.directConversationId !== conversationId || state.directMessages[failedIndex] !== failed) return;
+    if (snapshot.state === "running") {
+      toast("原请求仍在执行，请稍后再检查结果。", true);
+      return;
+    }
+    if (snapshot.state === "completed" && snapshot.terminal) {
+      const result = snapshot.terminal.result || snapshot.terminal;
+      const recoveredSessionId = String(result.agent_runtime?.session?.session_id || state.sessionId || "");
+      state.directMessages[failedIndex] = {
+        ...failed,
+        ...(result.message || {}),
+        message_id: failed.message_id,
+        parent_message_id: user.message_id,
+        model: modelIdentitySnapshot(result.model || result.message?.model || failed.model),
+        streaming: false,
+        paused: false,
+        error: "",
+        failure: null,
+      };
+      try {
+        await persistDirectConversationSnapshot({ conversationId, messages: state.directMessages, sessionId: recoveredSessionId });
+      } catch (error) {
+        state.directMessages[failedIndex] = failed;
+        throw error;
+      }
+      state.sessionId = recoveredSessionId || null;
+      renderDirectConversation();
+      toast("已恢复上一轮完成的结果");
+      return;
+    }
+    if (!["uncertain", "unreplayable", "failed", "completed", "missing", "abandoned"].includes(snapshot.state)) {
+      toast("无法确认原请求状态，请查看历史后再操作。", true);
+      return;
+    }
+    const confirmed = await requestConfirmation({
+      eyebrow: "重新生成",
+      title: "重新生成这条回复？",
+      message: "上一轮可能已经执行工具。请先检查已生成的文件或其他结果；重新生成可能再次执行相同操作。",
+      confirmLabel: "重新生成",
+      danger: true,
+    });
+    if (!confirmed) return;
+    if (snapshot.state === "missing") {
+      const fenced = await request(`/api/chat/submissions/${encodeURIComponent(user.message_id)}/abandon`, {
+        method: "POST",
+        body: JSON.stringify({ conversation_id: conversationId }),
+      });
+      if (fenced.state !== "abandoned") {
+        toast("原请求状态已变化，请再次检查。", true);
+        return;
+      }
+    }
+    if (directChatJob(conversationId) || state.directConversationId !== conversationId || state.directMessages[failedIndex] !== failed) return;
+    const turn = directTurnFromHistoryMessage(user, user.content, state.directMessages);
+    turn.branchId = globalThis.crypto?.randomUUID?.() || `branch-${Date.now()}-${Math.random().toString(16).slice(2)}`;
+    turn.branchFromMessageId = String(user.message_id || "");
+    turn.branchReason = "retry_failed_assistant";
+    state.directMessages = state.directMessages
+      .slice(0, userIndex)
+      .filter((message) => message && !message.streaming);
+    state.sessionId = null;
+    state.sessionStats = null;
+    state.sessionTokens = 0;
+    state.contextUsagePercent = 0;
+    window.localStorage.removeItem("scansci.active.session");
+    state.conversationAutoFollow = true;
+    renderDirectConversation({ forceFollow: true });
+    beginDirectChatJob(turn);
+    toast("正在重新生成，失败的尝试已保留在分支记录中");
+  } catch (error) {
+    toast(error.message, true);
+  }
 }
 
 function renderDirectConversation({ forceFollow = false } = {}) {
@@ -7883,7 +8341,7 @@ function renderDirectConversation({ forceFollow = false } = {}) {
       });
     }
     const duration = Number(message.processing_ms || 0);
-    const processing = `${directKnowledgeReceiptMarkup(message)}${processTraceMarkup(message, duration)}`;
+    const processing = `${directKnowledgeReceiptMarkup(message)}${processTraceMarkup(message, duration, index)}`;
     const cursor = message.streaming && message.content ? '<span class="stream-caret" aria-label="正在生成"></span>' : "";
     const answer = message.reader_answer
       ? directEvidenceAnswerMarkup(message, index, cursor)
@@ -7902,7 +8360,7 @@ function renderDirectConversation({ forceFollow = false } = {}) {
       ? `${visionFallbackNotice}<p class="vision-route-notice">图片由 ${escapeHtml(visionRoute.provider_name || visionRoute.provider_id || "本地视觉模型")} 的 ${escapeHtml(visionRoute.model_id)} 处理${visionRoute.mode === "cloud" ? "（云端）" : visionRoute.mode === "ocr-fallback" ? "（OCR + 文本模型）" : "（本地）"}</p>`
       : visionFallbackNotice;
     const generation = message.streaming ? '<div class="generation-indicator" role="status" aria-label="正在生成回复"><span class="generation-dots" aria-hidden="true"><i></i><i></i><i></i></span></div>' : "";
-    const paused = message.paused ? '<p class="stream-paused" role="status">已暂停，点击发送键中的播放图标继续</p>' : "";
+    const paused = message.paused ? '<p class="stream-paused" role="status">已暂停，点击播放图标检查结果；重新生成前会提示确认</p>' : "";
     const error = message.error && !message.paused ? directFailureMarkup(message, index) : "";
     const interaction = interactionMarkup(message.interaction);
     const modeLabel = composerModeLabels[message.mode] || "通用对话";
@@ -7922,6 +8380,12 @@ function renderDirectConversation({ forceFollow = false } = {}) {
     });
   }).join("");
   byId("answerArea").innerHTML = `<article class="conversation-thread">${turns}</article>`;
+  byId("answerArea").querySelectorAll(".answer-processing[data-message-index]").forEach((details) => {
+    details.querySelector("summary")?.addEventListener("click", () => {
+      const message = state.directMessages[Number(details.dataset.messageIndex)];
+      if (message) message.reasoning_open = !details.open;
+    });
+  });
   renderDirectLiveControls();
   updateProcessingTimers();
   state.directMessages.forEach((message, index) => {
@@ -7936,6 +8400,18 @@ function composerMode(inputId) {
   if (inputId === "reviewQuestionInput") return "writing";
   const selectId = inputId === "homeQuestionInput" ? "homeModeSelect" : "chatModeSelect";
   return byId(selectId)?.value || "general";
+}
+
+function setAgentMode(enabled, { announce = true } = {}) {
+  state.agentMode = enabled === true;
+  window.localStorage.setItem("scansci.agent-mode", String(state.agentMode));
+  document.querySelectorAll(".composer-agent-button").forEach((button) => {
+    button.classList.toggle("is-active", state.agentMode);
+    button.setAttribute("aria-pressed", String(state.agentMode));
+  });
+  if (announce) toast(state.agentMode
+    ? "Agent 已开启：Pi 会按任务规划并调用已授权的工具。"
+    : "Agent 已关闭：普通对话继续使用自动路由。");
 }
 
 function isCasualConversationMessage(text = "") {
@@ -8514,6 +8990,28 @@ function closeComposerModelPickers(except = null) {
   });
 }
 
+function fitComposerModelPicker(picker) {
+  const trigger = picker.querySelector("[data-action='toggle-composer-model']");
+  const popover = picker.querySelector(".composer-model-popover");
+  if (!trigger || !popover) return;
+  let top = 12;
+  let bottom = window.innerHeight - 12;
+  for (let parent = picker.parentElement; parent; parent = parent.parentElement) {
+    if (!/(auto|scroll|hidden|clip)/.test(getComputedStyle(parent).overflowY)) continue;
+    const bounds = parent.getBoundingClientRect();
+    top = Math.max(top, bounds.top + 12);
+    bottom = Math.min(bottom, bounds.bottom - 12);
+  }
+  const anchor = trigger.getBoundingClientRect();
+  const above = Math.max(0, anchor.top - top - 10);
+  const below = Math.max(0, bottom - anchor.bottom - 10);
+  const preferBelow = Boolean(picker.closest(".home-landing.has-mode-workbench"));
+  const openBelow = preferBelow ? below >= 160 || below >= above : above < 160 && below > above;
+  picker.classList.toggle("is-below", openBelow);
+  picker.classList.toggle("is-above", !openBelow);
+  popover.style.setProperty("--composer-popover-available", `${Math.floor(openBelow ? below : above)}px`);
+}
+
 function closeComposerThinkingPickers(except = null) {
   document.querySelectorAll("[data-composer-thinking]").forEach((picker) => {
     if (picker === except) return;
@@ -8532,6 +9030,8 @@ function toggleComposerModelPicker(trigger) {
   closeWebSearchPickers();
   closeComposerModelPickers();
   if (shouldOpen) {
+    fitComposerModelPicker(picker);
+    picker.querySelector(".composer-model-popover")?.scrollTo(0, 0);
     picker.classList.add("is-open");
     trigger.setAttribute("aria-expanded", "true");
   }
@@ -9078,6 +9578,9 @@ function setComposerMode(mode, { preserveResearchWorkflow = false } = {}) {
     const input = byId(id);
     if (input) input.value = safeMode;
   }
+  document.querySelectorAll(".composer-agent-button").forEach((button) => {
+    button.hidden = !["general", "writing"].includes(safeMode);
+  });
   document.querySelectorAll("[data-composer-mode-shortcut]").forEach((button) => {
     const selected = button.dataset.modeValue === safeMode;
     button.classList.toggle("is-selected", selected);
@@ -9280,16 +9783,44 @@ async function previewFreeformTask(question, skills = []) {
 
 async function continueTaskConversation(runId, content, skills = []) {
   const selectedSkills = [...new Set([...(skills || []), ...extractSkillMentions(content)].map((item) => String(item || "").toLowerCase()).filter(Boolean))].slice(0, 4);
-  return request(`/api/runs/${encodeURIComponent(runId)}/messages`, {
-    method: "POST",
-    body: JSON.stringify({
+  const storageKey = `scansci.task.followup.${runId}`;
+  let pending = null;
+  try { pending = JSON.parse(window.localStorage.getItem(storageKey) || "null"); } catch (_) { /* stale local state */ }
+  const payload = pending?.content === content && pending?.payload?.idempotency_key ? pending.payload : {
       content,
       ...(selectedComposerImageModel() ? { image_model: selectedComposerImageModel(), image_request_id: globalThis.crypto.randomUUID() } : {}),
       thinking_level: currentThinkingLevel(),
       chat_mode: composerMode("chatQuestionInput"),
+      agent_mode: state.agentMode,
+      web_search: state.webSearchMode,
       skills: selectedSkills,
-    }),
-  });
+      idempotency_key: `ui-${globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`}`,
+  };
+  window.localStorage.setItem(storageKey, JSON.stringify({ content, payload }));
+  const endpoint = `/api/runs/${encodeURIComponent(runId)}/messages`;
+  let result;
+  try {
+    result = await request(endpoint, { method: "POST", body: JSON.stringify(payload) });
+  } catch (error) {
+    if (error?.payload?.error?.code !== "submission_uncertain" || pending?.content !== content) throw error;
+    const confirmed = await requestConfirmation({
+      eyebrow: "结果待核实",
+      title: "重新提交这条追问？",
+      message: "上次请求可能已经执行工具。请先查看任务消息和生成的文件；确认需要再次执行后再继续。",
+      confirmLabel: "重新提交",
+      danger: true,
+    });
+    if (!confirmed) throw error;
+    const retryPayload = {
+      ...payload,
+      idempotency_key: `ui-${globalThis.crypto?.randomUUID?.() || `${Date.now()}-${Math.random().toString(16).slice(2)}`}`,
+      ...(payload.image_model ? { image_request_id: globalThis.crypto.randomUUID() } : {}),
+    };
+    window.localStorage.setItem(storageKey, JSON.stringify({ content, payload: retryPayload }));
+    result = await request(endpoint, { method: "POST", body: JSON.stringify(retryPayload) });
+  }
+  window.localStorage.removeItem(storageKey);
+  return result;
 }
 
 async function watchRun(runId, onUpdate = () => {}) {
@@ -9450,6 +9981,7 @@ function estimateRunSessionStats(run) {
 
 function runFailureSummary(run) {
   const raw = String(run.error?.message || run.recovery?.detail || "").trim();
+  if (run.workflow_type === "pdf-translation") return raw || "文献翻译未完成，请检查当前模型与 OCR 设置。";
   if (/scansci-pdf.*(?:json|检索结果)|(?:json|检索结果).*scansci-pdf/i.test(raw)) {
     return "文献检索服务返回了无法读取的结果，下载尚未开始。";
   }
@@ -9480,6 +10012,12 @@ function runFailureSummary(run) {
 function runCompletionSummary(run) {
   const artifact = run.output_artifact;
   const payload = artifact?.payload || {};
+  if (run.workflow_type === "pdf-translation") {
+    if (run.status === "completed") return "译文 PDF 已保存到翻译库，可从上方打开。";
+    if (run.status === "cancelled") return "翻译已取消；已保存的 PDF 会保留在翻译库。";
+    if (run.status === "paused") return "应用重启中断了翻译，请从首页重新提交原始 PDF。";
+    return "";
+  }
   const items = Array.isArray(payload.items) ? payload.items : [];
   const completed = items.filter((item) => item.status === "completed").length
     || Number(payload.completed || 0)
@@ -9533,7 +10071,7 @@ function runCompletionMessageMarkup(run) {
   const artifact = run.output_artifact || {};
   const payload = artifact.payload || {};
   const citations = citationRecordsForRun(run);
-  const resources = runArtifactFiles(run);
+  const resources = run.workflow_type === "pdf-translation" ? [] : runArtifactFiles(run);
   const files = resources.filter((path) => localResourceKind(path) !== "folder");
   const folders = [
     payload.output_dir,
@@ -9594,6 +10132,11 @@ function runControlPlaneMarkup(run) {
 }
 
 function runSummaryActionsMarkup(run) {
+  if (run.workflow_type === "pdf-translation") {
+    return ["queued", "planning", "running", "verifying"].includes(run.status)
+      ? `<button type="button" class="run-action stop" data-action="cancel-translation-run" data-run-id="${escapeHtml(run.run_id)}">取消翻译</button>`
+      : "";
+  }
   const interaction = run.interaction && Object.keys(run.interaction).length ? run.interaction : null;
   if (interaction) {
     const interactionId = String(interaction.interaction_id || "");
@@ -9694,6 +10237,10 @@ function renderRun(run) {
     resultMarkup = slideProjectArtifactMarkup(artifact.payload, run.run_id);
   } else if (artifact?.payload && artifact.artifact_type === "downloaded_paper") {
     resultMarkup = downloadedPaperArtifactMarkup(artifact);
+  } else if (artifact?.artifact_type === "translated_pdf") {
+    const details = artifact.payload || {};
+    const warnings = Array.isArray(details.warnings) ? details.warnings : [];
+    resultMarkup = `<article class="artifact-card"><span class="artifact-type">文献翻译</span><h3>${escapeHtml(artifact.title || "译文 PDF")}</h3><p>已保存 ${escapeHtml(String(details.pages || "?"))} 页到翻译库。${escapeHtml(artifact.file_path || "")}</p><button type="button" class="secondary-button" data-action="open-translation-run-pdf" data-run-id="${escapeHtml(run.run_id)}">打开译文 PDF</button> <button type="button" class="secondary-button" data-action="show-translation-library">查看翻译库</button>${warnings.length ? `<p>${escapeHtml(warnings.join("；"))}</p>` : ""}</article>`;
   } else if (artifact) {
     resultMarkup = genericArtifactMarkup(artifact);
   } else if (run.workflow_type === "evidence_index" && run.status === "completed") {
@@ -9719,9 +10266,7 @@ function renderRun(run) {
   } else {
     resultMarkup = "";
   }
-  const actions = [
-    `<button type="button" class="run-action" data-action="branch-run" data-run-id="${escapeHtml(run.run_id)}">建立分支</button>`,
-  ].join("");
+  const actions = run.workflow_type === "pdf-translation" ? "" : `<button type="button" class="run-action" data-action="branch-run" data-run-id="${escapeHtml(run.run_id)}">建立分支</button>`;
   if (["literature_review", "deep_research"].includes(run.workflow_type)) {
     const reviewModel = artifact?.payload ? buildReviewDocumentModel(run, artifact) : null;
     state.reviewDocument = reviewModel;
@@ -9751,13 +10296,15 @@ function renderRun(run) {
     contentMarkup: `<div class="user-turn-bubble">${messageSkillTokensMarkup(skillRecordsForIds(run.input?.skills || []))}${composerSourcePreviewMarkup(run.input?.source_files || [])}${composerImagePreviewMarkup(run.input?.images || [])}<p>${userPrompt}</p></div>`,
     createdAt: run.created_at,
   });
-  const workflowLabel = ({ evidence_index: "语义检索", ask: "证据问答", literature_review: "证据综述", academic_search: "学术搜索", deep_research: "深度研究", research_idea: "研究构思", novelty_check: "证据查新", paper_download: "文献下载", paper_download_batch: "批量下载", paper_search_download: "检索并下载", ppt_outline: "幻灯片大纲", ppt_project: "演示项目", pdf_to_ppt: "PPTX" })[run.workflow_type] || "科研任务";
+  const workflowLabel = ({ evidence_index: "语义检索", ask: "证据问答", literature_review: "证据综述", academic_search: "学术搜索", deep_research: "深度研究", research_idea: "研究构思", novelty_check: "证据查新", paper_download: "文献下载", paper_download_batch: "批量下载", paper_search_download: "检索并下载", ppt_outline: "幻灯片大纲", ppt_project: "演示项目", pdf_to_ppt: "PPTX", "pdf-translation": "文献翻译" })[run.workflow_type] || "科研任务";
   const active = !["completed", "failed", "cancelled", "paused"].includes(String(run.status || ""));
   const runResult = resultMarkup ? `<section class="run-result">${resultMarkup}</section>` : "";
   const activityTitle = active
     ? (currentStageRow?.title || (evidenceIndex ? evidenceIndexRunTitle(run) : runStatusLabel(run)))
     : ({ completed: "已完成", failed: "任务未完成", cancelled: "已停止", paused: "已暂停" })[run.status] || runStatusLabel(run);
-  const summaryTitle = active ? "正在研究" : run.status === "failed" ? "研究未完成" : run.status === "completed" ? "研究完成" : activityTitle;
+  const summaryTitle = run.workflow_type === "pdf-translation"
+    ? (active ? "正在翻译" : run.status === "completed" ? "翻译完成" : "翻译未完成")
+    : active ? "正在研究" : run.status === "failed" ? "研究未完成" : run.status === "completed" ? "研究完成" : activityTitle;
   const detailsMeta = `${activityTitle}${percent || run.status === "completed" ? ` · ${percent}%` : ""}`;
   const summaryActions = runSummaryActionsMarkup(run);
   const summaryIcon = active ? "refresh" : run.status === "failed" ? "x" : "check";
@@ -10683,6 +11230,7 @@ function syncKnowledgeTreeControl() {
 }
 
 function libraryKindCopy(kind) {
+  if (kind === "translation") return { title: "翻译库", detail: "本地保存的译文 PDF", icon: "book" };
   if (kind === "zotero") return { title: "Zotero", detail: "本机文献数据库", icon: "library" };
   if (kind === "obsidian") return { title: "Obsidian", detail: "Vault 或笔记文件夹", icon: "book" };
   if (kind === "notion") return { title: "Notion", detail: "页面与数据库同步", icon: "book" };
@@ -10711,7 +11259,7 @@ function renderLibraryMode() {
   const zoteroLibraries = notebooks.filter((item) => String(item.metadata?.library_kind || "") === "zotero");
   const obsidianLibraries = notebooks.filter((item) => String(item.metadata?.library_kind || "") === "obsidian");
   const notionLibraries = notebooks.filter((item) => String(item.metadata?.library_kind || "") === "notion");
-  const localLibraries = notebooks.filter((item) => !["zotero", "obsidian", "notion"].includes(String(item.metadata?.library_kind || "folder")));
+  const localLibraries = notebooks.filter((item) => !["translation", "zotero", "obsidian", "notion"].includes(String(item.metadata?.library_kind || "folder")));
   const totalSources = notebooks.reduce((sum, item) => sum + Number(item.counts?.sources || 0), 0);
   const sourceRows = notebooks.map((notebook) => {
     const kindKey = String(notebook.metadata?.library_kind || "folder");
@@ -10735,6 +11283,7 @@ function renderLibraryMode() {
 
 function knowledgeSourceKind(notebook) {
   const kind = String(notebook?.metadata?.library_kind || "folder");
+  if (kind === "translation") return "translation";
   if (kind === "zotero" || notebook?.metadata?.zotero) return "zotero";
   if (kind === "obsidian" || notebook?.metadata?.obsidian) return "obsidian";
   if (kind === "notion" || notebook?.metadata?.notion) return "notion";
@@ -10758,6 +11307,7 @@ function knowledgeItemUsesPdfIcon(item, notebook) {
 
 function knowledgeSourceItems(notebook) {
   const kind = knowledgeSourceKind(notebook);
+  if (kind === "translation") return notebook?.translation_files || [];
   const indexed = (notebook?.sources || []).map((source) => ({
     ...source,
     id: source.source_id || source.doc_id || source.title,
@@ -10947,7 +11497,7 @@ function renderKnowledgeTree(notebook, items) {
   return `${zoteroIssue}${[...groups.entries()].map(([folder, entries]) => `<details class="ima-folder"${state.knowledgeTreeExpanded !== false ? " open" : ""}><summary>${uiIcon("chevron-right")}<span>${uiIcon("folder-open")}</span><strong>${escapeHtml(folder)}</strong><small>${entries.length}</small></summary><div>${entries.map((item) => renderKnowledgeFileRow(item, notebook, items)).join("")}</div></details>`).join("")}`;
 }
 
-// External sources are fixed integration slots. Only personal libraries can be added.
+// Only personal libraries can be added manually; translation entries arrive from completed tasks.
 function renderKnowledgeSourceGroup(title, kind, notebooks) {
   const connectionAction = kind === "zotero"
     ? "choose-zotero-library"
@@ -10957,17 +11507,20 @@ function renderKnowledgeSourceGroup(title, kind, notebooks) {
         ? "connect-notion"
         : "create-empty-library";
   const isPersonal = kind === "personal";
-  const headerAction = isPersonal
+  const headerAction = isPersonal && notebooks.length
     ? `<button type="button" data-action="create-empty-library" aria-label="新建个人知识库" title="新建个人知识库">${uiIcon("plus")}</button>`
     : "";
   const entries = notebooks.map((notebook) => `<button type="button" class="ima-source-entry ${notebook.notebook_id === state.notebook?.notebook_id ? "is-active" : ""}" data-action="activate-library" data-notebook-id="${escapeHtml(notebook.notebook_id)}"><img src="${knowledgeLogoUrl(kind)}" alt="" /><span>${escapeHtml(notebook.title || pathLeaf(notebook.root_path))}</span></button>`).join("");
-  const emptyConnection = !isPersonal && !notebooks.length
-    ? `<button type="button" class="ima-source-entry is-empty" data-action="${connectionAction}" aria-label="连接 ${escapeHtml(title)}"><img src="${knowledgeLogoUrl(kind)}" alt="" /><span>连接 ${escapeHtml(title)}</span></button>`
+  const emptyConnection = !notebooks.length
+    ? kind === "translation"
+      ? `<div class="ima-source-entry is-empty is-placeholder" aria-label="翻译库暂无译文"><img src="${knowledgeLogoUrl(kind)}" alt="" /><span>暂无译文</span></div>`
+      : `<button type="button" class="ima-source-entry is-empty" data-action="${connectionAction}" aria-label="${isPersonal ? "新建个人知识库" : `连接 ${escapeHtml(title)}`}"><img src="${knowledgeLogoUrl(kind)}" alt="" /><span>${isPersonal ? "新建个人知识库" : `连接 ${escapeHtml(title)}`}</span></button>`
     : "";
   return `<section class="ima-source-group"><header><span>${escapeHtml(title)}</span>${headerAction}</header>${entries || emptyConnection}</section>`;
 }
 
 function knowledgeIndexStatusMarkup(notebook) {
+  if (knowledgeSourceKind(notebook) === "translation") return `<span class="ima-index-status is-empty" title="文件夹中的 PDF 已关联；全文检索索引尚未建立">仅文件关联</span>`;
   const notebookId = String(notebook?.notebook_id || "");
   const status = state.knowledgeIndexStatuses[notebookId] || {};
   const localAi = state.localAiStatuses[notebookId] || {};
@@ -11052,7 +11605,144 @@ function focusKnowledgeFileSearch() {
 function closeKnowledgeFileSearch() {
   if (!state.knowledgeSearchOpen) return;
   state.knowledgeSearchOpen = false;
+  state.knowledgeQuery = "";
+  state.knowledgeVisibleLimit = 200;
   renderMode();
+  window.setTimeout(() => document.querySelector('[data-action="focus-knowledge-file-search"]')?.focus({ preventScroll: true }), 0);
+}
+
+async function openTranslationDialog({ showLocation = false } = {}) {
+  const dialog = byId("translationDialog");
+  if (!dialog) return;
+  const library = await request("/api/translations/library");
+  const root = String(library.root_path || "");
+  byId("translationParentPath").value = root.replace(/[\\/]翻译库$/, "") || state.workspace?.workspace_directory || "";
+  updateTranslationLocation();
+  byId("translationLocation").open = showLocation;
+  dialog.querySelector(".translation-runtime").open = false;
+  byId("translationStatus").replaceChildren();
+  byId("translationStatus").hidden = true;
+  const model = state.settings?.active_model || {};
+  const provider = (state.settings?.providers || []).find((item) => item.id === model.provider_id) || {};
+  const destination = provider.auth_mode === "local" || String(provider.id || "").startsWith("local-") ? "本机" : "远程服务";
+  const ocr = state.settings?.document_processing?.ocr || {};
+  byId("translationRouteStatus").textContent = `翻译模型：${model.model_id || "未选择"}${model.model_id ? `（${destination}）` : ""} · OCR：${ocr.enabled === false ? "已关闭" : ocr.provider || "Tesseract"}。扫描 PDF 的版面翻译当前需要 Tesseract。`;
+  if (!dialog.open) dialog.showModal();
+  hydrateIcons(dialog);
+  if (translationRunId) refreshTranslationStatus({ resume: true }).catch((error) => toast(error.message, true));
+}
+
+function updateTranslationLocation() {
+  const path = byId("translationParentPath")?.value.trim() || "";
+  const label = byId("translationLocationPath");
+  if (!label) return;
+  const workspacePath = String(state.workspace?.workspace_directory || "").replace(/[\\/]+$/, "");
+  const isWorkspace = path.replace(/[\\/]+$/, "").toLowerCase() === workspacePath.toLowerCase();
+  label.textContent = isWorkspace || !path ? "当前工作区" : path.split(/[\\/]/).filter(Boolean).pop();
+  label.title = path || "当前工作区";
+}
+
+function closeTranslationDialog() {
+  byId("translationDialog")?.close();
+}
+
+async function pickTranslationFolder() {
+  const picker = window.pywebview?.api?.choose_library_folder;
+  if (typeof picker !== "function") {
+    byId("translationParentPath")?.focus();
+    return;
+  }
+  const path = String(await picker() || "").trim();
+  if (path) {
+    byId("translationParentPath").value = path;
+    updateTranslationLocation();
+  }
+}
+
+async function saveTranslationFolder(notify = true) {
+  const parentPath = byId("translationParentPath")?.value.trim() || "";
+  const result = await request("/api/translations/library", {
+    method: "POST", body: JSON.stringify({ parent_path: parentPath }),
+  });
+  state.workspace = result.workspace;
+  state.notebook = (state.workspace.notebooks || []).find((item) => item.notebook_id === state.notebook?.notebook_id)
+    || (state.workspace.notebooks || []).find((item) => item.notebook_id === "translation-library")
+    || state.notebook;
+  if (state.activeMode === "library") renderMode();
+  updateTranslationLocation();
+  if (notify) {
+    byId("translationLocation").open = false;
+    toast("翻译库已关联");
+  }
+  return result;
+}
+
+async function submitTranslation() {
+  const file = byId("translationFile")?.files?.[0];
+  if (!file || !file.name.toLowerCase().endsWith(".pdf")) throw new Error("请选择 PDF 文件");
+  if (!file.size || file.size > 50 * 1024 * 1024) throw new Error("PDF 文件须小于 50 MB");
+  const button = byId("translationSubmit");
+  button.disabled = true;
+  const status = byId("translationStatus");
+  status.hidden = false;
+  status.textContent = "正在准备翻译…";
+  try {
+    await saveTranslationFolder(false);
+    const started = await request("/api/translations", {
+      method: "POST",
+      body: JSON.stringify({
+        filename: file.name,
+        data_url: await fileToDataUrl(file, "无法读取 PDF"),
+        target_language: byId("translationLanguage").value,
+      }),
+    });
+    translationRunId = started.run_id;
+    window.localStorage.setItem("scansci.translation.run-id", translationRunId);
+    await refreshTranslationStatus();
+  } finally {
+    button.disabled = false;
+  }
+}
+
+function renderTranslationStatus(run) {
+  if (!byId("translationDialog")?.open || run.run_id !== translationRunId) return;
+  const target = byId("translationStatus");
+  target.hidden = false;
+  const stage = (run.stages || []).find((item) => item.status === "running") || {};
+  const progress = Math.round(Number(run.progress || 0) * 100);
+  if (run.status === "completed") {
+    target.innerHTML = `<strong>已保存到翻译库</strong><p>${escapeHtml(run.output_artifact?.file_path || "")}</p><button type="button" class="secondary-button" data-action="open-translation-result">打开译文 PDF</button> <button type="button" class="secondary-button" data-action="show-translation-library">查看翻译库</button>`;
+  } else if (run.status === "cancelled") {
+    target.innerHTML = "<strong>翻译已取消</strong><p>没有生成译文 PDF。</p>";
+  } else if (run.status === "failed") {
+    const error = String(run.error?.message || "翻译失败");
+    const runnerStopped = /model runner has unexpectedly stopped|本地模型运行中断/i.test(error);
+    const saveFailed = (run.stages || [])[0]?.status === "completed";
+    const detail = runnerStopped ? "本地模型运行中断。请检查 Ollama，或换用较小模型后重试。" : error;
+    target.innerHTML = `<strong>翻译未完成</strong><p>${escapeHtml(detail)}</p><p>${saveFailed ? "保存阶段失败，请检查目标文件夹。" : "没有生成译文 PDF。"}</p>${runnerStopped ? '<button type="button" class="secondary-button" data-action="configure-translation-model">管理模型</button>' : saveFailed ? '<button type="button" class="secondary-button" data-action="show-translation-library">查看翻译库</button>' : ""}`;
+  } else {
+    target.innerHTML = `<strong>正在翻译 · ${progress}%</strong><p>${escapeHtml(stage.summary || stage.title || "请稍候")}</p><button type="button" class="secondary-button" data-action="cancel-translation">取消任务</button>`;
+  }
+}
+
+function watchTranslationRun(runId) {
+  if (translationWatchers.has(runId)) return;
+  translationWatchers.add(runId);
+  void watchRun(runId, (run) => {
+    renderTranslationStatus(run);
+    if (run.status === "completed") refreshTranslationLibrary().catch(() => {});
+  }).finally(() => translationWatchers.delete(runId));
+}
+
+async function refreshTranslationStatus({ resume = false } = {}) {
+  if (!translationRunId) return;
+  const run = await request(`/api/translations/${encodeURIComponent(translationRunId)}`);
+  upsertRun(run);
+  const finished = ["completed", "failed", "cancelled"].includes(run.status);
+  if (!resume || !finished) renderTranslationStatus(run);
+  if (finished) {
+    if (run.status === "completed") refreshTranslationLibrary().catch(() => {});
+  } else watchTranslationRun(translationRunId);
 }
 
 function renderImaLibraryMode() {
@@ -11081,6 +11771,7 @@ function renderImaLibraryMode() {
   const previewId = state.knowledgePreviewSourceId || items[0]?.id || "";
   const preview = items.find((item) => String(item.id) === String(previewId)) || items[0] || null;
   const personal = notebooks.filter((notebook) => knowledgeSourceKind(notebook) === "personal");
+  const translations = notebooks.filter((notebook) => knowledgeSourceKind(notebook) === "translation");
   const zotero = notebooks.filter((notebook) => knowledgeSourceKind(notebook) === "zotero");
   const obsidian = notebooks.filter((notebook) => knowledgeSourceKind(notebook) === "obsidian");
   const activeTitle = active?.title || "个人知识库";
@@ -11092,19 +11783,21 @@ function renderImaLibraryMode() {
     ? `<button type="button" class="ima-scope-toggle ${linked ? "is-active" : ""}" data-action="toggle-active-library-scope">${linked ? `@${escapeHtml(activeTitle)}` : "用于对话"}</button>`
     : kind === "zotero"
       ? `<button type="button" class="ima-scope-toggle" data-action="choose-zotero-library" data-notebook-id="${escapeHtml(active?.notebook_id || "")}">${escapeHtml(zoteroActionLabel)}</button>`
-      : `<span class="ima-scope-toggle is-disabled">导入后可用于对话</span>`;
+      : `<span class="ima-scope-toggle is-disabled">${kind === "translation" ? "仅文件，未建立检索索引" : "导入后可用于对话"}</span>`;
   const linkedKinds = knowledgeLocalBindingKinds(active);
   const localLibraryActions = [
     `<button type="button" data-action="choose-library-files" data-notebook-id="${escapeHtml(active?.notebook_id || "")}">${uiIcon("link")}${linkedKinds.file ? "添加文件" : "链接文件"}</button>`,
     `<button type="button" data-action="choose-library-folder" data-notebook-id="${escapeHtml(active?.notebook_id || "")}">${uiIcon("folder-open")}${linkedKinds.folder ? "添加文件夹" : "链接文件夹"}</button>`,
   ].filter(Boolean).join("") || `<span class="ima-library-linked-status" title="文件与文件夹已连接">已全部连接</span>`;
-  const libraryToolbarActions = kind === "zotero"
-    ? `<button type="button" data-action="choose-zotero-library" data-notebook-id="${escapeHtml(active?.notebook_id || "")}">${uiIcon(zoteroConnected ? "refresh-cw" : "link")} ${escapeHtml(zoteroActionLabel)}</button>`
-    : localLibraryActions;
-  const previewPanel = !activeReady
-    ? `<div class="ima-preview-empty">${uiIcon("circle-alert")}<span>导入资料后可基于证据问答</span></div>`
-    : preview
-    ? `<article class="ima-preview-card"><span>${escapeHtml(preview.type || sourceTypeLabel(preview.path || preview.title))}</span><h3>${escapeHtml(preview.title)}</h3><p>${escapeHtml(preview.creators || preview.doi || preview.path || "本地链接文件")}</p>${preview.publication ? `<small>${escapeHtml(preview.publication)}</small>` : ""}</article>`
+  const libraryToolbarActions = kind === "translation"
+    ? `<span class="ima-library-linked-status">${escapeHtml(active?.root_path || "译文由文献翻译任务保存到本地")}</span><button type="button" data-action="open-translation" data-open-location="true">${uiIcon("folder-open")}选择保存位置</button>`
+    : kind === "zotero"
+      ? `<button type="button" data-action="choose-zotero-library" data-notebook-id="${escapeHtml(active?.notebook_id || "")}">${uiIcon(zoteroConnected ? "refresh-cw" : "link")} ${escapeHtml(zoteroActionLabel)}</button>`
+      : localLibraryActions;
+  const previewPanel = preview && (activeReady || kind === "translation")
+    ? `<article class="ima-preview-card"><span>${escapeHtml(preview.type || sourceTypeLabel(preview.path || preview.title))}</span><h3>${escapeHtml(preview.title)}</h3><p>${escapeHtml(preview.creators || preview.doi || preview.path || "本地链接文件")}</p>${preview.publication ? `<small>${escapeHtml(preview.publication)}</small>` : ""}${kind === "translation" ? `<button type="button" class="secondary-button" data-action="open-translation-file" data-file-id="${escapeHtml(preview.id)}" data-file-title="${escapeHtml(preview.title)}">打开译文 PDF</button>` : ""}</article>`
+    : !activeReady
+    ? `<div class="ima-preview-empty">${uiIcon("circle-alert")}<span>${kind === "translation" ? "完成文献翻译后，译文会保存在这里" : "导入资料后可基于证据问答"}</span></div>`
     : `<div class="ima-preview-empty">${uiIcon("message-circle")}<span>基于知识库问答</span></div>`;
   const suggestions = activeReady ? [
     `总结「${activeTitle}」中的核心主题`,
@@ -11121,18 +11814,21 @@ function renderImaLibraryMode() {
     : "";
   const searchOpen = Boolean(state.knowledgeSearchOpen);
   const topSearch = searchOpen
-    ? `<label class="ima-library-appbar-search-field"><span>${uiIcon("search")}</span><input type="search" data-knowledge-file-search value="${escapeHtml(state.knowledgeQuery || "")}" placeholder="输入文件名、作者或路径" aria-label="搜索当前知识库" /><button type="button" data-action="close-knowledge-file-search" aria-label="收起搜索" title="收起搜索">${uiIcon("x")}</button></label>`
-    : "";
-  return `<section class="ima-library-layout ${state.knowledgePreviewCollapsed ? "is-preview-collapsed" : ""} ${searchOpen ? "is-search-open" : ""}">
+    ? `<div class="ima-library-appbar-search-field"><span>${uiIcon("search")}</span><input type="search" data-knowledge-file-search value="${escapeHtml(state.knowledgeQuery || "")}" placeholder="输入文件名、作者或路径" aria-label="搜索当前知识库" /><button type="button" data-action="close-knowledge-file-search" aria-label="收起搜索并清除筛选" title="收起搜索并清除筛选">${uiIcon("x")}</button></div>`
+    : `<button type="button" class="ima-library-appbar-search" data-action="focus-knowledge-file-search" aria-label="搜索当前知识库" aria-expanded="false" title="搜索当前知识库（Ctrl+F）">${uiIcon("search")}</button>`;
+  const returnToGuide = state.onboardingOpen && state.onboardingMode === "welcome"
+    ? `<button type="button" class="ima-library-onboarding-back" data-action="return-first-run">${uiIcon("arrow-left")}返回引导</button>`
+    : uiIcon("folder-open");
+  return `<section class="ima-library-layout ${state.knowledgePreviewCollapsed ? "is-preview-collapsed" : ""}">
     <header class="ima-library-appbar">
-      <div class="ima-library-appbar-context">${uiIcon("folder-open")}<strong>${escapeHtml(activeTitle)}</strong></div>
+      <div class="ima-library-appbar-context">${returnToGuide}<strong>${escapeHtml(activeTitle)}</strong></div>
       <div class="ima-library-appbar-actions">
-        ${topSearch}<button type="button" class="ima-library-appbar-search" data-action="focus-knowledge-file-search" aria-label="搜索当前知识库" aria-expanded="${searchOpen}" title="搜索当前知识库（Ctrl+F）">${uiIcon("search")}</button>
+        ${topSearch}
         <button type="button" class="ima-preview-toggle" data-action="toggle-knowledge-preview" aria-label="${state.knowledgePreviewCollapsed ? "展开详情栏" : "折叠详情栏"}" title="${state.knowledgePreviewCollapsed ? "展开详情栏" : "折叠详情栏"}">${uiIcon(state.knowledgePreviewCollapsed ? "panel-left" : "panel-right")}</button>
       </div>
     </header>
-    <aside class="ima-library-sources">${renderKnowledgeSourceGroup("个人知识库", "personal", personal)}${renderKnowledgeSourceGroup("Zotero", "zotero", zotero)}${renderKnowledgeSourceGroup("Obsidian", "obsidian", obsidian)}${renderKnowledgeSourceGroup("Notion", "notion", notebooks.filter((notebook) => knowledgeSourceKind(notebook) === "notion"))}</aside>
-    <main class="ima-library-main"><header class="ima-library-title"><img src="${knowledgeLogoUrl(kind)}" alt="" /><div class="ima-library-heading"><h2>${escapeHtml(activeTitle)}</h2><div><span>${kind === "personal" ? "个人知识库" : kind === "zotero" ? "Zotero" : kind === "obsidian" ? "Obsidian" : "Notion"}</span>${knowledgeIndexStatusMarkup(active)}</div></div><div class="ima-library-title-actions">${libraryScopeControl}${kind === "personal" && active ? `<button type="button" class="ima-library-delete" data-action="delete-personal-library" data-notebook-id="${escapeHtml(active.notebook_id)}" title="移除个人知识库" aria-label="移除个人知识库 ${escapeHtml(activeTitle)}">${uiIcon("trash")}移除</button>` : ""}</div></header><div class="ima-library-toolbar"><label><span data-ui-icon="search"></span><input type="search" data-knowledge-file-search value="${escapeHtml(state.knowledgeQuery || "")}" placeholder="搜索当前知识库" /></label>${libraryToolbarActions}</div><section class="ima-library-tree"><header><strong>内容 (${contentCountLabel})</strong><span data-knowledge-search-count>${escapeHtml(resultLabel)}</span></header>${renderKnowledgeTree(active, visibleItems)}${loadMore}</section></main>
+    <aside class="ima-library-sources">${renderKnowledgeSourceGroup("个人知识库", "personal", personal)}${renderKnowledgeSourceGroup("翻译库", "translation", translations)}${renderKnowledgeSourceGroup("Zotero", "zotero", zotero)}${renderKnowledgeSourceGroup("Obsidian", "obsidian", obsidian)}${renderKnowledgeSourceGroup("Notion", "notion", notebooks.filter((notebook) => knowledgeSourceKind(notebook) === "notion"))}</aside>
+    <main class="ima-library-main"><header class="ima-library-title"><img src="${knowledgeLogoUrl(kind)}" alt="" /><div class="ima-library-heading"><h2>${escapeHtml(activeTitle)}</h2><div><span>${kind === "personal" ? "个人知识库" : kind === "translation" ? "翻译库" : kind === "zotero" ? "Zotero" : kind === "obsidian" ? "Obsidian" : "Notion"}</span>${knowledgeIndexStatusMarkup(active)}</div></div><div class="ima-library-title-actions">${libraryScopeControl}${kind === "personal" && active ? `<button type="button" class="ima-library-delete" data-action="delete-personal-library" data-notebook-id="${escapeHtml(active.notebook_id)}" title="移除个人知识库" aria-label="移除个人知识库 ${escapeHtml(activeTitle)}">${uiIcon("trash")}移除</button>` : ""}</div></header><div class="ima-library-toolbar">${libraryToolbarActions}</div><section class="ima-library-tree"><header><strong>内容 (${contentCountLabel})</strong><span data-knowledge-search-count>${escapeHtml(resultLabel)}</span></header>${renderKnowledgeTree(active, visibleItems)}${loadMore}</section></main>
     <aside class="ima-library-preview"><div class="ima-library-preview-content">${previewPanel}<section class="ima-library-suggestions"><span>你可以这样开始</span>${suggestions.map((prompt) => `<button type="button" data-action="use-knowledge-suggestion" data-prompt="${escapeHtml(prompt)}">${escapeHtml(prompt)}${uiIcon("chevron-right")}</button>`).join("")}</section></div></aside>
   </section>`;
 }
@@ -11654,8 +12350,9 @@ function renderResourceGuideOverlay() {
   return `<div class="resource-onboarding-backdrop resource-guide-backdrop"><section class="resource-onboarding-card resource-guide-card resource-guide-wizard" role="dialog" aria-modal="true" aria-labelledby="resourceGuideTitle" tabindex="-1"><aside class="resource-onboarding-aside resource-guide-aside"><span class="resource-onboarding-brand">ScanSci · LOCAL GUIDE</span><div class="resource-onboarding-glyph">${uiIcon(step.id === "knowledge" ? "library" : step.id === "multimodal" ? "eye" : step.id === "chat" ? "brain" : "download")}</div><h1 id="resourceGuideTitle">把本地能力<br />一步步配好。</h1><p>按照研究检索、知识库、视觉语音和本地对话的顺序配置；每一页都可以跳过。</p><ol class="resource-guide-step-rail">${resourceGuideStepRail(currentIndex)}</ol><div class="resource-onboarding-note"><span>${uiIcon("shield-check")}</span><p>模型只保存在这台电脑上。没有下载模型，也不影响基础对话和关键词检索。</p></div></aside><main class="resource-onboarding-main resource-guide-main"><header><div><span>${escapeHtml(step.eyebrow)}</span><h2>${escapeHtml(step.title)}</h2><p>${escapeHtml(step.description)}</p></div><div class="resource-guide-header-actions"><span class="resource-guide-count">${readyCount}/${snapshots.length} 已就绪</span><button type="button" class="resource-guide-close" data-action="close-resource-guide" data-resource-guide-result="skip" aria-label="关闭本地能力引导">${uiIcon("x")}</button></div></header><div class="resource-guide-wizard-body">${resourceGuidePageMarkup(step)}</div><footer><p>第 ${currentIndex + 1} / ${RESOURCE_GUIDE_STEPS.length} 页 · 关闭后可从“本地模型”页再次打开。</p><div><button type="button" class="resource-skip-button" data-action="close-resource-guide" data-resource-guide-result="skip">暂时跳过</button>${backButton}${nextButton}</div></footer></main></section></div>`;
 }
 
-function openResourceGuideOverlay() {
+function openResourceGuideOverlay({ returnToWelcome = false } = {}) {
   if (state.onboardingMode !== "resources") onboardingReturnFocus = document.activeElement;
+  state.onboardingGuideFromWelcome = returnToWelcome || (state.onboardingOpen && state.onboardingMode === "welcome");
   state.onboardingMode = "resources";
   state.resourceGuideStep = 0;
   state.onboardingOpen = true;
@@ -11665,18 +12362,32 @@ function openResourceGuideOverlay() {
 }
 
 async function closeResourceGuideOverlay(result = "skip") {
-  state.onboardingMode = "";
+  const returnToWelcome = state.onboardingGuideFromWelcome;
+  state.onboardingGuideFromWelcome = false;
+  state.onboardingMode = returnToWelcome ? "welcome" : "";
   state.resourceGuideStep = 0;
+  const restoreFocus = () => {
+    if (returnToWelcome && state.activeView === "home") {
+      window.setTimeout(() => byId("firstRunWelcome")?.querySelector('[data-action="onboarding-open-models"]')?.focus({ preventScroll: true }), 0);
+    } else restoreOnboardingFocus();
+  };
+  if (returnToWelcome && result !== "complete") {
+    renderResourceOnboarding();
+    restoreFocus();
+    return;
+  }
   const persistence = persistOnboardingPreferences(
-    result === "complete"
-      ? { welcome_dismissed: true, resource_setup_completed: true }
-      : { welcome_dismissed: true },
+    returnToWelcome
+      ? { resource_setup_completed: true }
+      : result === "complete"
+        ? { welcome_dismissed: true, resource_setup_completed: true }
+        : { welcome_dismissed: true },
     result === "complete"
       ? "本地能力配置已完成；之后可随时再次打开引导"
       : "已关闭本地能力配置；需要时可在本地模型页重新打开",
-    { close: true },
+    { close: !returnToWelcome },
   );
-  restoreOnboardingFocus();
+  restoreFocus();
   await persistence;
 }
 
@@ -11729,13 +12440,14 @@ function renderFirstRunWelcome() {
     && state.activeView === "home",
   );
   host.hidden = !visible;
+  host.closest(".home-view")?.classList.toggle("has-first-run-guide", visible);
   if (!visible) {
     host.innerHTML = "";
     return;
   }
   const disabled = state.onboardingPersisting ? " disabled" : "";
   host.setAttribute("aria-busy", String(state.onboardingPersisting));
-  host.innerHTML = `<div class="first-run-welcome-copy"><span class="first-run-welcome-mark">${uiIcon("sparkles")}</span><div><h2 id="firstRunWelcomeTitle">现在就可以开始</h2><p>无需先安装本地模型。直接描述任务；知识库、本地能力和插件都可以按需添加。</p></div></div><div class="first-run-welcome-actions"><button type="button" class="first-run-primary" data-action="finish-first-run"${disabled}>开始研究</button><button type="button" data-action="onboarding-open-knowledge"${disabled}>连接知识库</button><button type="button" data-action="onboarding-open-models"${disabled}>配置本地能力</button></div>`;
+  host.innerHTML = `<div class="first-run-welcome-copy"><span class="first-run-welcome-mark">${uiIcon("book-open")}</span><div><h2 id="firstRunWelcomeTitle">从一个研究问题开始</h2><p>在上方直接描述任务，或选择下方功能。资料和本地模型用到时再连接。</p></div></div><div class="first-run-welcome-actions"><button type="button" data-action="onboarding-open-knowledge"${disabled}>${uiIcon("library")}连接知识库</button><button type="button" data-action="onboarding-open-models"${disabled}>${uiIcon("download")}配置本地能力</button><button type="button" class="first-run-dismiss" data-action="finish-first-run" aria-label="关闭新手引导" title="关闭新手引导"${disabled}>${uiIcon("x")}</button></div>`;
   host.setAttribute("aria-labelledby", "firstRunWelcomeTitle");
   hydrateIcons(host);
 }
@@ -12139,6 +12851,9 @@ function renderSettings() {
   hydrateSettingsSelects(target);
   renderDownloadActivity();
   if (["defaults", "document-processing"].includes(state.activeSettings)) refreshSystemOcrStatus().catch(() => {});
+  if (state.activeSettings === "local-models" && !state.localModelMarket?.loaded && !state.localModelMarket?.loading) {
+    void refreshLocalModelMarket().catch((error) => toast(error.message, true));
+  }
 }
 
 function renderExtensions() {
@@ -12166,11 +12881,11 @@ function renderExtensions() {
   if (refreshButton) {
     const isLoading = Boolean(state.extensionUpdates.loading);
     refreshButton.disabled = isLoading;
-    refreshButton.textContent = isLoading
-      ? "↻ 检查中"
+    refreshButton.querySelector(".extensions-refresh-label").textContent = isLoading
+      ? "检查中"
       : state.extensionUpdates.error
-        ? "↻ 重试"
-        : "↻ 检查更新";
+        ? "重试"
+        : "检查更新";
   }
 }
 
@@ -12700,21 +13415,29 @@ function renderModelsSettings() {
     if (!groupedModels.has(group)) groupedModels.set(group, []);
     groupedModels.get(group).push({ model, index });
   });
-  const modelRows = [...groupedModels.entries()].map(([group, models]) => `<section class="cherry-model-group"><header><strong>${escapeHtml(group)}</strong></header>${models.map(({ model, index }) => `<article class="cherry-model-row ${model.available === false ? "is-unavailable" : ""}"><span class="cherry-model-mark">${escapeHtml((group || "M").slice(0, 1).toUpperCase())}</span><div class="cherry-model-copy"><button type="button" data-action="edit-model" data-model-index="${index}">${escapeHtml(model.name || model.id)}</button><small>${escapeHtml(model.id)}${model.context_window ? ` · ${escapeHtml(model.context_window)}` : ""}${model.available === false ? ` · ${escapeHtml(model.unavailable_reason || "模型目录当前不可访问")}` : ""}</small></div>${modelCapabilityChips(model, index)}<details class="cherry-model-more"><summary aria-label="编辑模型能力">${uiIcon("settings")}</summary>${modelCapabilityChips(model, index, { showAll: true })}</details><button class="cherry-row-remove" type="button" data-action="remove-model" data-model-index="${index}" aria-label="移除模型">${uiIcon("minus")}</button></article>`).join("")}</section>`).join("");
+  const modelRows = [...groupedModels.entries()].map(([group, models]) => `<section class="cherry-model-group"><header><strong>${escapeHtml(group)}</strong></header>${models.map(({ model, index }) => {
+    const shown = model.show_in_composer !== false;
+    const name = model.name || model.id;
+    return `<article class="cherry-model-row ${model.available === false ? "is-unavailable" : ""} ${state.editingModelIndex === index ? "is-selected" : ""}"><span class="cherry-model-mark">${escapeHtml((group || "M").slice(0, 1).toUpperCase())}</span><div class="cherry-model-copy"><button type="button" data-action="edit-model" data-model-index="${index}">${escapeHtml(name)}</button><small>${escapeHtml(model.id)}${model.context_window ? ` · ${escapeHtml(model.context_window)}` : ""}${model.available === false ? ` · ${escapeHtml(model.unavailable_reason || "模型目录当前不可访问")}` : ""}${shown ? "" : " · 已从对话候选隐藏"}</small></div>${modelCapabilityChips(model, index)}<details class="cherry-model-more"><summary aria-label="编辑模型能力">${uiIcon("settings")}</summary>${modelCapabilityChips(model, index, { showAll: true })}</details><div class="cherry-model-row-actions"><button class="cherry-model-visibility" type="button" data-action="toggle-model-composer-visibility" data-model-index="${index}" aria-label="在对话候选中显示 ${escapeHtml(name)}" aria-pressed="${shown ? "true" : "false"}" title="${shown ? "从对话候选中隐藏" : "在对话候选中显示"}">${uiIcon(shown ? "eye" : "eye-off")}</button><button class="cherry-row-remove" type="button" data-action="remove-model" data-model-index="${index}" aria-label="移除模型">${uiIcon("minus")}</button></div></article>`;
+  }).join("")}</section>`).join("");
   const kindOptions = ["local", "openai-compatible", "anthropic-compatible"].map((kind) => `<option value="${kind}" ${provider.kind === kind ? "selected" : ""}>${kind === "local" ? "本地" : kind}</option>`).join("");
   const customNameField = isBuiltInProvider(provider) ? `<input type="hidden" name="provider-name" value="${escapeHtml(provider.name)}" />` : `<label class="cherry-field"><span>服务商名称</span><input name="provider-name" value="${escapeHtml(provider.name)}" required maxlength="80" /></label>`;
   const kindField = isBuiltInProvider(provider) ? `<input type="hidden" name="provider-kind" value="${escapeHtml(provider.kind)}" />` : `<label class="cherry-field cherry-kind-field"><span>接口类型</span><select name="provider-kind">${kindOptions}</select></label>`;
   const isManaged = provider.auth_mode === "managed";
+  const isLocalConnection = provider.auth_mode === "local";
   const providerUsesEnvironmentKey = provider.api_key_source === "environment";
   const providerKeyLabel = providerUsesEnvironmentKey ? "环境变量" : "已保存";
   const providerKeyHint = providerUsesEnvironmentKey
     ? `当前使用环境变量 <code>${escapeHtml(provider.api_key_env || "")}</code>；设置页不会覆盖它。`
+    : provider.api_key_source === "endpoint_mismatch"
+    ? `环境变量 <code>${escapeHtml(provider.api_key_env || "")}</code> 仅用于默认 API 地址；当前地址请单独保存密钥。`
     : provider.api_key_configured
-      ? "密钥默认隐藏；仅在点击眼睛时从本机凭据管理器读取。"
-      : provider.api_key_env
-        ? `未检测到密钥；也可设置环境变量 <code>${escapeHtml(provider.api_key_env)}</code>。`
-        : "多个密钥可用英文逗号分隔。";
-  const keyField = isManaged ? `<p class="cherry-field-hint">云端模型由 ScanSci 托管提供，无需配置 API 密钥；本地模型通过这台电脑的运行时调用。</p>` : provider.kind !== "local" ? `<div class="cherry-key-row"><label class="cherry-field cherry-secret-field"><span>API 密钥${provider.api_key_configured ? `<em>${providerKeyLabel}</em>` : ""}</span><span class="cherry-secret-control"><input name="provider-api-key" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false" placeholder="${provider.api_key_configured ? "••••••••••••••••" : "输入后仅保存在系统凭据管理器"}" /><button type="button" class="cherry-secret-toggle" data-action="toggle-provider-key" aria-label="${provider.api_key_configured ? "显示已保存的 API 密钥" : "显示 API 密钥"}" aria-pressed="false" title="${provider.api_key_configured ? "显示已保存的密钥" : "显示密钥"}">${uiIcon("eye")}</button></span></label><button type="button" class="cherry-detect-button" data-action="test-provider" ${!provider.api_key_configured ? "disabled" : ""}>检 测</button></div><p class="cherry-field-hint">${providerKeyHint}</p>` : `<p class="cherry-field-hint">内置证据引擎不需要 API 密钥。</p>`;
+      ? "密钥已安全保存；此电脑会记住，并在适用的知识库中复用。输入新值可替换。"
+      : "只需输入一次；此电脑会在适用的知识库中复用。";
+  const keyField = isManaged ? `<p class="cherry-field-hint">云端模型由 ScanSci 托管提供，无需配置 API 密钥；本地模型通过这台电脑的运行时调用。</p>` : isLocalConnection ? `<p class="cherry-field-hint">本机运行时连接无需 API 密钥。请到“运行时”页面检测连接和模型能力。</p>` : provider.kind !== "local" ? `<div class="cherry-key-row"><label class="cherry-field cherry-secret-field"><span>API 密钥${provider.api_key_configured ? `<em>${providerKeyLabel}</em>` : ""}</span><span class="cherry-secret-control"><input name="provider-api-key" type="password" autocomplete="new-password" autocapitalize="off" spellcheck="false" placeholder="${provider.api_key_configured ? "已保存；输入新值以替换" : "输入后仅保存在系统凭据管理器"}" /></span></label><button type="button" class="cherry-detect-button" data-action="test-provider" ${!provider.api_key_configured ? "disabled" : ""}>检 测</button></div><p class="cherry-field-hint">${providerKeyHint}</p>` : `<p class="cherry-field-hint">内置证据引擎不需要 API 密钥。</p>`;
+  const remoteRagField = provider.id === "siliconflow"
+    ? `<div class="cherry-endpoint-mode"><div class="cherry-endpoint-mode-copy"><strong>允许云端知识库检索</strong><small>开启后，本工作区的论文片段和检索问题会发送至 ${escapeHtml(provider.base_url || "当前 API 地址")} 用于嵌入、重排；关闭后改用本地检索。更换 API 地址后需重新开启。</small></div><label class="cherry-toggle cherry-endpoint-toggle"><input name="provider-remote-rag-allowed" type="checkbox" ${provider.remote_rag_allowed ? "checked" : ""} aria-label="允许云端服务处理本工作区的论文片段和检索问题" /><span aria-hidden="true"></span></label></div>`
+    : "";
   const isZhipu = provider.id === "zhipu";
   const codingPlanEnabled = isZhipu && Boolean(provider.coding_plan_enabled);
   const codingPlanField = isZhipu
@@ -12724,7 +13447,7 @@ function renderModelsSettings() {
     ? `API 地址 <i>⌁</i><b class="cherry-endpoint-mode-label">${codingPlanEnabled ? "Coding Plan" : "标准 API"}</b>`
     : "API 地址 <i>⌁</i>";
   const restoreDefaultButton = isBuiltInProvider(provider) ? '<button type="button" class="cherry-restore-default" data-action="restore-provider-default">恢复默认</button>' : "";
-  const providerHeaderActions = `${restoreDefaultButton}${provider.api_key_configured && !providerUsesEnvironmentKey && !isManaged ? '<button type="button" class="cherry-text-button" data-action="remove-provider-key">移除密钥</button>' : ""}<button type="button" class="cherry-text-button" data-action="refresh-model-health" ${state.modelHealth?.loading ? "disabled" : ""}>${state.modelHealth?.loading ? "检查中…" : "刷新状态"}</button><button type="submit" class="cherry-save-button">保存</button>`;
+  const providerHeaderActions = `${restoreDefaultButton}${provider.api_key_configured && !providerUsesEnvironmentKey && !isManaged ? '<button type="button" class="cherry-text-button" data-action="remove-provider-key" title="移除当前知识库及同地址的共享密钥；其他旧工作区的独立密钥需分别移除">移除密钥</button>' : ""}<button type="button" class="cherry-text-button" data-action="refresh-model-health" ${state.modelHealth?.loading ? "检查中…" : "刷新状态"}</button><button type="submit" class="cherry-save-button">保存</button>`;
   const endpointPreview = provider.id === "jev"
     ? `POST ${provider.base_url || JEV_DEFAULT_ENDPOINT}`
     : provider.id === "opencode-go"
@@ -12743,7 +13466,7 @@ function renderModelsSettings() {
     : provider.id === "paratera"
       ? '<p class="cherry-field-hint">保存密钥后，可在输入框选择 WanX2.1-T2I-Plus 生图，按服务商计费；也可在“默认能力”中设为图像生成模型。<a href="https://ai.paratera.com/document/llm/modalAbility/image" target="_blank" rel="noopener noreferrer">生图说明与价格 ↗</a></p>'
     : "";
-  return `<section class="cherry-model-services"><aside class="cherry-provider-catalog"><label class="cherry-provider-search"><svg class="cherry-search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.75" cy="10.75" r="6.75"></circle><path d="m16 16 5 5"></path></svg><input id="modelServiceSearch" type="search" value="${escapeHtml(state.providerQuery)}" placeholder="搜索模型平台..." autocomplete="off" /></label><div class="cherry-provider-scroll">${providerItems || '<div class="cherry-provider-empty">没有匹配的模型平台</div>'}${localRuntimeNotice}</div><button class="cherry-add-provider" type="button" data-action="add-provider">＋&nbsp; 添加</button></aside><main class="cherry-provider-panel"><form id="modelProviderForm"><header class="cherry-provider-header"><div><div class="cherry-provider-name">${providerLogo(provider)}<h1>${escapeHtml(provider.name)}</h1><button type="button" class="cherry-mini-gear" aria-label="服务商设置">⚙</button></div>${kindField}</div><div class="cherry-provider-header-actions">${providerHeaderActions}<span class="cherry-provider-header-divider" aria-hidden="true"></span><label class="cherry-toggle"><input name="provider-enabled" type="checkbox" ${provider.enabled ? "checked" : ""} /><span></span></label></div></header><section class="cherry-connection-section">${customNameField}${keyField}${codingPlanField}<label class="cherry-field"><span>${endpointLabel}</span><input name="provider-base-url" value="${escapeHtml(provider.base_url || "")}" placeholder="https://api.example.com/v1" maxlength="500" ${isManaged ? "readonly" : ""} /></label>${providerGuide}<p class="cherry-endpoint-preview">预览：${escapeHtml(endpointPreview)}</p></section><section class="cherry-model-section"><header><div class="cherry-model-section-title"><h2>模型</h2><b>${provider.models.length + localServiceModels.length}</b></div><label class="cherry-model-search"><span>⌕</span><input id="modelListSearch" type="search" value="${escapeHtml(state.modelQuery)}" placeholder="搜索模型..." aria-label="搜索模型" autocomplete="off" /></label><div class="cherry-model-actions"><button type="button" class="cherry-fetch-button" data-action="fetch-provider-models" ${provider.kind === "local" || !provider.model_listing ? "disabled" : ""}>↻&nbsp; 获取模型列表</button><button type="button" class="cherry-plus-button" data-action="add-model" aria-label="添加模型">＋</button></div></header><div class="cherry-model-list">${(modelRows + localServiceModelsMarkup(localServiceModels, modelQuery)) || `<div class="cherry-provider-empty">${modelQuery ? "没有匹配的模型" : "尚未添加模型"}</div>`}</div></section><footer class="cherry-provider-footer"><button type="button" class="cherry-remove-provider" data-action="remove-provider" ${isBuiltInProvider(provider) ? "disabled" : ""}>移除服务商</button></footer>${modelEditorMarkup(provider)}</form></main></section>`;
+  return `<section class="cherry-model-services"><aside class="cherry-provider-catalog"><label class="cherry-provider-search"><svg class="cherry-search-icon" viewBox="0 0 24 24" aria-hidden="true"><circle cx="10.75" cy="10.75" r="6.75"></circle><path d="m16 16 5 5"></path></svg><input id="modelServiceSearch" type="search" value="${escapeHtml(state.providerQuery)}" placeholder="搜索模型平台..." autocomplete="off" /></label><div class="cherry-provider-scroll">${providerItems || '<div class="cherry-provider-empty">没有匹配的模型平台</div>'}${localRuntimeNotice}</div><button class="cherry-add-provider" type="button" data-action="add-provider">＋&nbsp; 添加</button></aside><main class="cherry-provider-panel"><form id="modelProviderForm"><header class="cherry-provider-header"><div><div class="cherry-provider-name">${providerLogo(provider)}<h1>${escapeHtml(provider.name)}</h1><button type="button" class="cherry-mini-gear" aria-label="服务商设置">⚙</button></div>${kindField}</div><div class="cherry-provider-header-actions">${providerHeaderActions}<span class="cherry-provider-header-divider" aria-hidden="true"></span><label class="cherry-toggle"><input name="provider-enabled" type="checkbox" ${provider.enabled ? "checked" : ""} /><span></span></label></div></header><section class="cherry-connection-section">${customNameField}${keyField}${remoteRagField}${codingPlanField}<label class="cherry-field"><span>${endpointLabel}</span><input name="provider-base-url" value="${escapeHtml(provider.base_url || "")}" placeholder="https://api.example.com/v1" maxlength="500" ${isManaged ? "readonly" : ""} /></label>${providerGuide}<p class="cherry-endpoint-preview">预览：${escapeHtml(endpointPreview)}</p></section><section class="cherry-model-section"><header><div class="cherry-model-section-title"><h2>模型</h2><b>${provider.models.length + localServiceModels.length}</b></div><label class="cherry-model-search"><span>⌕</span><input id="modelListSearch" type="search" value="${escapeHtml(state.modelQuery)}" placeholder="搜索模型..." aria-label="搜索模型" autocomplete="off" /></label><div class="cherry-model-actions"><button type="button" class="cherry-fetch-button" data-action="fetch-provider-models" ${provider.kind === "local" || !provider.model_listing ? "disabled" : ""}>↻&nbsp; 获取模型列表</button><button type="button" class="cherry-plus-button" data-action="add-model" aria-label="添加模型">＋</button></div></header><div class="cherry-model-list">${(modelRows + localServiceModelsMarkup(localServiceModels, modelQuery)) || `<div class="cherry-provider-empty">${modelQuery ? "没有匹配的模型" : "尚未添加模型"}</div>`}</div></section><footer class="cherry-provider-footer"><button type="button" class="cherry-remove-provider" data-action="remove-provider" ${isBuiltInProvider(provider) ? "disabled" : ""}>移除服务商</button></footer>${modelEditorMarkup(provider)}</form></main></section>`;
 }
 
 function renderLegacyLocalModelsSettings() {
@@ -12812,7 +13535,7 @@ function renderLegacyLocalModelsSettings() {
       : canDownload
         ? `<button type="button" class="quiet-text-button" data-action="download-local-model" data-model-repo="${escapeHtml(item.id)}" data-model-runtime="${escapeHtml(item.runtime || "huggingface")}">下载</button>`
         : isOllama
-          ? `<button type="button" class="quiet-text-button" data-action="open-ollama-setup">安装/启动 Ollama</button>`
+          ? `<button type="button" class="quiet-text-button" data-action="open-ollama-setup">连接已有 Ollama</button>`
           : `<button type="button" class="quiet-text-button" data-action="open-local-runtime-setup">查看运行时</button>`;
     const status = isOllama && !ollama.reachable && !installed ? "需要 Ollama" : ready ? "已就绪" : job ? downloadJobStatus(job).label : "未下载";
     return `<article class="quiet-model-row">${item.icon_url ? `<img class="model-market-icon" data-site-icon="true" src="/api/site-icon?url=${encodeURIComponent(item.icon_url)}" alt="" loading="lazy" decoding="async" />` : `<span class="quiet-model-mark is-muted">${isOllama ? "◉" : "↓"}</span>`}<div><strong>${escapeHtml(item.name)}</strong><p>${escapeHtml(item.description || (isOllama ? "本地视觉模型" : "本地模型"))}${item.size_hint ? ` · ${escapeHtml(item.size_hint)}` : ""}</p><div class="local-capability-tags"><span>${capabilityLabel(item.kind)}</span><span>${status}</span></div></div>${action}</article>`;
@@ -12936,7 +13659,7 @@ function localModelMarketRow(item, recommendedIds) {
         : canDownload
           ? `<button type="button" class="quiet-text-button" data-action="download-local-model" data-model-repo="${escapeHtml(item.id)}" data-model-runtime="${escapeHtml(item.runtime || "huggingface")}">下载</button>`
           : isOllama
-            ? `<button type="button" class="quiet-text-button" data-action="open-ollama-setup">安装 / 启动 Ollama</button>`
+            ? `<button type="button" class="quiet-text-button" data-action="open-ollama-setup">连接已有 Ollama</button>`
             : `<button type="button" class="quiet-text-button" data-action="open-local-runtime-setup">查看运行时</button>`;
   const status = incompatible ? "当前格式不可运行" : isOllama && !ollama.reachable && !installed ? "需要 Ollama" : ready ? "已就绪" : job ? downloadJobStatus(job).label : "未下载";
   const kind = item.kind || "chat";
@@ -12968,6 +13691,32 @@ function localRuntimeChannelRecoveryMarkup(runtime = state.localRuntime || {}) {
   return `<section class="local-runtime-recovery"><header><div><span>下载通道</span><strong>${escapeHtml(checking ? "正在检查自动通道…" : summary)}</strong></div><button type="button" class="quiet-text-button" data-action="check-local-runtime-channels" ${checking ? "disabled" : ""}>${uiIcon("refresh")} ${checking ? "检查中…" : checked ? "重新检查" : "检查通道"}</button></header>${channelRows}<div class="local-runtime-manual-fallback"><div><strong>网络仍不可用？可以手动安装</strong><p>从官方发布页下载 ZIP；如果是分片包，请把 JSON 清单和全部分片一起选中，ScanSci 会校验后再安装。</p></div><div class="local-runtime-recovery-actions"><button type="button" class="quiet-primary-button" data-action="choose-local-runtime-files">选择本地文件</button><a href="${escapeHtml(releaseUrl)}" target="_blank" rel="noopener noreferrer">打开官方发布页 ${uiIcon("arrow-up-right")}</a></div></div></section>`;
 }
 
+function renderStrataSetupMarkup() {
+  const entry = (state.settings?.local_models || []).find((item) => item.runtime === "strata" && item.id === "strata");
+  const routeChanged = Boolean(entry && state.strataDraftUrl && state.strataDraftUrl.replace(/\/$/, "") !== String(entry.base_url || "").replace(/\/$/, ""));
+  const candidate = state.strataCandidateConnection?.base_url === state.strataDraftUrl ? state.strataCandidateConnection : null;
+  const connection = candidate || (!routeChanged && entry ? state.modelHealth?.runtime_connections?.[entry.id] : null);
+  const models = (connection?.models || []).filter(Boolean);
+  const current = String(candidate ? models[0] || "" : entry?.model_id || models[0] || "");
+  const selectedHealth = modelHealthEntry(`local-runtime-${entry?.id || "strata"}`, current);
+  const verified = !candidate && selectedHealth?.status === "ready";
+  const connectionFailed = Boolean(state.strataProbeError || (entry?.enabled && connection && !connection.ok));
+  const stage = connectionFailed ? "连接异常" : candidate ? "候选地址待验证" : !entry ? "尚未连接" : !entry.enabled ? "已停用" : !connection ? "等待检测" : verified ? "Agent 已验证" : "模型已发现 · 待验证";
+  const detail = state.strataProbeError || connection?.error || (candidate ? "候选地址已连接。验证通过后切换助手，当前默认模型继续可用。" : connection?.ok ? `已发现 ${models.length} 个模型入口。验证通过后可设为助手。` : routeChanged ? "点击重新检测连接；当前默认模型继续可用。" : "先安装并启动 Strata，再检测连接。");
+  const hardware = state.strataPreflight;
+  const vram = Number(hardware?.vram_gib || 0) > 0 ? `${hardware.vram_gib} GiB` : "未检出";
+  const hardwareNote = hardware
+    ? `本机内存 ${escapeHtml(hardware.ram_gib || "未知")} GiB · NVIDIA 显存 ${escapeHtml(vram)}。实际可运行性由 Strata 安装器和模型加载确认。`
+    : "安装前可查看本机内存和 NVIDIA 显存；模型所需磁盘空间以 Strata 安装器为准。";
+  const selector = connection?.ok && models.length
+    ? `<label class="strata-model-picker"><span>已加载模型</span><select data-strata-model>${models.map((model) => `<option value="${escapeHtml(model)}" ${model === current ? "selected" : ""}>${escapeHtml(model)}</option>`).join("")}</select></label>`
+    : "";
+  const verifyAction = entry && connection?.ok && models.length
+    ? `<button type="button" class="quiet-primary-button" data-action="activate-strata" data-local-id="${escapeHtml(entry.id)}" ${state.strataProbeRunning ? "disabled" : ""}>${state.strataProbeRunning ? "正在验证模型…" : "验证并设为助手"}</button>`
+    : "";
+  return `<section class="strata-setup local-runtime-recovery"><header><div><span>可选 · 外部本地推理</span><strong>Strata</strong></div><b class="strata-setup-stage ${connectionFailed ? "is-error" : ""}">${connectionFailed ? uiIcon("circle-alert") : ""}${escapeHtml(stage)}</b></header><p>下载官方发布包，解压后双击 START-HERE.bat 完成安装和启动。首次模型下载约 70 GB 起；模型文件保存在本机。</p><label class="strata-model-picker"><span>本机地址</span><input data-strata-url value="${escapeHtml(state.strataDraftUrl || entry?.base_url || "http://127.0.0.1:8080/v1")}" aria-label="Strata 本机地址" /></label><p class="strata-setup-detail ${connectionFailed ? "is-error" : ""}" role="status">${escapeHtml(detail)}</p><div class="strata-setup-actions"><a href="https://github.com/Niko1221/Strata/releases/latest" target="_blank" rel="noopener noreferrer">打开 Strata 官方发布页 ${uiIcon("arrow-up-right")}</a><button type="button" class="quiet-text-button" data-action="check-strata-hardware">查看本机条件</button><button type="button" class="quiet-text-button" data-action="connect-strata">${entry ? "重新检测连接" : "连接已运行的 Strata"}</button>${verifyAction}${entry ? '<button type="button" class="quiet-text-button" data-action="disconnect-strata">移除连接</button>' : ""}</div><small class="strata-hardware-note">${hardwareNote}</small>${selector}<small>ScanSci 只连接本机地址；嵌入、重排和文件读取继续由 ScanSci 管理。</small></section>`;
+}
+
 function renderExternalRuntimeConnectionsMarkup() {
   const presets = (state.presets?.local_models || [])
     .filter((item) => ["ollama", "lm-studio", "llama.cpp"].includes(String(item.runtime || "").toLowerCase()))
@@ -12975,14 +13724,16 @@ function renderExternalRuntimeConnectionsMarkup() {
     .join("");
   const manualRuntimeItems = (state.settings?.local_models || [])
     .map((item, index) => ({ item, index }))
-    .filter(({ item }) => !["builtin", "local-huggingface"].includes(String(item.runtime || "").toLowerCase()));
+    .filter(({ item }) => !["builtin", "local-huggingface", "strata"].includes(String(item.runtime || "").toLowerCase()));
+  const runtimeAddressCount = new Set(manualRuntimeItems.map(({ item }) => `${item.runtime}|${item.base_url}`)).size
+    + Number((state.settings?.local_models || []).some((item) => item.id === "strata" && item.runtime === "strata"));
   const runtimeRows = manualRuntimeItems
     .map(({ item, index }) => {
-      const runtimeName = { ollama: "Ollama", "lm-studio": "LM Studio", "llama.cpp": "llama.cpp" }[String(item.runtime || "").toLowerCase()] || item.runtime || "本地运行时";
-      return `<article class="local-runtime-row"><header class="local-runtime-row-header"><div class="local-runtime-row-copy"><span class="local-runtime-row-icon">${uiIcon("cpu")}</span><div><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(runtimeName)} · ${item.enabled ? "可用" : "已停用"}</small></div></div><button type="button" class="local-runtime-remove" data-action="remove-local-model" data-local-index="${index}">移除</button></header><details class="local-runtime-edit"><summary>编辑连接</summary><div class="quiet-runtime-fields"><label><span>名称</span><input data-local-name="${index}" value="${escapeHtml(item.name)}" /></label><label><span>运行时</span><input data-local-runtime="${index}" value="${escapeHtml(item.runtime)}" /></label><label><span>地址</span><input data-local-url="${index}" value="${escapeHtml(item.base_url || "")}" placeholder="http://127.0.0.1:11434/v1" /></label><label><span>模型 ID</span><input data-local-model="${index}" value="${escapeHtml(item.model_id || "")}" placeholder="例如 qwen3:8b" /></label><label class="quiet-switch"><input type="checkbox" data-local-enabled="${index}" ${item.enabled ? "checked" : ""} /><span>允许助手使用</span></label><div><button type="button" class="quiet-text-button" data-action="test-local-model" data-local-id="${escapeHtml(item.id)}">测试连接</button></div></div></details></article>`;
+      const runtimeName = { ollama: "Ollama", "lm-studio": "LM Studio", "llama.cpp": "llama.cpp", strata: "Strata" }[String(item.runtime || "").toLowerCase()] || item.runtime || "本地运行时";
+      return `<article class="local-runtime-row"><header class="local-runtime-row-header"><div class="local-runtime-row-copy"><span class="local-runtime-row-icon">${uiIcon("cpu")}</span><div><strong>${escapeHtml(item.name)}</strong><small>${escapeHtml(runtimeName)} · ${item.enabled ? "已启用" : "已停用"}</small></div></div><button type="button" class="local-runtime-remove" data-action="remove-local-model" data-local-index="${index}">移除</button></header><details class="local-runtime-edit"><summary>编辑连接</summary><div class="quiet-runtime-fields"><label><span>名称</span><input data-local-name="${index}" value="${escapeHtml(item.name)}" /></label><label><span>运行时</span><input data-local-runtime="${index}" value="${escapeHtml(item.runtime)}" /></label><label><span>地址</span><input data-local-url="${index}" value="${escapeHtml(item.base_url || "")}" placeholder="http://127.0.0.1:11434/v1" /></label><label><span>模型 ID</span><input data-local-model="${index}" value="${escapeHtml(item.model_id || "")}" placeholder="例如 qwen3:8b" /></label><label class="quiet-switch"><input type="checkbox" data-local-enabled="${index}" ${item.enabled ? "checked" : ""} /><span>允许助手使用</span></label><div><button type="button" class="quiet-text-button" data-action="test-local-model" data-local-id="${escapeHtml(item.id)}">测试连接</button></div></div></details></article>`;
     })
     .join("") || '<div class="quiet-empty">没有手动连接也没关系，ScanSci 会优先检测本地能力。</div>';
-  return `<section class="runtime-connections-panel"><header><div><h2>外部运行时</h2><p>连接你已经运行的 Ollama、LM Studio 或 llama.cpp；它们不会改变 ScanSci 默认的本地 Transformers 路线。</p></div><span class="runtime-connection-count">${manualRuntimeItems.length ? `${manualRuntimeItems.length} 个连接` : "可选"}</span></header>${presets ? `<div class="local-runtime-add"><strong>添加已有运行时</strong><div class="quiet-add-chips">${presets}</div></div>` : ""}<form id="localModelsForm" class="quiet-runtime-list">${runtimeRows}<footer><button type="submit" class="quiet-primary-button">保存连接</button></footer></form></section>`;
+  return `<section class="runtime-connections-panel"><header><div><h2>外部运行时</h2><p>连接你已经运行的 Ollama、LM Studio、llama.cpp 或 Strata。ScanSci 负责模型路由和工具授权。</p></div><span class="runtime-connection-count">${runtimeAddressCount ? `${runtimeAddressCount} 个服务地址` : "可选"}</span></header>${renderStrataSetupMarkup()}${presets ? `<div class="local-runtime-add"><strong>添加已有运行时</strong><div class="quiet-add-chips">${presets}</div></div>` : ""}<form id="localModelsForm" class="quiet-runtime-list">${runtimeRows}<footer><button type="submit" class="quiet-primary-button">保存连接</button></footer></form></section>`;
 }
 
 function renderRuntimeSettings() {
@@ -13036,17 +13787,21 @@ function stripLegacyLocalAgentRouting(page) {
 
 function renderLocalModelsSettings() {
   const installedItems = state.localModelMarket?.installed || [];
+  const ollamaItems = (state.ollama?.models || []).filter((item) => String(item?.name || item?.model || "").trim());
   const isUnavailableInstalledModel = (item) => item.runtime_compatible === false || item.runtime_probe_state === "failed";
   const usableInstalledCount = installedItems.filter((item) => (
     item.ready && !isUnavailableInstalledModel(item) && item.runtime_probe_state !== "pending"
   )).length;
   const unavailableInstalledCount = installedItems.filter(isUnavailableInstalledModel).length;
   const incompleteInstalledCount = installedItems.length - usableInstalledCount - unavailableInstalledCount;
-  const installedSummary = `${usableInstalledCount} 可用${incompleteInstalledCount ? ` · ${incompleteInstalledCount} 未完成` : ""}${unavailableInstalledCount ? ` · ${unavailableInstalledCount} 不可用` : ""}`;
+  const installedSummary = [
+    installedItems.length ? `${usableInstalledCount} 快照可用${incompleteInstalledCount ? ` · ${incompleteInstalledCount} 未完成` : ""}${unavailableInstalledCount ? ` · ${unavailableInstalledCount} 不可用` : ""}` : "",
+    ollamaItems.length ? `${ollamaItems.length} 个 Ollama 模型` : "",
+  ].filter(Boolean).join(" · ") || "0 已安装";
   const runtime = state.localRuntime || { installed: false, install_available: false, mode: "missing" };
   const runtimeReady = Boolean(runtime.installed) && !runtime.update_required;
   const ollama = state.ollama || {};
-  const installed = installedItems.map((item) => {
+  const installedSnapshots = installedItems.map((item) => {
     const size = `${(Number(item.size_bytes || 0) / 1024 / 1024 / 1024).toFixed(1)} GB`;
     const kind = item.kind || (/(embedding|embed|bge|gte|e5-)/i.test(item.id || "") ? "embedding" : /(rerank)/i.test(item.id || "") ? "reranking" : "chat");
     const unsupportedAudio = kind === "audio" && item.runtime_compatible === false;
@@ -13066,11 +13821,17 @@ function renderLocalModelsSettings() {
       ? `<small class="quiet-model-warning" title="${escapeHtml(item.runtime_message)}">${escapeHtml(item.runtime_message)}</small>`
       : "";
     return `<article class="quiet-model-row local-installed-model-row">${icon}<div class="local-installed-model-copy"><strong>${escapeHtml(item.name)}</strong><div class="local-capability-tags"><span>${escapeHtml(({ chat: "对话", embedding: "嵌入", reranking: "重排", vision: "视觉", audio: "语音" }[kind] || "通用"))}</span>${item.format ? `<span>${escapeHtml(item.format)}</span>` : ""}</div>${warning}</div><span class="quiet-row-note local-installed-status ${statusClass}">${status}</span><span class="quiet-row-size">${size}</span><div class="local-installed-actions">${probeAction}<button type="button" class="quiet-danger-button local-installed-remove" data-action="delete-installed-local-model" data-model-id="${escapeHtml(item.id)}" title="删除 ${escapeHtml(item.name)}" aria-label="删除 ${escapeHtml(item.name)}">${uiIcon("trash")}</button></div></article>`;
-  }).join("") || '<div class="quiet-empty">未发现本地模型快照。</div>';
+  }).join("");
+  const installedOllama = ollamaItems.map((item) => {
+    const name = String(item.name || item.model || "").trim();
+    const size = Number(item.size || 0) > 0 ? `${(Number(item.size) / 1024 / 1024 / 1024).toFixed(1)} GB` : "—";
+    return `<article class="quiet-model-row local-installed-model-row"><span class="quiet-model-mark">◉</span><div class="local-installed-model-copy"><strong>${escapeHtml(name)}</strong><div class="local-capability-tags"><span>Ollama</span><span>已安装</span></div></div><span class="quiet-row-note local-installed-status is-ready">已安装</span><span class="quiet-row-size">${size}</span><div class="local-installed-actions"><span class="quiet-row-note">由 Ollama 管理</span></div></article>`;
+  }).join("");
+  const installed = installedSnapshots + installedOllama || '<div class="quiet-empty">未发现本地模型。</div>';
   const audioRuntimeReady = runtimeReady && ["source", "embedded", "component"].includes(String(state.localRuntime?.mode || ""));
   const marketCatalog = (state.localModelMarket?.catalog || []).map((item) => {
     const isOllama = String(item.runtime || "").toLowerCase() === "ollama";
-    const ready = isOllama ? Boolean(ollama.model_ready || item.ready) : Boolean(item.ready);
+    const ready = Boolean(item.ready);
     const installed = isOllama ? ready : Boolean(item.installed);
     const canDownload = isOllama ? Boolean(ollama.reachable) : item.kind === "audio" ? audioRuntimeReady : runtimeReady;
     const job = (state.localModelInstall?.jobs || []).find((candidate) => (
@@ -13088,7 +13849,7 @@ function renderLocalModelsSettings() {
       : canDownload
         ? `<button type="button" class="quiet-text-button" data-action="download-local-model" data-model-repo="${escapeHtml(item.id)}" data-model-runtime="${escapeHtml(item.runtime || "huggingface")}">下载</button>`
         : isOllama
-          ? `<button type="button" class="quiet-text-button" data-action="open-ollama-setup">安装/启动 Ollama</button>`
+          ? `<button type="button" class="quiet-text-button" data-action="open-ollama-setup">连接已有 Ollama</button>`
           : `<button type="button" class="quiet-text-button" data-action="open-local-runtime-setup">查看运行时</button>`;
     const status = isOllama && !ollama.reachable && !installed ? "需要 Ollama" : ready ? "已就绪" : job ? downloadJobStatus(job).label : "未下载";
     const icon = item.icon_url
@@ -13097,9 +13858,36 @@ function renderLocalModelsSettings() {
     return `<article class="quiet-model-row">${icon}<div><strong>${escapeHtml(item.name)}</strong><p>${escapeHtml(item.description || "本地模型")}${item.size_hint ? ` · ${escapeHtml(item.size_hint)}` : ""}</p><div class="local-capability-tags"><span>${escapeHtml(({ chat: "对话", embedding: "嵌入", reranking: "重排", vision: "视觉", audio: "语音" }[item.kind] || "通用"))}</span><span>${status}</span></div></div>${action}</article>`;
   }).join("") || '<div class="quiet-empty">市场目录暂不可用。</div>';
   return `<section class="quiet-settings-page local-models-page local-models-page--managed">
+    ${renderLocalModelRecommendation()}
     <details class="local-model-disclosure local-model-market-disclosure" open><summary><span>模型市场</span><em>按需下载</em></summary><div class="local-model-disclosure-body"><form id="localModelMarketSearch" class="local-model-market-search"><input name="query" type="search" value="${escapeHtml(state.localModelMarket?.query || "")}" placeholder="搜索模型，例如 embedding、reranker、Qwen" aria-label="搜索模型市场" /><button type="submit" class="quiet-text-button">搜索</button></form><div class="quiet-model-list">${marketCatalog}</div></div></details>
-    <section class="local-installed-panel"><header><div><span>INSTALLED</span><h2>已安装模型</h2><p>完成下载并通过校验的模型会出现在这里。</p></div><b>${escapeHtml(installedSummary)}</b></header><div class="quiet-model-list local-installed-model-list">${installed}</div></section>
+    <section class="local-installed-panel"><header><div><span>INSTALLED</span><h2>已安装模型</h2><p>这里显示本地模型快照及 Ollama 中已有的模型。</p></div><b>${escapeHtml(installedSummary)}</b></header><div class="quiet-model-list local-installed-model-list">${installed}</div></section>
     </section>`;
+}
+
+function renderLocalModelRecommendation() {
+  const choice = state.localModelMarket?.recommendation;
+  if (!choice) return '<section class="local-model-recommendation"><span>本机推荐</span><p>正在检测硬件与模型状态…</p></section>';
+  if (!choice.available) return `<section class="local-model-recommendation"><span>本机推荐</span><p>${escapeHtml(choice.reason || "暂时没有合适的本地主力模型。")}</p></section>`;
+  const hardware = choice.hardware || {};
+  const gpu = hardware.gpu_name ? `${hardware.gpu_name} · ${hardware.vram_gib} GB 显存` : "未检测到 NVIDIA 显卡";
+  const memory = hardware.ram_gib ? `${hardware.ram_gib} GB 内存` : "内存待确认";
+  const disk = hardware.storage_free_gib == null ? "" : ` · 模型盘剩余 ${hardware.storage_free_gib} GB`;
+  const active = state.settings?.active_model?.model_id === choice.id
+    && String(state.settings?.active_model?.provider_id || "").startsWith("local-runtime-ollama-");
+  const job = (state.localModelInstall?.jobs || []).find((item) => item.job_id === `ollama:${choice.id}`);
+  const installing = ["queued", "downloading", "pausing", "cancelling"].includes(String(job?.state || ""));
+  const action = active
+    ? '<span class="local-model-recommendation-status">当前主力模型</span>'
+    : choice.installed
+      ? `<button type="button" class="quiet-primary-button" data-action="activate-recommended-model" data-model-id="${escapeHtml(choice.id)}">验证并设为主力</button>`
+      : installing
+        ? `<span class="local-model-recommendation-status">${escapeHtml(downloadJobStatus(job).label)} · ${escapeHtml(downloadJobProgressSummary(job))}</span>`
+        : choice.storage_blocked
+          ? '<span class="local-model-recommendation-status">模型盘空间不足</span>'
+          : choice.runtime_reachable
+            ? `<button type="button" class="quiet-primary-button" data-action="download-local-model" data-model-repo="${escapeHtml(choice.id)}" data-model-runtime="ollama">在已有 Ollama 中安装</button>`
+            : '<button type="button" class="quiet-text-button" data-action="open-ollama-setup">连接 Ollama 后安装</button>';
+  return `<section class="local-model-recommendation"><div><span>已有 Ollama · 本机推荐</span><h2>${escapeHtml(choice.name)}</h2><p>${escapeHtml(choice.reason)}</p><small>${escapeHtml(gpu)} · ${escapeHtml(memory)}${escapeHtml(disk)}</small><small>下载约 ${escapeHtml(choice.download_gb)} GB · Pi 任务上下文 ${escapeHtml(choice.context_tokens)} tokens；安装不会替换现有模型。</small></div>${action}</section>`;
 }
 
 // Local model routing is automatic and is already represented by the default
@@ -13364,11 +14152,16 @@ function renderDefaultCapabilitiesSettings() {
     { id: "reranking", title: "重排模型", description: "提高证据片段排序。", capability: "reranking" },
     { id: "retrieval", title: "基础检索", description: "语义模型不可用时的关键词回退。", capability: "retrieval" },
   ].map((item) => defaultCapabilityRow(item)).join("");
+  const remoteRetrievalSelected = ["embedding", "reranking"].some((role) => String(state.settings.model_roles?.[role] || "").startsWith("provider:siliconflow:"));
+  const siliconflow = (state.settings.providers || []).find((provider) => provider.id === "siliconflow");
+  const remoteRetrievalNotice = remoteRetrievalSelected && !siliconflow?.remote_rag_allowed
+    ? '<p class="default-capability-consent-warning" role="status">⚠ 已选择硅基流动检索模型。请在“模型服务 → 硅基流动”开启“允许云端知识库检索”；授权前继续使用本地检索。</p>'
+    : "";
   return `<section class="settings-minimal-page default-capabilities-page"><header class="settings-page-heading default-capabilities-heading"><div><h1>默认能力</h1></div><button type="button" class="quiet-text-button" data-action="open-resource-guide">添加本地能力 ${uiIcon("arrow-right")}</button></header>
     <form id="defaultCapabilitiesForm"><div class="settings-minimal-sections">
       ${defaultCapabilityPanel("助手", "默认助手", "对话、任务、写作和演示使用同一个默认模型。", assistantRows)}
       ${defaultCapabilityPanel("多模态", "视觉、图像与语音", "图像理解、图像生成和语音能力可以分别选择模型。", multimodalRows)}
-      ${defaultCapabilityPanel("知识库", "语义检索", "嵌入和重排可以独立选择；基础检索始终可用。", retrievalRows)}
+      ${defaultCapabilityPanel("知识库", "语义检索", "嵌入和重排可以独立选择；基础检索始终可用。", retrievalRows)}${remoteRetrievalNotice}
     </div><footer class="settings-minimal-actions"><span>配置仅保存在此电脑</span><button type="submit" class="save-button">保存默认能力</button></footer></form>
     <section class="default-tools-section default-tools-disclosure">${renderDocumentProcessingFormMarkup("defaultDocumentProcessingForm", true)}</section>
   </section>`;
@@ -13620,6 +14413,7 @@ function collectProviderForm() {
     provider.base_url = provider.coding_plan_enabled ? provider.coding_plan_base_url : provider.standard_base_url;
   }
   provider.enabled = form.elements["provider-enabled"]?.checked ?? provider.enabled;
+  if (provider.id === "siliconflow") provider.remote_rag_allowed = Boolean(form.elements["provider-remote-rag-allowed"]?.checked);
   provider.models = provider.models.map((model, index) => {
     const id = form.querySelector(`[data-model-id="${index}"]`)?.value.trim() || model.id;
     return {
@@ -13634,14 +14428,18 @@ function collectProviderForm() {
 }
 
 function collectLocalModelsForm() {
-  state.settings.local_models = (state.settings.local_models || []).map((model, index) => ({
-    ...model,
-    name: document.querySelector(`[data-local-name="${index}"]`)?.value.trim() || model.name,
-    runtime: document.querySelector(`[data-local-runtime="${index}"]`)?.value.trim() || model.runtime,
-    base_url: document.querySelector(`[data-local-url="${index}"]`)?.value.trim() || "",
-    model_id: document.querySelector(`[data-local-model="${index}"]`)?.value.trim() || "",
-    enabled: document.querySelector(`[data-local-enabled="${index}"]`)?.checked ?? model.enabled,
-  }));
+  state.settings.local_models = (state.settings.local_models || []).map((model, index) => {
+    const urlInput = document.querySelector(`[data-local-url="${index}"]`);
+    if (!urlInput) return model;
+    return {
+      ...model,
+      name: document.querySelector(`[data-local-name="${index}"]`)?.value.trim() || model.name,
+      runtime: document.querySelector(`[data-local-runtime="${index}"]`)?.value.trim() || model.runtime,
+      base_url: urlInput.value.trim(),
+      model_id: document.querySelector(`[data-local-model="${index}"]`)?.value.trim() || "",
+      enabled: document.querySelector(`[data-local-enabled="${index}"]`)?.checked ?? model.enabled,
+    };
+  });
   return state.settings.local_models;
 }
 
@@ -13676,7 +14474,7 @@ async function refreshLocalModelMarket() {
       request("/api/local-runtime").catch(() => state.localRuntime),
       request("/api/ollama/status").catch(() => state.ollama),
     ]);
-    state.localModelMarket = { installed: installed.models || [], catalog: catalog.items || [], source: catalog.source || "", query, loading: false, loaded: true };
+    state.localModelMarket = { installed: installed.models || [], catalog: catalog.items || [], recommendation: catalog.recommendation || null, source: catalog.source || "", query, loading: false, loaded: true };
     state.localRuntime = { ...(state.localRuntime || {}), ...(runtime || {}) };
     state.ollama = ollama || state.ollama;
     state.settings = await request("/api/settings");
@@ -13780,7 +14578,7 @@ async function refreshModelHealth({ render = true } = {}) {
   }
   if (render) {
     renderModelSelectors();
-    if (state.activeView === "settings" && ["models", "local-models", "resources"].includes(state.activeSettings)) renderSettings();
+    if (state.activeView === "settings" && ["models", "local-models", "runtime", "resources"].includes(state.activeSettings)) renderSettings();
   }
   return state.modelHealth;
 }
@@ -13820,7 +14618,8 @@ function ensureActiveModel() {
 
 async function persistSettings(message = "设置已保存") {
   ensureActiveModel();
-  const saved = await request("/api/settings", { method: "POST", body: JSON.stringify({ settings: state.settings }) });
+  const settings = { ...state.settings, local_models: (state.settings.local_models || []).filter((model) => !model.discovered) };
+  const saved = await request("/api/settings", { method: "POST", body: JSON.stringify({ settings }) });
   state.settings = saved;
   applyAppearancePreferences();
   state.selectedProviderId = selectedProvider()?.id || state.settings.providers[0]?.id || "";
@@ -13877,12 +14676,16 @@ async function handleSettingsAction(action, element) {
     return;
   }
   if (action === "open-data-onboarding") {
-    await persistOnboardingPreferences({ welcome_dismissed: true }, "已打开知识库；资料接入可随时完成", { close: true });
     openMode("library");
     return;
   }
   if (action === "finish-first-run") {
     await finishFirstRun();
+    return;
+  }
+  if (action === "return-first-run") {
+    setView("home");
+    window.setTimeout(() => byId("firstRunWelcome")?.querySelector('[data-action="onboarding-open-knowledge"]')?.focus({ preventScroll: true }), 0);
     return;
   }
   if (action === "onboarding-next") {
@@ -13896,12 +14699,10 @@ async function handleSettingsAction(action, element) {
     return;
   }
   if (action === "onboarding-open-models") {
-    await persistOnboardingPreferences({ welcome_dismissed: true }, "已打开本地能力引导；模型可以按需下载", { close: true });
-    openResourceGuideOverlay();
+    openResourceGuideOverlay({ returnToWelcome: true });
     return;
   }
   if (action === "onboarding-open-knowledge") {
-    await persistOnboardingPreferences({ welcome_dismissed: true }, "已打开知识库；资料可以按需接入", { close: true });
     openMode("library");
     return;
   }
@@ -14125,45 +14926,6 @@ async function handleSettingsAction(action, element) {
     renderSettings();
     return;
   }
-  if (action === "toggle-provider-key") {
-    const provider = selectedProvider();
-    const input = byId("modelProviderForm")?.elements["provider-api-key"];
-    if (!provider || !input) return;
-    if (input.type === "text") {
-      input.type = "password";
-      element.innerHTML = uiIcon("eye");
-      element.setAttribute("aria-label", "显示 API 密钥");
-      element.setAttribute("title", "显示密钥");
-      element.setAttribute("aria-pressed", "false");
-      return;
-    }
-    if (!input.value && provider.api_key_configured) {
-      element.disabled = true;
-      element.classList.add("is-loading");
-      try {
-        const result = await request(`/api/settings/providers/${encodeURIComponent(provider.id)}/api-key/reveal`, {
-          method: "POST",
-          body: JSON.stringify({ reveal: true }),
-        });
-        input.value = String(result.api_key || "");
-      } finally {
-        element.disabled = false;
-        element.classList.remove("is-loading");
-      }
-    }
-    if (!input.value) {
-      input.focus();
-      return;
-    }
-    input.type = "text";
-    element.innerHTML = uiIcon("eye-off");
-    element.setAttribute("aria-label", "隐藏 API 密钥");
-    element.setAttribute("title", "隐藏密钥");
-    element.setAttribute("aria-pressed", "true");
-    input.focus({ preventScroll: true });
-    input.setSelectionRange(input.value.length, input.value.length);
-    return;
-  }
   if (action === "add-model") {
     const provider = collectProviderForm();
     provider.models.push({ id: `model-${provider.models.length + 1}`, name: "新模型", group: "默认模型", context_window: "", capabilities: ["reasoning"] });
@@ -14219,6 +14981,14 @@ async function handleSettingsAction(action, element) {
     }
     return;
   }
+  if (action === "toggle-model-composer-visibility") {
+    const provider = collectProviderForm();
+    const model = provider?.models?.[Number(element.dataset.modelIndex)];
+    if (!model) return;
+    model.show_in_composer = model.show_in_composer === false;
+    await persistSettings(model.show_in_composer ? "模型已显示在对话候选中" : "模型已从对话候选中隐藏");
+    return;
+  }
   if (action === "remove-model") {
     const provider = collectProviderForm();
     if (provider.models.length < 2) return;
@@ -14257,6 +15027,107 @@ async function handleSettingsAction(action, element) {
     state.settings.local_models.push(structuredClone(preset));
     renderSettings();
     document.querySelector(".local-manual-runtime-disclosure")?.setAttribute("open", "");
+    return;
+  }
+  if (action === "check-strata-hardware") {
+    state.strataDraftUrl = String(document.querySelector("[data-strata-url]")?.value || "").trim();
+    state.strataPreflight = await request("/api/strata/preflight");
+    renderSettings();
+    return;
+  }
+  if (action === "connect-strata") {
+    collectLocalModelsForm();
+    const preset = (state.presets?.local_models || []).find((item) => item.id === "strata");
+    if (!preset) {
+      toast("无法读取 Strata 连接预设，请刷新页面", true);
+      return;
+    }
+    const baseUrl = String(document.querySelector("[data-strata-url]")?.value || "").trim();
+    state.strataDraftUrl = baseUrl;
+    if (!/^http:\/\/(?:127\.0\.0\.1|\[::1\]):\d+\/v1\/?$/.test(baseUrl)) {
+      state.strataProbeError = "Strata 地址须为本机 HTTP 地址，例如 http://127.0.0.1:8080/v1";
+      state.strataCandidateConnection = null;
+      renderSettings();
+      toast(state.strataProbeError, true);
+      return;
+    }
+    let result;
+    try {
+      result = await request("/api/local-models/test-strata", {
+        method: "POST", body: JSON.stringify({ base_url: baseUrl }),
+      });
+    } catch (error) {
+      state.strataProbeError = error.message;
+      state.strataCandidateConnection = null;
+      renderSettings();
+      toast(error.message, true);
+      return;
+    }
+    if (!result.ok) {
+      state.strataProbeError = result.error || "尚未检测到已加载模型的 Strata 服务";
+      state.strataCandidateConnection = null;
+      renderSettings();
+      toast(state.strataProbeError, true);
+      return;
+    }
+    const existing = (state.settings.local_models || []).find((item) => item.id === "strata");
+    const inUse = state.settings.active_model?.provider_id === "local-runtime-strata"
+      || Object.values(state.settings.model_roles || {}).some((role) => String(role).startsWith("provider:local-runtime-strata:"));
+    state.strataProbeError = "";
+    if (existing && inUse && existing.base_url.replace(/\/$/, "") !== baseUrl.replace(/\/$/, "")) {
+      state.strataCandidateConnection = { ...result, base_url: baseUrl };
+      renderSettings();
+      toast("候选地址已连接；验证后再切换默认助手");
+      return;
+    }
+    state.strataCandidateConnection = null;
+    if (existing) {
+      existing.enabled = true;
+      existing.base_url = baseUrl;
+    } else state.settings.local_models.push({ ...structuredClone(preset), base_url: baseUrl, enabled: true });
+    await persistSettings("Strata 连接已保存");
+    await refreshModelHealth();
+    state.strataDraftUrl = "";
+    return;
+  }
+  if (action === "disconnect-strata") {
+    collectLocalModelsForm();
+    state.settings.local_models = (state.settings.local_models || []).filter((item) => item.id !== "strata" && !(item.runtime === "strata" && item.discovered));
+    state.strataProbeError = "";
+    state.strataDraftUrl = "";
+    state.strataCandidateConnection = null;
+    await persistSettings("Strata 连接已移除");
+    await refreshModelHealth();
+    return;
+  }
+  if (action === "activate-strata") {
+    if (state.strataProbeRunning) return;
+    collectLocalModelsForm();
+    const modelId = String(document.querySelector("[data-strata-model]")?.value || "").trim();
+    if (!modelId) return;
+    const baseUrl = String(document.querySelector("[data-strata-url]")?.value || "").trim();
+    state.strataDraftUrl = baseUrl;
+    state.strataProbeRunning = true;
+    state.strataProbeError = "";
+    renderSettings();
+    try {
+      const result = await request("/api/local-models/activate-strata", {
+        method: "POST",
+        body: JSON.stringify({ local_model_id: element.dataset.localId, model_id: modelId, base_url: baseUrl }),
+      });
+      state.settings = result.settings;
+      state.strataDraftUrl = "";
+      state.strataCandidateConnection = null;
+      await refreshModelHealth();
+      renderModelSelectors();
+      toast(`${modelId} 已通过流式回答、证据引用和工具调用验证，现为默认助手`);
+    } catch (error) {
+      state.strataProbeError = error.message;
+      toast(error.message, true);
+    } finally {
+      state.strataProbeRunning = false;
+      renderSettings();
+    }
     return;
   }
   if (action === "remove-local-model") {
@@ -14321,6 +15192,10 @@ async function handleSettingsAction(action, element) {
     collectLocalModelsForm();
     await persistSettings("正在测试本地运行时…");
     const result = await request(`/api/settings/local-models/${encodeURIComponent(element.dataset.localId)}/test`, { method: "POST", body: "{}" });
+    if (!result.ok) {
+      toast(result.error || "本地服务尚未就绪", true);
+      return;
+    }
     toast(`${result.runtime || "本地模型"}：${result.message || "连接正常"}`);
     return;
   }
@@ -14372,7 +15247,7 @@ async function handleSettingsAction(action, element) {
   }
   if (action === "open-ollama-setup") {
     openSettings("runtime");
-    toast("请先安装并启动 Ollama，再回来下载 MiniCPM-V 4.6。", true);
+    toast("如果已经安装 Ollama，请启动它并在运行时页面确认连接地址。", true);
     return;
   }
   if (action === "install-local-runtime") {
@@ -14410,6 +15285,25 @@ async function handleSettingsAction(action, element) {
       })
       .catch((error) => toast(error.message, true))
       .finally(() => { if (element.isConnected) element.disabled = false; });
+    return;
+  }
+  if (action === "activate-recommended-model") {
+    const modelId = element.dataset.modelId || "";
+    element.disabled = true;
+    element.textContent = "正在验证模型…";
+    try {
+      const result = await request("/api/local-models/activate-recommended", {
+        method: "POST",
+        body: JSON.stringify({ id: modelId }),
+      });
+      state.settings = result.settings;
+      await refreshLocalModelMarket();
+      toast(`${modelId} 已通过生成、工具调用和证据引用验证，现为主力模型。`);
+    } catch (error) {
+      toast(error.message, true);
+    } finally {
+      if (element.isConnected) element.disabled = false;
+    }
     return;
   }
   if (action === "install-retrieval-models") {
@@ -14603,6 +15497,7 @@ document.addEventListener("click", (event) => {
   else if (action === "confirm-review-save-note") commitReviewAsNote().catch((error) => toast(error.message, true));
   else if (action === "accept-confirm-dialog") settleConfirmation(true);
   else if (action === "jump-conversation-latest") followLatestConversationMessage({ smooth: true });
+  else if (action === "jump-conversation-turn") jumpConversationTurn(element.dataset.turnIndex);
   else if (action === "minimize-window") controlDesktopWindow("minimize_window").catch((error) => toast(error.message, true));
   else if (action === "toggle-maximize-window") controlDesktopWindow("toggle_maximize_window").catch((error) => toast(error.message, true));
   else if (action === "close-window") controlDesktopWindow("close_window").catch((error) => toast(error.message, true));
@@ -14662,6 +15557,39 @@ document.addEventListener("click", (event) => {
     else window.open(url, "_blank", "noopener,noreferrer");
   }
   else if (action === "choose-library-folder") chooseLibraryFolder("folder", element.dataset.notebookId || "").catch((error) => toast(error.message, true));
+  else if (action === "open-translation") openTranslationDialog({ showLocation: element.dataset.openLocation === "true" }).catch((error) => toast(error.message, true));
+  else if (action === "close-translation") closeTranslationDialog();
+  else if (action === "configure-translation-model") { closeTranslationDialog(); openSettings("models"); }
+  else if (action === "pick-translation-folder") pickTranslationFolder().catch((error) => toast(error.message, true));
+  else if (action === "save-translation-folder") saveTranslationFolder().catch((error) => toast(error.message, true));
+  else if (action === "cancel-translation") request(`/api/translations/${encodeURIComponent(translationRunId)}/cancel`, { method: "POST", body: "{}" }).then(() => refreshTranslationStatus()).catch((error) => toast(error.message, true));
+  else if (action === "cancel-translation-run") {
+    request(`/api/translations/${encodeURIComponent(element.dataset.runId || "")}/cancel`, { method: "POST", body: "{}" })
+      .then((run) => { upsertRun(run); if (state.activeTaskId === run.run_id) renderRun(run); })
+      .catch((error) => toast(error.message, true));
+  }
+  else if (action === "open-translation-result") {
+    const url = `/api/translations/${encodeURIComponent(translationRunId)}/pdf`;
+    if (window.ScanSciPdfViewer) window.ScanSciPdfViewer.open(url, "译文 PDF");
+    else window.open(url, "_blank", "noopener,noreferrer");
+  }
+  else if (action === "open-translation-run-pdf") {
+    const url = `/api/translations/${encodeURIComponent(element.dataset.runId || "")}/pdf`;
+    if (window.ScanSciPdfViewer) window.ScanSciPdfViewer.open(url, "译文 PDF");
+    else window.open(url, "_blank", "noopener,noreferrer");
+  }
+  else if (action === "open-translation-file") {
+    const url = `/api/translations/files/${encodeURIComponent(element.dataset.fileId || "")}`;
+    if (window.ScanSciPdfViewer) window.ScanSciPdfViewer.open(url, element.dataset.fileTitle || "译文 PDF");
+    else window.open(url, "_blank", "noopener,noreferrer");
+  }
+  else if (action === "show-translation-library") {
+    refreshTranslationLibrary().then(() => {
+      state.notebook = (state.workspace?.notebooks || []).find((item) => item.notebook_id === "translation-library") || state.notebook;
+      closeTranslationDialog();
+      openMode("library");
+    }).catch((error) => toast(error.message, true));
+  }
   else if (action === "choose-obsidian-vault") chooseLibraryFolder("obsidian", element.dataset.notebookId || "").catch((error) => toast(error.message, true));
   else if (action === "choose-zotero-library") connectLocalZotero(element.dataset.notebookId || "").catch((error) => toast(error.message, true));
   else if (action === "choose-zotero-data-directory") chooseZoteroDataDirectory(element.dataset.notebookId || "").catch((error) => toast(error.message, true));
@@ -14748,7 +15676,8 @@ document.addEventListener("click", (event) => {
       state.knowledgeVisibleLimit = 200;
       window.localStorage.setItem("scansci.knowledge.scope", notebook.notebook_id);
       renderMode();
-      void ensureActiveKnowledgeIndex();
+      if (knowledgeSourceKind(notebook) === "translation") void refreshTranslationLibrary();
+      else void ensureActiveKnowledgeIndex();
     }
   }
   else if (action === "load-more-knowledge-items") {
@@ -14914,6 +15843,10 @@ document.addEventListener("click", (event) => {
   else if (action === "toggle-composer-model") {
     event.preventDefault();
     toggleComposerModelPicker(element);
+  }
+  else if (action === "toggle-agent-mode") {
+    event.preventDefault();
+    setAgentMode(!state.agentMode);
   }
   else if (action === "toggle-context-usage") {
     event.preventDefault();
@@ -15114,9 +16047,18 @@ document.addEventListener("click", (event) => {
     renderMode();
   }
   else if (action === "open-mode") openMode(element.dataset.mode || "tools");
+  else if (action === "toggle-embedded-browser") {
+    window.pywebview?.api?.toggle_browser?.()
+      .then((result) => {
+        if (!result?.ok) throw new Error(result?.message || "内置浏览器暂时不可用");
+        updateEmbeddedBrowserButton(result.open);
+      })
+      .catch((error) => toast(error.message, true));
+  }
   else if (action === "open-external") {
     const url = element.dataset.url || "";
-    if (url.startsWith("/") || /^https?:\/\//i.test(url)) window.open(url, "_blank", "noopener");
+    if (/^https?:\/\//i.test(url)) openEmbeddedBrowser(url).catch((error) => toast(error.message, true));
+    else if (url.startsWith("/")) window.open(url, "_blank", "noopener");
   }
   else if (action === "open-local-path") {
     event.preventDefault();
@@ -15543,6 +16485,10 @@ document.addEventListener("keydown", (event) => {
 });
 
 document.addEventListener("input", (event) => {
+  if (event.target.id === "translationParentPath") {
+    updateTranslationLocation();
+    return;
+  }
   if (event.target.matches?.("[data-last-message-edit-input]")) {
     if (directMessageEdit) directMessageEdit.value = String(event.target.value || "");
     return;
@@ -15679,6 +16625,13 @@ byId("skillSecurityDialog")?.addEventListener("cancel", (event) => {
 });
 
 document.addEventListener("change", (event) => {
+  if (event.target.id === "translationFile") {
+    const file = event.target.files?.[0];
+    const name = byId("translationFileName");
+    name.textContent = file?.name || "选择 PDF";
+    name.title = file?.name || "";
+    return;
+  }
   const input = event.target.closest('#paperBatchFile[data-action="pick-batch-file"], #homePaperBatchFile[data-action="pick-home-batch-file"]');
   if (!input) return;
   const file = input.files && input.files[0];
@@ -15700,6 +16653,16 @@ document.addEventListener("change", (event) => {
 });
 
 document.addEventListener("submit", (event) => {
+  if (event.target.id === "translationForm") {
+    event.preventDefault();
+    submitTranslation().catch((error) => {
+      const status = byId("translationStatus");
+      status.hidden = false;
+      status.textContent = error.message;
+      toast(error.message, true);
+    });
+    return;
+  }
   if (event.target.id === "localModelMarketSearch") {
     event.preventDefault();
     state.localModelMarket.query = event.target.elements.query.value.trim();
@@ -16120,6 +17083,12 @@ byId("slideTemplateSearch").addEventListener("input", (event) => {
   renderSlideTemplateBrowser();
 });
 
+window.addEventListener("focus", () => {
+  if (state.activeView === "mode" && state.activeMode === "library" && knowledgeSourceKind(state.notebook) === "translation") {
+    refreshTranslationLibrary().catch(() => {});
+  }
+});
+
 document.addEventListener("keydown", (event) => {
   if (!event.ctrlKey || event.altKey || event.metaKey) return;
   if (event.key.toLowerCase() === "n") {
@@ -16169,12 +17138,60 @@ byId("answerArea")?.addEventListener("scroll", () => {
   const distanceFromBottom = answerArea.scrollHeight - answerArea.scrollTop - answerArea.clientHeight;
   state.conversationAutoFollow = distanceFromBottom < conversationFollowThreshold;
   updateConversationScrollAffordance();
+  scheduleConversationTurnNavActive();
 }, { passive: true });
+const conversationTurnList = byId("conversationTurnList");
+if (conversationTurnList) {
+  const area = byId("answerArea");
+  new MutationObserver(scheduleConversationTurnNav).observe(area, { childList: true, subtree: true, characterData: true });
+  new ResizeObserver(scheduleConversationTurnNav).observe(area);
+  const updateWave = (y) => {
+    conversationTurnNavState.waveY = y;
+    byId("conversationTurnNav")?.classList.add("is-hovering");
+    if (conversationTurnNavState.waveFrame) return;
+    conversationTurnNavState.waveFrame = window.requestAnimationFrame(() => {
+      conversationTurnNavState.waveFrame = 0;
+      const widths = [52, 40, 28, 20, 12];
+      conversationTurnList.querySelectorAll(".conversation-turn-marker").forEach((marker, index) => {
+        const position = Math.min(4, Math.abs(conversationTurnNavState.waveY - (index + 0.5) * 20) / 20);
+        const lower = Math.floor(position);
+        const width = widths[lower] + (widths[Math.min(4, lower + 1)] - widths[lower]) * (position - lower);
+        marker.style.setProperty("--wave-width", `${width.toFixed(1)}px`);
+      });
+    });
+  };
+  conversationTurnList.addEventListener("pointermove", (event) => {
+    const button = event.target.closest(".conversation-turn-marker");
+    if (!button) return;
+    const index = Number(button.dataset.turnIndex);
+    if (index !== conversationTurnNavState.hovered) showConversationTurnPreview(index);
+    updateWave(event.clientY - conversationTurnList.getBoundingClientRect().top + conversationTurnList.scrollTop);
+  });
+  conversationTurnList.addEventListener("pointerleave", () => {
+    if (!conversationTurnList.contains(document.activeElement)) hideConversationTurnPreview();
+  });
+  conversationTurnList.addEventListener("focusin", (event) => {
+    const button = event.target.closest(".conversation-turn-marker");
+    if (button) {
+      const index = Number(button.dataset.turnIndex);
+      showConversationTurnPreview(index);
+      updateWave((index + 0.5) * 20);
+    }
+  });
+  conversationTurnList.addEventListener("focusout", (event) => {
+    if (!conversationTurnList.contains(event.relatedTarget)) hideConversationTurnPreview();
+  });
+  conversationTurnList.addEventListener("scroll", () => {
+    if (conversationTurnNavState.hovered >= 0) showConversationTurnPreview(conversationTurnNavState.hovered);
+  }, { passive: true });
+}
 byId("taskList")?.addEventListener("scroll", () => {
   if (state.historyMenuRunId) positionTaskMenu();
 });
 window.addEventListener("resize", () => {
+  scheduleConversationTurnNav();
   if (state.historyMenuRunId) positionTaskMenu();
+  document.querySelectorAll("[data-composer-model].is-open").forEach(fitComposerModelPicker);
 });
 renderProfileAvatar();
 updateChromeControls();
@@ -16185,6 +17202,9 @@ initialize();
 renderAppUpdate();
 window.addEventListener("pywebviewready", () => {
   state.updateNative = Boolean(window.pywebview?.api?.install_update);
-  renderRuntimeBadge();
+  const browserButton = document.querySelector('[data-action="toggle-embedded-browser"]');
+  if (browserButton) browserButton.hidden = typeof window.pywebview?.api?.toggle_browser !== "function";
+  syncEmbeddedBrowserTheme();
   renderAppUpdate();
 });
+window.addEventListener("scansci-browser-state", (event) => updateEmbeddedBrowserButton(event.detail?.open));

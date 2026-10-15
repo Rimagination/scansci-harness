@@ -1,3 +1,5 @@
+import json
+
 import pytest
 import requests
 
@@ -7,6 +9,7 @@ from scansci_html.llm import (
     OpenAICompatibleChatJsonClient,
     _model_transport_exception,
     _public_model_error,
+    _response_needs_continuation,
     analyze_vision_images,
     build_chat_json_client,
     complete_chat_text,
@@ -45,6 +48,28 @@ def test_public_model_error_distinguishes_gateway_and_upstream_rate_limits():
     assert "ScanSci 托管模型网关当前限流" in _public_model_error(gateway_error, prefix="模型服务暂时不可用")
     assert "上游服务当前限流" in _public_model_error(upstream_error, prefix="模型服务暂时不可用")
     assert "b95e7079-0000-4000-8000-000000000001" in _public_model_error(gateway_error, prefix="模型服务暂时不可用")
+
+
+def test_public_model_error_explains_local_runner_crash_without_raw_english():
+    class LocalResponse:
+        status_code = 500
+        url = "http://127.0.0.1:11434/v1/chat/completions"
+
+        def json(self):
+            return {"error": {"message": "model runner has unexpectedly stopped, check ollama server logs for details"}}
+
+    error = requests.HTTPError("HTTP 500", response=LocalResponse())
+
+    assert _public_model_error(error, prefix="模型服务暂时不可用") == (
+        "本地模型运行中断。请检查 Ollama，或换用较小模型后重试。"
+    )
+
+    class BusyResponse(LocalResponse):
+        def json(self):
+            return {"error": {"message": "模型忙"}}
+
+    busy = requests.HTTPError("HTTP 500", response=BusyResponse())
+    assert _public_model_error(busy, prefix="模型服务暂时不可用") == "模型服务暂时不可用（HTTP 500）：模型忙"
 
 
 def test_model_transport_exception_preserves_retry_metadata():
@@ -563,6 +588,8 @@ def test_openai_json_client_honors_long_rate_limit_without_blocking_workflow(mon
 
 
 def test_complete_chat_text_returns_a_plain_openai_compatible_reply():
+    requests_sent = []
+
     class FakeResponse:
         def raise_for_status(self):
             return None
@@ -572,10 +599,10 @@ def test_complete_chat_text_returns_a_plain_openai_compatible_reply():
 
     class FakeSession:
         def post(self, url, *, headers, json, timeout):
+            requests_sent.append(json)
             assert url == "https://example.test/v1/chat/completions"
             assert headers["Authorization"] == "Bearer secret"
             assert json["stream"] is False
-            assert json["max_tokens"] == 8192
             assert timeout == 90.0
             return FakeResponse()
 
@@ -587,6 +614,17 @@ def test_complete_chat_text_returns_a_plain_openai_compatible_reply():
         messages=[{"role": "user", "content": "你好"}],
         session=FakeSession(),
     ) == "你好，我是 GLM。"
+    assert complete_chat_text(
+        "openai-compatible",
+        base_url="https://example.test/v1",
+        api_key="secret",
+        model="chat-model",
+        messages=[{"role": "user", "content": "你好"}],
+        session=FakeSession(),
+        max_tokens=None,
+    ) == "你好，我是 GLM。"
+    assert requests_sent[0]["max_tokens"] == 8192
+    assert "max_tokens" not in requests_sent[1]
 
 
 def test_complete_chat_text_forwards_a_valid_thinking_mode_only_when_requested():
@@ -614,6 +652,35 @@ def test_complete_chat_text_forwards_a_valid_thinking_mode_only_when_requested()
         session=FakeSession(),
     ) == "ok"
     assert calls[0]["thinking"] == {"type": "disabled"}
+
+
+def test_local_qwen_chat_uses_ollama_reasoning_effort():
+    calls = []
+
+    class FakeResponse:
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return {"choices": [{"message": {"content": "12 株乔木 [E1]"}}]}
+
+    class FakeSession:
+        def post(self, _url, *, headers, json, timeout):
+            calls.append(json)
+            return FakeResponse()
+
+    answer = complete_chat_text(
+        "openai-compatible",
+        base_url="http://127.0.0.1:11434/v1",
+        api_key="local",
+        model="qwen3.5:9b",
+        messages=[{"role": "user", "content": "样地 A 有多少株乔木？"}],
+        session=FakeSession(),
+    )
+
+    assert answer == "12 株乔木 [E1]"
+    assert calls[0]["reasoning_effort"] == "none"
+    assert "thinking" not in calls[0]
 
 
 def test_complete_chat_text_returns_actual_token_usage_when_requested():
@@ -659,6 +726,7 @@ def test_stream_chat_text_yields_openai_deltas_and_final_usage():
             assert decode_unicode is False
             return iter(
                 [
+                    b'data: {"choices":[{"delta":{"reasoning_content":"Plan "}}]}',
                     b'data: {"choices":[{"delta":{"content":"Hel"}}]}',
                     b'data: {"choices":[{"delta":{"content":"lo"}}]}',
                     b'data: {"choices":[{"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":5,"completion_tokens":2,"total_tokens":7}}',
@@ -689,12 +757,141 @@ def test_stream_chat_text_yields_openai_deltas_and_final_usage():
 
     assert calls == [{"json": {"model": "chat-model", "messages": [{"role": "user", "content": "hello"}], "max_tokens": 8192, "temperature": 0.4, "stream": True, "stream_options": {"include_usage": True}}, "stream": True}]
     assert events == [
+        {"type": "reasoning", "content": "Plan "},
         {"type": "delta", "content": "Hel"},
         {"type": "delta", "content": "lo"},
         {"type": "done", "usage": {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}, "finish_reason": "stop", "truncated": False},
     ]
     assert response.closed is True
     assert response.encoding == "utf-8"
+    list(
+        stream_chat_text(
+            "openai-compatible",
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="chat-model",
+            messages=[{"role": "user", "content": "hello"}],
+            session=FakeSession(),
+            max_tokens=None,
+        )
+    )
+    assert "max_tokens" not in calls[1]["json"]
+
+
+def test_stream_chat_text_does_not_retry_after_visible_reasoning():
+    calls = 0
+
+    class BrokenResponse:
+        headers = {"Content-Type": "text/event-stream"}
+
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self, *, decode_unicode):
+            assert decode_unicode is False
+            yield b'data: {"choices":[{"delta":{"reasoning_content":"Planning"}}]}'
+            raise requests.ConnectionError("stream closed after reasoning")
+
+        def close(self):
+            return None
+
+    class FakeSession:
+        def post(self, *_args, **_kwargs):
+            nonlocal calls
+            calls += 1
+            return BrokenResponse()
+
+    events = []
+    with pytest.raises(RuntimeError):
+        for event in stream_chat_text(
+            "openai-compatible",
+            base_url="https://example.test/v1",
+            api_key="secret",
+            model="chat-model",
+            messages=[{"role": "user", "content": "hello"}],
+            session=FakeSession(),
+            max_requests=2,
+        ):
+            events.append(event)
+
+    assert events == [{"type": "reasoning", "content": "Planning"}]
+    assert calls == 1
+
+
+def test_local_ollama_stream_reports_loading_then_stops_after_one_timeout(monkeypatch):
+    monkeypatch.setattr(
+        "scansci_html.llm.warm_ollama_chat_model",
+        lambda _base, _model: iter([{"type": "status", "status": "local_model_loading", "name": "qwen3.5:4b"}]),
+    )
+    monkeypatch.setattr("scansci_html.llm.time.sleep", lambda _seconds: pytest.fail("Ollama timeout must not auto-retry"))
+    calls = []
+
+    class FakeSession:
+        def post(self, _url, *, headers, json, timeout, stream):
+            calls.append(timeout)
+            raise requests.ReadTimeout("first token exceeded budget")
+
+    events = []
+    with pytest.raises(RuntimeError, match="Ollama 模型 qwen3.5:4b 在 120 秒内未返回数据") as caught:
+        for event in stream_chat_text(
+            "openai-compatible",
+            provider_id="local-runtime-ollama-qwen3.5-4b",
+            base_url="http://127.0.0.1:11434/v1",
+            api_key="local",
+            model="qwen3.5:4b",
+            messages=[{"role": "user", "content": "你好"}],
+            session=FakeSession(),
+            timeout=45.0,
+            max_requests=1,
+        ):
+            events.append(event)
+
+    assert events == [{"type": "status", "status": "local_model_loading", "name": "qwen3.5:4b"}]
+    assert calls == [120.0]
+    assert caught.value.failure["code"] == "local_model_timeout"
+    assert caught.value.failure["retryable"] is True
+    assert caught.value.failure["actions"][0]["label"] == "重试"
+
+
+def test_manual_ollama_sse_read_timeout_keeps_the_original_request(monkeypatch):
+    from urllib3.exceptions import ReadTimeoutError
+
+    monkeypatch.setattr("scansci_html.llm.warm_ollama_chat_model", lambda _base, _model: iter(()))
+    monkeypatch.setattr("scansci_html.llm.time.sleep", lambda _seconds: pytest.fail("Ollama must not replay a timed-out prompt"))
+    calls = []
+
+    class FakeResponse:
+        headers = {"Content-Type": "text/event-stream"}
+
+        def raise_for_status(self):
+            pass
+
+        def iter_lines(self, *, decode_unicode):
+            raise requests.ConnectionError(ReadTimeoutError(None, "/api/chat", "Read timed out"))
+
+        def close(self):
+            pass
+
+    class FakeSession:
+        def post(self, _url, *, headers, json, timeout, stream):
+            calls.append(timeout)
+            return FakeResponse()
+
+    with pytest.raises(RuntimeError, match="Ollama 模型 qwen3.5:4b 在 120 秒内未返回数据") as caught:
+        list(stream_chat_text(
+            "openai-compatible",
+            provider_id="local-runtime-ollama",
+            base_url="http://127.0.0.1:11434/v1",
+            api_key="local",
+            model="qwen3.5:4b",
+            messages=[{"role": "user", "content": "你好"}],
+            session=FakeSession(),
+            timeout=45.0,
+            max_requests=2,
+        ))
+
+    assert calls == [120.0]
+    assert caught.value.failure["code"] == "local_model_timeout"
 
 
 def test_litellm_adapter_handles_custom_openai_compatible_completion(monkeypatch):
@@ -724,6 +921,15 @@ def test_litellm_adapter_handles_custom_openai_compatible_completion(monkeypatch
     assert calls[0]["model"] == "openai/custom-model"
     assert calls[0]["api_base"] == "https://gateway.example/v1"
     assert calls[0]["drop_params"] is True
+    assert complete_chat_text(
+        "openai-compatible",
+        base_url="https://gateway.example/v1",
+        api_key="private-key",
+        model="custom-model",
+        messages=[{"role": "user", "content": "hello"}],
+        max_tokens=None,
+    ) == "adapter ready"
+    assert "max_tokens" not in calls[1]
 
 
 def test_litellm_adapter_streams_and_never_reflects_api_keys(monkeypatch):
@@ -733,7 +939,7 @@ def test_litellm_adapter_streams_and_never_reflects_api_keys(monkeypatch):
         assert kwargs["stream"] is True
         return iter(
             [
-                {"choices": [{"delta": {"content": "A"}}]},
+                {"choices": [{"delta": {"reasoning_content": "Check", "content": "A"}}]},
                 {"choices": [{"delta": {"content": "B"}}], "usage": {"total_tokens": 4}},
             ]
         )
@@ -750,6 +956,7 @@ def test_litellm_adapter_streams_and_never_reflects_api_keys(monkeypatch):
         )
     )
     assert events == [
+        {"type": "reasoning", "content": "Check"},
         {"type": "delta", "content": "A"},
         {"type": "delta", "content": "B"},
         {"type": "done", "usage": {"total_tokens": 4}, "finish_reason": "stop", "truncated": False},
@@ -820,6 +1027,82 @@ def test_stream_chat_text_automatically_continues_after_length_finish():
         "finish_reason": "stop",
         "truncated": False,
     }
+
+
+def test_html_game_continues_when_provider_stops_before_closing_page():
+    class FakeResponse:
+        headers = {"Content-Type": "text/event-stream"}
+
+        def __init__(self, text):
+            self.text = text
+
+        def raise_for_status(self):
+            return None
+
+        def iter_lines(self, *, decode_unicode):
+            assert decode_unicode is False
+            yield f'data: {{"choices":[{{"delta":{{"content":{json.dumps(self.text)}}}}}]}}'.encode()
+            yield b'data: {"choices":[{"delta":{},"finish_reason":"stop"}]}'
+            yield b"data: [DONE]"
+
+        def close(self):
+            return None
+
+    responses = [
+        FakeResponse("<!doctype html><html><body><script>function play(){"),
+        FakeResponse("}</script></body></html>"),
+    ]
+    calls = []
+
+    class FakeSession:
+        def post(self, _url, *, headers, json, timeout, stream):
+            calls.append(json)
+            return responses.pop(0)
+
+    events = list(stream_chat_text(
+        "openai-compatible",
+        base_url="https://example.test/v1",
+        api_key="secret",
+        model="chat-model",
+        messages=[{"role": "user", "content": "做一个坦克大战的HTML游戏给我看"}],
+        session=FakeSession(),
+    ))
+
+    assert [event["type"] for event in events] == ["delta", "continuation", "delta", "done"]
+    assert "直接继续" in calls[1]["messages"][-1]["content"]
+    assert "结束标记" not in calls[1]["messages"][-1]["content"]
+    assert events[-1]["truncated"] is False
+    assert "".join(event["content"] for event in events if event["type"] == "delta").endswith("</html>")
+
+
+def test_html_completion_guard_ignores_explanations_without_full_page_request():
+    assert not _response_needs_continuation(
+        finish_reason="stop",
+        attempt_text="`<html>` is the root element.",
+        complete_text="`<html>` is the root element.",
+        messages=[
+            {"role": "user", "content": "做一个完整的 HTML 游戏，最后写【完成】"},
+            {"role": "assistant", "content": "<html>Game</html>【完成】"},
+            {"role": "user", "content": "解释 HTML 中的 html 标签"},
+        ],
+    )
+
+
+def test_completion_guard_accepts_a_closed_code_fence_after_continuation():
+    messages = [{"role": "user", "content": "写一个完整的 HTML 游戏"}]
+    partial = "```html\n<html><body>Game"
+    assert _response_needs_continuation(
+        finish_reason="stop",
+        attempt_text=partial,
+        complete_text=partial,
+        messages=messages,
+    )
+    assert not _response_needs_continuation(
+        finish_reason="stop",
+        attempt_text="</body></html>\n```",
+        complete_text=partial + "</body></html>\n```",
+        messages=messages,
+    )
 
 
 def test_stream_chat_text_identifies_an_opencode_go_conversation():
@@ -914,7 +1197,7 @@ def test_stream_chat_text_continues_when_provider_stops_before_required_marker()
 
     assert [event["type"] for event in events] == ["delta", "continuation", "delta", "done"]
     assert "【回答完毕】" in calls[1]["messages"][-1]["content"]
-    assert "只输出用户要求的结束标记" in calls[1]["messages"][-1]["content"]
+    assert "最后一行必须保留为" in calls[1]["messages"][-1]["content"]
     assert len(calls[1]["messages"]) == 3
     assert events[-1]["truncated"] is False
 

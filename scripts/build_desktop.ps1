@@ -14,7 +14,7 @@ param(
     # release candidate to the exact source fingerprint that passed its gate.
     [string]$ReleaseSourceSha256 = "",
     [string]$CacheKey = "",
-    [string]$UpdateManifestUrl = "https://github.com/Rimagination/scansci-pi/releases/latest/download/stable.json",
+    [string]$UpdateManifestUrl = "https://github.com/Rimagination/scansci-harness/releases/latest/download/stable.json",
     # Keep direct/manual builds aligned with the public release contract. An
     # empty value here makes a core package advertise model downloads without
     # providing the runtime that executes them.
@@ -29,6 +29,10 @@ param(
     # managed runtime components (see runtime_components.py) after one
     # user-confirmed install.
     [switch]$ExcludeRuntimes,
+    # Build the Python loopback service for the Electron shell. The legacy
+    # pywebview executable remains available until the Electron release gate
+    # validates its replacement package and update path.
+    [switch]$ElectronBackend,
     [switch]$Clean
 )
 
@@ -63,7 +67,11 @@ if ($ReleasePublicKey) {
         throw "ReleasePublicKey must decode to exactly 32 bytes."
     }
 }
-$entryPoint = Join-Path $projectRoot "scripts\scansci_desktop_entry.py"
+if ($ElectronBackend -and $Mode -ne "onedir") {
+    throw "ElectronBackend requires the onedir profile."
+}
+if ($ElectronBackend) { $Name = "ScanSciBackend" }
+$entryPoint = Join-Path $projectRoot $(if ($ElectronBackend) { "scripts\scansci_electron_backend_entry.py" } else { "scripts\scansci_desktop_entry.py" })
 $pyInstallerHooks = Join-Path $projectRoot "scripts\pyinstaller_hooks"
 $assetSource = Join-Path $projectRoot "src\scansci_html\web"
 $skillAssetSource = Join-Path $projectRoot "src\scansci_html\builtin_skill_assets"
@@ -132,7 +140,7 @@ $dependencyFiles = @(
 $dependencyHashes = $dependencyFiles | ForEach-Object {
     if (Test-Path -LiteralPath $_ -PathType Leaf) { (Get-FileHash -Algorithm SHA256 -LiteralPath $_).Hash } else { "missing" }
 }
-$cacheMaterial = "$PackageProfile|$Mode|$Name|$ExcludeRuntimes|$UpdateManifestUrl|$RuntimeManifestUrl|$NodeComponentManifestUrl|$TectonicComponentManifestUrl|$ReleasePublicKey|$pythonVersion|$pyInstallerVersion|$sourceTreeHash|$($dependencyHashes -join '|')"
+$cacheMaterial = "$PackageProfile|$Mode|$Name|$ExcludeRuntimes|$ElectronBackend|$UpdateManifestUrl|$RuntimeManifestUrl|$NodeComponentManifestUrl|$TectonicComponentManifestUrl|$ReleasePublicKey|$pythonVersion|$pyInstallerVersion|$sourceTreeHash|$($dependencyHashes -join '|')"
 if (-not $CacheKey) {
     $bytes = [Text.Encoding]::UTF8.GetBytes($cacheMaterial)
     $digest = [Security.Cryptography.SHA256]::Create().ComputeHash($bytes)
@@ -181,7 +189,7 @@ if (-not (Test-Path -LiteralPath $iconPath -PathType Leaf)) {
 
 $pyInstallerArgs = @(
     "--noconfirm",
-    "--windowed",
+    $(if ($ElectronBackend) { "--console" } else { "--windowed" }),
     "--name", $Name,
     "--icon", $iconPath,
     "--$Mode",
@@ -374,6 +382,9 @@ if ($PackageProfile -eq "core") {
         "TTS",
         "whisper"
     )
+}
+if ($ElectronBackend) {
+    $excludedModules += "webview"
 }
 foreach ($module in $excludedModules) {
     $pyInstallerArgs += "--exclude-module"

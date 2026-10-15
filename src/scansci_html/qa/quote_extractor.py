@@ -64,10 +64,12 @@ _PREDICATE_RE = re.compile(
     r"affect(?:s|ed|ing)?|result(?:s|ed|ing)?|investigat(?:e|es|ed|ing)|assess(?:es|ed|ing)?|"
     r"evaluat(?:e|es|ed|ing)|explain(?:s|ed|ing)?|improv(?:e|es|ed|ing)|reduc(?:e|es|ed|ing)|"
     r"yield(?:s|ed|ing)?|achiev(?:e|es|ed|ing)|predict(?:s|ed|ing)?|measur(?:e|es|ed|ing)|"
+    r"contain(?:s|ed|ing)?|"
     r"quantif(?:y|ies|ied|ying)|correlat(?:e|es|ed|ing)|associate(?:s|d|ing)?|"
     # These ordinary research predicates are common in concise result
     # sentences. They remain subject to the bibliography checks below.
-    r"deploy(?:s|ed|ing)?|use(?:s|d|ing)?|support(?:s|ed|ing)?|"
+    r"fell|rose|fall(?:s|ing|en)?|ris(?:e|es|en|ing)|declin(?:e|es|ed|ing)|"
+    r"dropp?(?:s|ed|ing)?|deploy(?:s|ed|ing)?|use(?:s|d|ing)?|support(?:s|ed|ing)?|"
     r"link(?:s|ed|ing)?|involv(?:e|es|ed|ing)?)\b",
     re.IGNORECASE,
 )
@@ -136,7 +138,11 @@ def is_substantive_evidence_hit(hit: dict[str, Any]) -> bool:
         return False
     if _COMPACT_AUTHOR_REFERENCE_RE.match(text):
         return False
-    if _AUTHOR_LIST_RE.match(text) and not _PREDICATE_RE.search(text):
+    author_list = _AUTHOR_LIST_RE.match(text)
+    if author_list and not _PREDICATE_RE.search(text[author_list.end() :]):
+        return False
+    author_et_al = re.match(r"^\s*[A-Z][A-Za-z'’\-]+\s+et\s+al\.?", text)
+    if author_et_al and not _PREDICATE_RE.search(text[author_et_al.end() :]):
         return False
 
     # OCR frequently splits a reference across separate evidence rows.  A
@@ -178,7 +184,11 @@ def extract_quotes(
         evidence_id = str(hit.get("evidence_id", "")).strip()
         text = str(hit.get("text", "")).strip()
         matched_terms = list(hit.get("matched_terms", []) or [])
-        if not evidence_id or not text or not matched_terms or not is_substantive_evidence_hit(hit):
+        try:
+            neural_match = float(hit.get("qwen3_score", 0.0) or 0.0) >= 0.65
+        except (TypeError, ValueError):
+            neural_match = False
+        if not evidence_id or not text or (not matched_terms and not neural_match) or not is_substantive_evidence_hit(hit):
             continue
         exact_quote = _exact_quote_text(hit)
         if not is_substantive_evidence_hit({"text": exact_quote, "section": hit.get("section", "")}):

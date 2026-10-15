@@ -76,7 +76,7 @@ function conservativeTokens(value: unknown, descriptor: ModelRuntimeDescriptor):
   return conservativeTextTokens(text, descriptor) + estimatePiImageTokens(images);
 }
 
-const OLLAMA_LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
+const OLLAMA_LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1", "[::1]"]);
 const OLLAMA_NATIVE_OPTION_KEYS = [
   "temperature",
   "top_p",
@@ -89,13 +89,13 @@ const OLLAMA_NATIVE_OPTION_KEYS = [
   "stop",
 ] as const;
 
-function isOllamaEndpoint(value: string): boolean {
+function isOllamaEndpoint(value: string, providerId = ""): boolean {
   try {
     const url = new URL(value);
     const port = url.port || (url.protocol === "https:" ? "443" : "80");
     return url.protocol === "http:"
       && OLLAMA_LOOPBACK_HOSTS.has(url.hostname.toLowerCase())
-      && port === "11434";
+      && (port === "11434" || providerId === "local-runtime-ollama" || providerId.startsWith("local-runtime-ollama-"));
   } catch {
     return false;
   }
@@ -169,7 +169,7 @@ function nativeOllamaMessages(value: unknown): unknown[] {
   });
 }
 
-function nativeOllamaPayload(payload: JsonRecord, contextWindowTokens: number): JsonRecord {
+function nativeOllamaPayload(payload: JsonRecord, contextWindowTokens: number, modelId: string): JsonRecord {
   const native = { ...payload };
   native.messages = nativeOllamaMessages(native.messages);
   const options = isRecord(native.options) ? { ...native.options } : {};
@@ -187,9 +187,16 @@ function nativeOllamaPayload(payload: JsonRecord, contextWindowTokens: number): 
   native.options = options;
   if (typeof native.enable_thinking === "boolean") {
     native.think = native.enable_thinking;
+  } else if (typeof native.reasoning_effort === "string") {
+    native.think = native.reasoning_effort.toLowerCase() !== "none";
+  } else if (isRecord(native.thinking) && typeof native.thinking.type === "string") {
+    native.think = native.thinking.type === "enabled";
+  } else if (modelId.toLowerCase().startsWith("qwen3.5:")) {
+    native.think = false;
   }
   delete native.enable_thinking;
   delete native.reasoning_effort;
+  delete native.thinking;
   delete native.max_tokens;
   delete native.max_completion_tokens;
   delete native.max_output_tokens;
@@ -225,6 +232,10 @@ function openAIChunkFromOllama(
   created: number,
   sawToolCall: { value: boolean },
 ): JsonRecord {
+  if (event.error) {
+    const detail = typeof event.error === "string" ? event.error : JSON.stringify(event.error);
+    throw new Error(`Ollama: ${detail}`);
+  }
   const message = isRecord(event.message) ? event.message : {};
   const delta: JsonRecord = {};
   if (typeof message.role === "string" && message.role) delta.role = message.role;
@@ -247,7 +258,6 @@ function openAIChunkFromOllama(
     finish_reason: null,
   };
   if (event.done) {
-    choice.delta = {};
     choice.finish_reason = sawToolCall.value
       ? "tool_calls"
       : String(event.done_reason || "stop");
@@ -275,10 +285,11 @@ function ollamaNativeFetch(
   originalFetch: FetchFunction,
   model: Model<Api>,
   contextWindowTokens: number,
+  providerId: string,
 ): FetchFunction {
   return async (input, init) => {
     const url = requestUrl(input);
-    if (!isOllamaEndpoint(model.baseUrl) || !url.includes("/chat/completions")) {
+    if (!isOllamaEndpoint(model.baseUrl, providerId) || !url.includes("/chat/completions")) {
       return originalFetch(input, init);
     }
     const bodyText = requestBodyText(init?.body);
@@ -289,7 +300,7 @@ function ollamaNativeFetch(
     nativeUrl.search = "";
     const nativeResponse = await originalFetch(nativeUrl, {
       ...init,
-      body: JSON.stringify(nativeOllamaPayload(payload, contextWindowTokens)),
+      body: JSON.stringify(nativeOllamaPayload(payload, contextWindowTokens, model.id)),
     });
     if (!nativeResponse.ok || !nativeResponse.body) return nativeResponse;
 
@@ -421,11 +432,12 @@ export function scansciStreamSimple(descriptor: ModelRuntimeDescriptor) {
         return finalPayload;
       },
     };
-    if (model.api === "openai-completions" && isOllamaEndpoint(model.baseUrl)) {
+    if (model.api === "openai-completions" && isOllamaEndpoint(model.baseUrl, descriptor.provider_id)) {
       guardedOptions.fetch = ollamaNativeFetch(
         options?.fetch || globalThis.fetch,
         model,
         descriptor.context_window_tokens,
+        descriptor.provider_id,
       );
     }
     if (model.api === "openai-completions") {

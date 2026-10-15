@@ -1,5 +1,6 @@
 import base64
 import json
+import os
 from dataclasses import replace
 from datetime import datetime
 from pathlib import Path
@@ -21,8 +22,6 @@ from scansci_html.pi_agent import PiAgentClient
 from scansci_html.webapp import NotebookWebApp, create_notebook_server, serve_notebook
 from scansci_html.research_agent import (
     ResearchAgentRuntime,
-    _direct_max_continuations,
-    _direct_output_budget,
     _guard_temporal_delivery,
     _numbered_heading_count,
     _numbered_section_check_counts,
@@ -232,7 +231,7 @@ def test_notebook_webapp_serves_workspace_assets_and_grounded_answer(tmp_path: P
         app.dispatch(
             "POST",
             "/api/ask",
-            json.dumps({"question": "What did Galunisertib reduce?"}).encode("utf-8"),
+            json.dumps({"question": "What did Galunisertib reduce?", "idempotency_key": "grounded-answer-1", "retrieval_quality": "balanced"}).encode("utf-8"),
         )
     )
 
@@ -488,7 +487,7 @@ def test_local_model_settings_and_first_run_guide_keep_setup_optional(tmp_path: 
 
     assert "LOCAL_MODEL_CATEGORY_GROUPS" in script
     assert "local-model-recommendation" in script
-    assert "无需先安装本地模型" in script
+    assert "资料和本地模型用到时再连接" in script
     assert "连接知识库" in script
     assert 'onboarding-open-models' in script
     assert 'onboarding-open-knowledge' in script
@@ -530,6 +529,25 @@ def test_local_model_settings_and_first_run_guide_keep_setup_optional(tmp_path: 
     assert "isError ? 10000 : 2800" in script
 
 
+def test_first_run_guide_can_return_from_optional_setup(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    page = app.dispatch("GET", "/").body.decode("utf-8")
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+
+    home_form = page[page.index('id="homeAskForm"') : page.index("</form>", page.index('id="homeAskForm"'))]
+    assert 'id="firstRunWelcome"' not in home_form
+    assert page.index('id="firstRunWelcome"') < page.index('class="home-capability-shortcuts"')
+
+    models = script[script.index('if (action === "onboarding-open-models")') : script.index('if (action === "onboarding-open-knowledge")')]
+    knowledge = script[script.index('if (action === "onboarding-open-knowledge")') : script.index('if (action === "advance-resource-onboarding"')]
+    data = script[script.index('if (action === "open-data-onboarding")') : script.index('if (action === "finish-first-run")')]
+    assert "persistOnboardingPreferences" not in models + knowledge
+    assert "persistOnboardingPreferences" not in data
+    assert "returnToWelcome: true" in models
+    assert 'state.onboardingOpen && state.onboardingMode === "welcome"' in script
+    assert 'data-action="return-first-run"' in script
+
+
 def test_model_services_preview_keeps_provider_catalog_when_backend_is_unavailable(tmp_path: Path) -> None:
     """The static preview must not collapse the model-service catalog to ScanSci only."""
 
@@ -542,6 +560,8 @@ def test_model_services_preview_keeps_provider_catalog_when_backend_is_unavailab
     assert "function bootstrapProviderCatalogFallback()" in script
     assert 'id: "openai"' in fallback
     assert 'id: "anthropic"' in fallback
+    assert 'id: "l0veyou"' in fallback
+    assert 'baseUrl: "https://l0veyou.com/v1"' in fallback
     assert 'id: "paratera"' in fallback
     assert 'capabilities: ["image"]' in fallback
     assert "providers: bootstrapProviderCatalogFallback()" in script
@@ -649,6 +669,25 @@ def test_preview_assets_are_cache_busted(tmp_path: Path) -> None:
     assert 'src="/app.js?v=30"' in page
     styles = Path(__file__).parents[1] / "src" / "scansci_html" / "web" / "styles.css"
     assert ".conversation-main:has(#answerArea > .run-shell) > :is(.chat-composer, .conversation-composer-dock) { margin-top: 20px; }" in styles.read_text(encoding="utf-8")
+
+
+def test_translation_dialog_keeps_idle_status_out_of_the_layout(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    page = app.dispatch("GET", "/").body.decode("utf-8")
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+
+    assert '<div id="translationStatus" role="status" aria-live="polite" hidden>' in page
+    assert 'class="translation-location"' in page
+    assert 'class="translation-runtime"' in page
+    assert 'byId("translationStatus").hidden = true;' in script
+    assert 'status.hidden = false;' in script
+    assert 'data-open-location="true"' in script
+    assert 'byId("translationLocation").open = showLocation;' in script
+    assert '.translation-dialog #translationStatus[hidden] { display: none; }' in styles
+    assert 'data-action="configure-translation-model"' in script
+    assert '没有生成译文 PDF。' in script
+    assert '若 PDF 已写入保存位置' not in script
 
 
 def test_settings_layout_groups_navigation_and_separates_runtime_page(tmp_path: Path) -> None:
@@ -818,6 +857,8 @@ def test_local_models_page_only_contains_installed_and_market_sections(tmp_path:
 
     assert 'class="local-installed-panel"' in local_models_page
     assert 'class="local-model-disclosure local-model-market-disclosure" open' in local_models_page
+    assert 'class="local-model-recommendation"' in local_models_page
+    assert 'data-action="activate-recommended-model"' in local_models_page
     assert 'data-action="delete-installed-local-model"' in local_models_page
     assert 'data-action="retry-local-model-probe"' in local_models_page
     assert 'class="local-model-detection-note"' in local_models_page
@@ -830,6 +871,16 @@ def test_local_models_page_only_contains_installed_and_market_sections(tmp_path:
     assert 'confirmLabel: "删除模型"' in script
     assert 'class="local-agent-routing-card"' not in local_models_page
     assert 'class="local-model-fallback"' not in local_models_page
+
+
+def test_recommended_local_model_card_uses_theme_colors(tmp_path: Path) -> None:
+    app, _workspace, _evidence = _build_app(tmp_path)
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+    card = styles[styles.index(".settings-content .local-model-recommendation {"):]
+
+    assert "background: var(--surface-elevated);" in card
+    assert "color: var(--ink);" in card
+    assert "border: 1px solid var(--rule-strong);" in card
 
 
 def test_installed_model_delete_control_uses_semantic_theme_tokens(tmp_path: Path) -> None:
@@ -961,11 +1012,19 @@ def test_evidence_reader_expansion_and_theme_contract_is_exposed(tmp_path: Path)
     assert "outline: none !important" in reader_html
     assert "box-shadow: none !important" in reader_html
     assert "#2457a6" not in reader_html
+    assert ".paper { background: var(--scansci-evidence-surface) !important;" in reader_html
+    assert ".paper a { color: var(--scansci-evidence-highlight) !important; }" in reader_html
     assert "toggle-evidence-panel-expand" in script
     assert "evidenceReaderFrameUrl" in script
     assert ".conversation-layout.is-evidence-expanded" in styles
+    assert ".conversation-layout.is-evidence-reading .reference-panel { display: flex; grid-column: 1; border-left: 0; }" in styles
+    assert 'classList.toggle("is-evidence-reading", evidence)' in script
     assert "installContextPanelResizer" in script
     assert "--context-panel-width" in styles
+    for theme, highlight in (("light", "#79f2a6"), ("dark", "#62e18f")):
+        jade_reader = app.dispatch("GET", f"/api/sources/{doc_id}/reader?theme={theme}&accent=jade")
+        assert jade_reader.status == 200
+        assert f"--scansci-evidence-highlight: {highlight}" in jade_reader.body.decode("utf-8")
 
 
 def test_theme_takeover_bridge_covers_settings_state_surfaces(tmp_path: Path):
@@ -1259,6 +1318,22 @@ def test_research_document_ui_distinguishes_reviewable_evidence_from_hard_absten
     assert "model.needsReview ? \"需要复核\"" in script
 
 
+def test_chat_attachments_reuse_file_type_icons_in_draft_and_history(tmp_path: Path):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+
+    assert "function fileTypeIconMarkup(path)" in script
+    assert "const kind = localResourceKind(path);" in script
+    assert "${uiIcon(localResourceIcon(kind))}" in script
+    assert "${fileTypeIconMarkup(source.name)}" in script
+    assert "${fileTypeIconMarkup(name)}" in script
+    assert 'class="user-source-file"' in script
+    assert ".local-artifact-icon.is-pdf" in styles
+    assert ".local-artifact-icon.is-spreadsheet" in styles
+    assert 'html[data-theme="dark"] {\n  --file-icon-tint:' in styles
+
+
 def test_academic_writing_routes_source_backed_requests_to_research_documents(tmp_path: Path):
     app, _workspace, _evidence = _build_app(tmp_path)
     script = app.dispatch("GET", "/app.js").body.decode("utf-8")
@@ -1418,13 +1493,17 @@ def test_startup_defers_model_market_scan_until_local_models_page_opens(tmp_path
     set_view_body = script.split("function setView", 1)[1].split(
         "function updateSidebarNavigation", 1
     )[0]
+    render_settings_body = script.split("function renderSettings()", 1)[1].split(
+        "function renderExtensions", 1
+    )[0]
 
     assert 'request("/api/local-models/installed")' in initialize_body
     assert 'request("/api/local-models/market")' not in initialize_body
     assert "loaded: false" in initialize_body
-    assert 'state.activeSettings === "local-models"' in set_view_body
-    assert "!state.localModelMarket?.loaded" in set_view_body
-    assert "refreshLocalModelMarket()" in set_view_body
+    assert "renderSettings();" in set_view_body
+    assert 'state.activeSettings === "local-models"' in render_settings_body
+    assert "!state.localModelMarket?.loaded" in render_settings_body
+    assert "refreshLocalModelMarket()" in render_settings_body
 
 
 def test_review_document_workspace_renders_live_stage_progress(tmp_path: Path):
@@ -1648,7 +1727,7 @@ def test_history_ui_exposes_archive_restore_and_delete_controls(tmp_path: Path):
     assert ".task-menu.opens-downward" in styles
     assert ".task-more:focus-visible" in styles
     assert ".confirm-dialog-card" in styles
-    assert "border-radius: 16px" in styles
+    assert "--radius-lg: 16px" in styles
     assert "background: #fff" in styles
 
 
@@ -1953,10 +2032,24 @@ def test_extensions_download_strategy_and_library_preview_match_desktop_navigati
     assert 'data-action="close-knowledge-file-search"' in script
     assert "输入文件名、作者或路径" in script
     assert "搜索当前知识库（Ctrl+F）" in script
+    library_renderer = script.split("function renderImaLibraryMode()", 1)[1].split("function renderToolsMode()", 1)[0]
+    assert library_renderer.count('data-knowledge-file-search') == 1
+    assert library_renderer.count('data-action="focus-knowledge-file-search"') == 1
+    assert '<div class="ima-library-toolbar">${libraryToolbarActions}</div>' in library_renderer
+    close_search = script.split("function closeKnowledgeFileSearch()", 1)[1].split("function renderImaLibraryMode()", 1)[0]
+    assert 'state.knowledgeQuery = ""' in close_search
+    assert "state.knowledgeVisibleLimit = 200" in close_search
+    assert ".ima-library-appbar-search-field:focus-within" in styles
+    assert ".library-path-dialog textarea:focus" in styles
+    assert "#libraryPathSubmit, #libraryPathSubmit:hover:not(:disabled) { box-shadow: none; }" in styles
     assert "function deletePersonalLibrary" in script
     assert 'data-action="delete-personal-library"' in script
     assert "移除 ScanSci 中的资料记录和本地检索索引" in script
     assert "新建个人知识库" in script
+    source_group = script.split("function renderKnowledgeSourceGroup", 1)[1].split("function knowledgeIndexStatusMarkup", 1)[0]
+    assert "const emptyConnection = !notebooks.length" in source_group
+    assert '<img src="${knowledgeLogoUrl(kind)}" alt="" />' in source_group
+    assert 'isPersonal ? "新建个人知识库"' in source_group
     assert "function autoConnectLocalZotero" not in script
     assert 'window.setTimeout(() => autoConnectLocalZotero()' not in script
     assert 'data-action="choose-zotero-library"' in script
@@ -1965,6 +2058,8 @@ def test_extensions_download_strategy_and_library_preview_match_desktop_navigati
     assert '内容 (${contentCountLabel})' in script
     assert 'data-knowledge-file-search' in script
     assert "个人知识库" in script
+    assert 'renderKnowledgeSourceGroup("翻译库", "translation", translations)' in library_renderer
+    assert 'class="ima-source-entry is-empty is-placeholder" aria-label="翻译库暂无译文"' in source_group
     assert '"Zotero"' in script
     assert '"Obsidian"' in script
     assert "链接本地文件夹" in script
@@ -2373,30 +2468,24 @@ def test_notebook_webapp_starts_tesseract_install(tmp_path: Path, monkeypatch: p
     assert captured["languages"] == ["zh", "en"]
 
 
-def test_provider_secret_reveal_is_explicit_and_kept_out_of_public_settings(
+def test_provider_secret_cannot_be_revealed_by_local_api(
     tmp_path: Path,
-    monkeypatch: pytest.MonkeyPatch,
 ):
-    app, workspace, _evidence = _build_app(tmp_path)
-    monkeypatch.setattr("scansci_html.webapp.get_provider_api_key", lambda *_args: "saved-secret")
-
-    public = _payload(app.dispatch("GET", "/api/settings"))
+    app, _workspace, _evidence = _build_app(tmp_path)
     rejected = app.dispatch(
         "POST",
         "/api/settings/providers/deepseek/api-key/reveal",
         json.dumps({"reveal": False}).encode("utf-8"),
     )
-    revealed = _payload(
-        app.dispatch(
-            "POST",
-            "/api/settings/providers/deepseek/api-key/reveal",
-            json.dumps({"reveal": True}).encode("utf-8"),
-        )
+    attempted_reveal = app.dispatch(
+        "POST",
+        "/api/settings/providers/deepseek/api-key/reveal",
+        json.dumps({"reveal": True}).encode("utf-8"),
     )
 
-    assert "saved-secret" not in json.dumps(public)
-    assert rejected.status == 400
-    assert revealed == {"api_key": "saved-secret"}
+    assert rejected.status == 404
+    assert attempted_reveal.status == 404
+    assert b"api_key" not in attempted_reveal.body
 
 
 def test_provider_environment_key_is_redacted_and_cannot_be_overwritten(
@@ -2422,16 +2511,13 @@ def test_provider_environment_key_is_redacted_and_cannot_be_overwritten(
     assert "DEEPSEEK_API_KEY" in rejected.body.decode("utf-8")
 
 
-def test_model_settings_render_masked_secret_placeholder_and_eye_control(tmp_path: Path):
+def test_model_settings_render_write_only_secret_field(tmp_path: Path):
     app, _workspace, _evidence = _build_app(tmp_path)
     script = app.dispatch("GET", "/app.js").body.decode("utf-8")
-    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
-
-    assert 'placeholder="${provider.api_key_configured ? "••••••••••••••••"' in script
-    assert 'data-action="toggle-provider-key"' in script
-    assert "/api-key/reveal" in script
-    assert "input.type === \"text\"" in script
-    assert ".cherry-secret-toggle" in styles
+    assert 'placeholder="${provider.api_key_configured ? "已保存；输入新值以替换"' in script
+    assert 'data-action="toggle-provider-key"' not in script
+    assert "/api-key/reveal" not in script
+    assert 'name="provider-remote-rag-allowed"' in script
 
 
 def test_model_service_provider_toggle_is_inline_without_redundant_status_text():
@@ -2671,7 +2757,7 @@ def test_notebook_webapp_allows_direct_chat_without_a_library(tmp_path: Path, mo
         app.dispatch(
             "POST",
             "/api/chat",
-            json.dumps({"messages": [{"role": "user", "content": "你是什么模型？"}]}).encode("utf-8"),
+            json.dumps({"messages": [{"role": "user", "content": "你是什么模型？"}], "conversation_id": "direct-chat-1", "idempotency_key": "direct-chat-1"}).encode("utf-8"),
         )
     )
 
@@ -2702,6 +2788,7 @@ def test_direct_chat_title_api_uses_model_title_and_chinese_fallback(
     assert generated["source"] == "model"
     assert observed["messages"][-1] == {"role": "user", "content": "这个人是谁？"}
     assert observed["max_tokens"] == 48
+    assert generated["model"]["model_id"] == observed["model"]
 
     monkeypatch.setattr(
         "scansci_html.research_agent.complete_chat_text",
@@ -2935,9 +3022,10 @@ def test_contextual_follow_up_repairs_one_bad_draft(tmp_path: Path, monkeypatch:
 
     def complete(_provider_kind, **kwargs):
         observed.update(kwargs)
-        return rewritten, {"prompt_tokens": 30, "completion_tokens": 80, "total_tokens": 110}
+        yield {"type": "delta", "content": rewritten}
+        yield {"type": "done", "usage": {"prompt_tokens": 30, "completion_tokens": 80, "total_tokens": 110}}
 
-    monkeypatch.setattr("scansci_html.research_agent.complete_chat_text", complete)
+    monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", complete)
 
     text, usage, repaired = runtime._repair_contextual_follow_up_if_needed(
         request,
@@ -2961,15 +3049,15 @@ def test_contextual_follow_up_stream_hides_bad_draft_and_delivers_repair(
     bad_draft = "好的，我从现在起用简体中文回答。请问有什么我可以帮你的？"
     rewritten = "下面重新用中文完整呈现上一条内容。" + "科技新闻正文及来源说明。" * 20
 
+    stream_calls = 0
+
     def initial_stream(*_args, **_kwargs):
-        yield {"type": "delta", "content": bad_draft}
-        yield {"type": "done", "usage": {"total_tokens": 20}}
+        nonlocal stream_calls
+        stream_calls += 1
+        yield {"type": "delta", "content": bad_draft if stream_calls == 1 else rewritten}
+        yield {"type": "done", "usage": {"total_tokens": 20 if stream_calls == 1 else 80}}
 
     monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", initial_stream)
-    monkeypatch.setattr(
-        "scansci_html.research_agent.complete_chat_text",
-        lambda *_args, **_kwargs: (rewritten, {"total_tokens": 80}),
-    )
     monkeypatch.setattr("scansci_html.research_agent._pi_should_run", lambda *_args: False)
     runtime = ResearchAgentRuntime(
         workspace=tmp_path / "workspace.sqlite",
@@ -3001,6 +3089,38 @@ def test_contextual_follow_up_stream_hides_bad_draft_and_delivers_repair(
     )
 
 
+def test_agent_contextual_repair_stays_in_pi(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    bad_draft = "好的，我从现在起用简体中文回答。请问有什么我可以帮你的？"
+    rewritten = "下面重新用中文完整呈现上一条内容。" + "科技新闻正文及来源说明。" * 20
+    calls: list[str] = []
+
+    def pi_events(_self, _request, *, task_mode=None, **_kwargs):
+        calls.append(str(task_mode))
+        yield {"type": "delta", "content": bad_draft if len(calls) == 1 else rewritten}
+        yield {"type": "done", "usage": {"total_tokens": 20}}
+
+    def direct_must_not_run(*_args, **_kwargs):
+        raise AssertionError("Agent contextual repair must stay in Pi")
+
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", pi_events)
+    monkeypatch.setattr("scansci_html.research_agent.complete_chat_text", direct_must_not_run)
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    events = list(runtime.chat_stream({
+        "agent_mode": True,
+        "web_search": "off",
+        "messages": [
+            {"role": "user", "content": "今天有什么科技新闻？"},
+            {"role": "assistant", "content": "English technology news with source links. " * 30},
+            {"role": "user", "content": "说中文"},
+        ],
+    }))
+
+    assert events[-1]["type"] == "RUN_FINISHED"
+    assert events[-1]["result"]["message"]["content"] == rewritten
+    assert calls == ["agent", "agent"]
+    assert events[-1]["result"]["agent_runtime"]["contextual_repair_harness"] == "pi-agent-sdk"
+
+
 def test_direct_chat_history_api_persists_and_reopens_completed_messages(tmp_path: Path):
     app = NotebookWebApp(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
     payload = {
@@ -3026,6 +3146,102 @@ def test_direct_chat_history_api_persists_and_reopens_completed_messages(tmp_pat
     assert reopened["messages"][0]["images"] == [{"name": "brief.png"}]
     assert "data_url" not in json.dumps(reopened, ensure_ascii=False)
     assert reopened["messages"][1]["model"]["model_name"] == "DeepSeek V4 Flash"
+
+
+def test_direct_chat_history_delete_erases_cached_submission(tmp_path: Path):
+    app = NotebookWebApp(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    app.direct_chat_submissions.reserve("delete-request", "payload-digest", "delete-conversation")
+    app.direct_chat_submissions.finish("delete-request", {
+        "type": "RUN_FINISHED", "result": {"message": {"content": "private cached answer"}},
+    })
+    _payload(app.dispatch("POST", "/api/chat/history", json.dumps({
+        "conversation_id": "delete-conversation",
+        "messages": [{"role": "user", "content": "question"}],
+    }).encode("utf-8")))
+
+    deleted = _payload(app.dispatch("POST", "/api/chat/history/delete-conversation/delete", b"{}"))
+
+    assert deleted["ok"] is True
+    assert app.direct_chat_submissions.status("delete-request", "delete-conversation") == ("erased", None)
+    assert b"private cached answer" not in app.direct_chat_submissions.path.read_bytes()
+    late_history = app.dispatch("POST", "/api/chat/history", json.dumps({
+        "conversation_id": "delete-conversation",
+        "messages": [{"role": "user", "content": "late history"}],
+    }).encode("utf-8"))
+    assert late_history.status != 200
+
+
+def test_deleted_direct_chat_rejects_every_history_writer(tmp_path: Path):
+    app = NotebookWebApp(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    _payload(app.dispatch("POST", "/api/chat/history", b'{"conversation_id":"deleted-history","messages":[{"role":"user","content":"question"}]}'))
+    assert _payload(app.dispatch("POST", "/api/chat/history/deleted-history/delete", b"{}"))["ok"] is True
+    assert _payload(app.dispatch("POST", "/api/chat/history/deleted-history/delete", b"{}"))["ok"] is True
+
+    for action, body in (
+        ("title", b'{"title":"late title"}'),
+        ("archive", b"{}"),
+        ("restore", b"{}"),
+    ):
+        assert app.dispatch("POST", f"/api/chat/history/deleted-history/{action}", body).status != 200
+    assert app.dispatch("POST", "/api/chat/history", b'{"conversation_id":"deleted-history"}').status != 200
+    assert app.dispatch("GET", "/api/chat/history/deleted-history").status == 404
+
+
+def test_overlong_conversation_alias_cannot_delete_or_recreate_history(tmp_path: Path):
+    app = NotebookWebApp(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    conversation_id = "c" * 160
+    alias = conversation_id + "suffix"
+    original = {"conversation_id": conversation_id, "messages": [{"role": "user", "content": "question"}]}
+    _payload(app.dispatch("POST", "/api/chat/history", json.dumps(original).encode()))
+
+    assert app.dispatch("POST", f"/api/chat/history/{alias}/delete", b"{}").status == 400
+    assert app.dispatch("POST", f"/api/chat/history/{alias}/title", b'{"title":"late"}').status == 400
+    assert app.dispatch("POST", f"/api/chat/history/{alias}/archive", b"{}").status == 400
+    assert app.dispatch("POST", f"/api/chat/history/{alias}/restore", b"{}").status == 400
+    assert app.dispatch("POST", "/api/chat/history", json.dumps({**original, "conversation_id": alias}).encode()).status == 400
+    assert app.dispatch("GET", f"/api/chat/history/{conversation_id}").status == 200
+
+    assert _payload(app.dispatch("POST", f"/api/chat/history/{conversation_id}/delete", b"{}"))["ok"] is True
+    assert app.direct_chat_submissions.reserve("late-key", "digest", conversation_id)[0] == "erased"
+
+
+def test_corrupt_history_delete_keeps_fence_and_reports_cleanup_failure(tmp_path: Path):
+    app = NotebookWebApp(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    app.direct_chat_history.path.write_text("{corrupt", encoding="utf-8")
+
+    first = app.dispatch("POST", "/api/chat/history/corrupt-conversation/delete", b"{}")
+    retry = app.dispatch("POST", "/api/chat/history/corrupt-conversation/delete", b"{}")
+
+    assert first.status == 502 and retry.status == 502
+    assert app.direct_chat_submissions.reserve("late-key", "digest", "corrupt-conversation")[0] == "erased"
+    assert app.direct_chat_history.path.read_text(encoding="utf-8") == "{corrupt"
+
+
+def test_unreadable_history_delete_never_reports_retry_as_cleaned(tmp_path: Path, monkeypatch):
+    app = NotebookWebApp(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    _payload(app.dispatch("POST", "/api/chat/history", b'{"conversation_id":"unreadable-history","messages":[{"role":"user","content":"private"}]}'))
+    original_read_text = Path.read_text
+
+    def unreadable(path, *args, **kwargs):
+        if path == app.direct_chat_history.path:
+            raise PermissionError("simulated history I/O failure")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+    first = app.dispatch("POST", "/api/chat/history/unreadable-history/delete", b"{}")
+    retry = app.dispatch("POST", "/api/chat/history/unreadable-history/delete", b"{}")
+
+    assert first.status == 502 and retry.status == 502
+    assert app.direct_chat_submissions.reserve("late-key", "digest", "unreadable-history")[0] == "erased"
+
+
+def test_direct_chat_submission_abandon_route_fences_late_post(tmp_path: Path):
+    app = NotebookWebApp(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    fenced = _payload(app.dispatch("POST", "/api/chat/submissions/late-request/abandon", b'{"conversation_id":"conversation-1"}'))
+    checked = _payload(app.dispatch("GET", "/api/chat/submissions/late-request?conversation_id=conversation-1"))
+
+    assert fenced["state"] == "abandoned"
+    assert checked == {"state": "abandoned", "terminal": None}
 
 
 def test_direct_chat_attachment_staging_returns_restart_safe_references(tmp_path: Path):
@@ -3087,7 +3303,10 @@ def test_direct_chat_history_api_preserves_attachment_reference_and_archive_acti
 
 
 def test_notebook_server_streams_direct_chat_events(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    executions: list[str] = []
+
     def fake_stream(_self, _payload):
+        executions.append("run")
         yield {"type": "delta", "content": "Hel"}
         yield {
             "type": "done",
@@ -3102,13 +3321,24 @@ def test_notebook_server_streams_direct_chat_events(tmp_path: Path, monkeypatch:
     try:
         request = Request(
             f"http://127.0.0.1:{server.server_port}/api/chat/stream",
-            data=json.dumps({"messages": [{"role": "user", "content": "hello"}]}).encode("utf-8"),
+            data=json.dumps({
+                "messages": [{"role": "user", "content": "hello"}],
+                "idempotency_key": "test-direct-chat-stream",
+                "conversation_id": "test-direct-chat-conversation",
+            }).encode("utf-8"),
             headers={"Content-Type": "application/json"},
             method="POST",
         )
         with urlopen(request, timeout=3) as response:
             body = response.read().decode("utf-8")
             assert response.headers.get_content_type() == "text/event-stream"
+        with urlopen(request, timeout=3) as response:
+            replay = response.read().decode("utf-8")
+        with urlopen(
+            f"http://127.0.0.1:{server.server_port}/api/chat/submissions/test-direct-chat-stream?conversation_id=test-direct-chat-conversation",
+            timeout=3,
+        ) as response:
+            submission = json.loads(response.read())
     finally:
         server.shutdown()
         thread.join(timeout=2)
@@ -3117,6 +3347,43 @@ def test_notebook_server_streams_direct_chat_events(tmp_path: Path, monkeypatch:
     assert "event: ready" in body
     assert 'event: delta\ndata: {"content":"Hel"}' in body
     assert 'event: done\ndata: {"message":{"role":"assistant","content":"Hello","usage":{"total_tokens":7}},"model":{"provider_id":"scansci-managed","model_id":"glm-4.7-flash"}}' in body
+    assert "event: done" in replay
+    assert "event: delta" not in replay
+    assert submission["state"] == "completed"
+    assert submission["terminal"]["message"]["content"] == "Hello"
+    assert executions == ["run"]
+
+
+def test_notebook_server_requires_stream_submission_key(tmp_path: Path):
+    server = create_notebook_server(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        request = Request(
+            f"http://127.0.0.1:{server.server_port}/api/chat/stream",
+            data=json.dumps({"messages": [{"role": "user", "content": "hello"}]}).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with pytest.raises(HTTPError) as rejected:
+            urlopen(request, timeout=3)
+        assert rejected.value.code == 400
+        missing_conversation = Request(
+            f"http://127.0.0.1:{server.server_port}/api/chat/stream",
+            data=json.dumps({
+                "idempotency_key": "has-key-but-no-conversation",
+                "messages": [{"role": "user", "content": "hello"}],
+            }).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with pytest.raises(HTTPError) as rejected_conversation:
+            urlopen(missing_conversation, timeout=3)
+        assert rejected_conversation.value.code == 400
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
 
 
 def test_pi_chat_emits_canonical_terminal_run_events(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
@@ -3157,6 +3424,42 @@ def test_pi_chat_emits_canonical_terminal_run_events(tmp_path: Path, monkeypatch
     assert events[-1]["result"]["message"]["trace"] == []
     assert events[-1]["result"]["agent_runtime"]["harness"] == "pi-agent-sdk"
     assert observed["session_id"] == "direct-session-alias"
+
+
+def test_pi_tool_authorization_is_visible_and_linked_to_the_result(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_pi_events(*_args, **_kwargs):
+        yield {
+            "type": "tool.authorization", "request_id": "request-1", "call_ref": "abc123",
+            "name": "inspect_available_tools", "contract_id": "contract-1",
+            "lease_schema_version": "scansci.capability-lease.v1", "risk_level": "read_only",
+            "idempotent": True, "decision": "allow", "rule": "authorized", "approval": "not_required",
+            "arguments": {"secret": "must-not-appear"},
+        }
+        yield {
+            "type": "tool.completed", "request_id": "request-1", "call_ref": "abc123",
+            "name": "inspect_available_tools", "result": {"tools": []},
+        }
+        yield {"type": "delta", "content": "已检查工具。"}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 4}}}
+
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", fake_pi_events)
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    events = list(runtime.chat_stream({
+        "chat_mode": "knowledge",
+        "messages": [{"role": "user", "content": "请检查工具。"}],
+    }))
+
+    assert events[-1]["type"] == "RUN_FINISHED"
+    result = events[-1]["result"]
+    authorization = result["agent_runtime"]["tool_authorizations"][0]
+    assert authorization["request_id"] == "request-1"
+    assert authorization["call_ref"] == result["agent_runtime"]["tool_calls"][0]["call_ref"]
+    assert authorization["decision"] == "allow"
+    assert "arguments" not in authorization
+    assert "must-not-appear" not in json.dumps(result, ensure_ascii=False)
+    assert any(item["title"] == "工具授权通过" for item in result["message"]["trace"])
 
 
 def test_pi_chat_surfaces_model_advisory_as_nonblocking_custom_event(
@@ -3262,6 +3565,127 @@ def test_image_question_with_web_tool_uses_pi_native_multimodal_route(tmp_path: 
     assert observed["images"] == [{"type": "image", "mimeType": "image/png", "data": "aGVsbG8="}]
     assert observed["model_runtime"]["input_modalities"] == ["text", "image"]
     assert isinstance(observed["messages"][-1]["content"], str)
+
+
+def test_image_follow_up_reuses_previous_attachment_without_duplicating_user_thumbnail(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    workspace = tmp_path / "workspace.sqlite"
+    provider_id = "local-runtime-ollama-qwen3.5-9b"
+    settings = {
+        "active_model": {"provider_id": provider_id, "model_id": "qwen3.5:9b"},
+        "providers": [{
+            "id": provider_id,
+            "name": "Ollama Qwen3.5 9B",
+            "kind": "local",
+            "runtime": "ollama",
+            "auth_mode": "local",
+            "logo": "ollama",
+            "base_url": "http://127.0.0.1:11434/v1",
+            "enabled": True,
+            "models": [{"id": "qwen3.5:9b", "name": "Qwen3.5 9B", "capabilities": ["vision", "tool"]}],
+        }],
+    }
+    monkeypatch.setattr("scansci_html.research_agent.load_settings", lambda _workspace: settings)
+    def ollama_ready(*_args, **_kwargs):
+        return {"reachable": True, "model_ready": True, "models": [{"name": "qwen3.5:9b"}]}
+
+    monkeypatch.setattr("scansci_html.research_agent.ollama_status", ollama_ready)
+    monkeypatch.setattr("scansci_html.vision_routing.ollama_status", ollama_ready)
+    from scansci_html import research_agent as research_agent_module
+    original_select_vision = research_agent_module.select_vision_route
+    cloud_permissions: list[bool] = []
+
+    def select_vision(*args, **kwargs):
+        cloud_permissions.append(kwargs["allow_cloud"])
+        return original_select_vision(*args, **kwargs)
+
+    monkeypatch.setattr(research_agent_module, "select_vision_route", select_vision)
+    requests: list[dict[str, object]] = []
+
+    def pi_model_stream(_client, **kwargs):
+        requests.append(kwargs)
+        yield {"type": "delta", "content": "图里有一个细胞。"}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 8}}}
+
+    monkeypatch.setattr(PiAgentClient, "stream_chat", pi_model_stream)
+    monkeypatch.setattr(
+        "scansci_html.research_agent.stream_chat_text",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("image follow-up must use vision")),
+    )
+    runtime = ResearchAgentRuntime(workspace=workspace, evidence_db=tmp_path / "evidence.sqlite")
+    png = (
+        "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJ"
+        "AAAADUlEQVQIHWP4z8DwHwAFgAI/ScL/nwAAAABJRU5ErkJggg=="
+    )
+    first = list(runtime.chat_stream({
+        "conversation_id": "image-follow-up",
+        "web_search": "off",
+        "messages": [{"role": "user", "content": "你能看图？"}],
+        "images": [{"name": "cell.png", "data_url": f"data:image/png;base64,{png}"}],
+    }))[-1]["result"]
+    second_events = list(runtime.chat_stream({
+        "conversation_id": "image-follow-up",
+        "web_search": "off",
+        "messages": [
+            {"role": "user", "content": "你能看图？", "images": first["user_images"]},
+            first["message"],
+            {"role": "user", "content": "我刚刚的图里有啥？"},
+        ],
+    }))
+    assert second_events[-1]["type"] == "RUN_FINISHED", second_events[-1]
+    second = second_events[-1]["result"]
+
+    assert len(requests) == 2
+    assert requests[0]["images"], first["agent_runtime"]["vision_route"]
+    assert requests[0]["images"] == requests[1]["images"]
+    assert cloud_permissions[:2] == [True, False]
+    assert requests[1]["images"][0]["mimeType"] == "image/png"
+    assert "mention a concrete visible detail" in requests[0]["messages"][0]["content"]
+    assert "mention a concrete visible detail" in requests[1]["messages"][0]["content"]
+    assert second["agent_runtime"]["vision_route"]["context_source"] == "conversation_history"
+    assert "user_images" not in second
+    from scansci_html.image_attachments import persist_image_attachments
+    another = persist_image_attachments(
+        workspace, [{"name": "other.png", "data_url": f"data:image/png;base64,{png}"}],
+    )[0]
+    history = [
+        {"role": "user", "content": "第一张", "images": first["user_images"]},
+        {"role": "user", "content": "第二张", "images": [another]},
+    ]
+    first_ref = runtime._direct_chat_request({
+        "_skip_run_manifest": True,
+        "messages": [*history, {"role": "user", "content": "第一张图里有什么？"}],
+    })
+    assert first_ref.image_attachments[0]["id"] == first["user_images"][0]["id"]
+    figure_ref = runtime._direct_chat_request({
+        "_skip_run_manifest": True,
+        "messages": [*history, {"role": "user", "content": "What does this figure show?"}],
+    })
+    assert figure_ref.image_attachments[0]["id"] == another["id"]
+    ignored = runtime._direct_chat_request({
+        "_skip_run_manifest": True,
+        "messages": [*history, {"role": "user", "content": "不要看之前的图片，只回答文字问题。"}],
+    })
+    assert ignored.pi_images == []
+    assert ignored.vision_route == {}
+    unrelated = runtime._direct_chat_request({
+        "_skip_run_manifest": True,
+        "messages": [
+            {"role": "user", "content": "你能看图？", "images": first["user_images"]},
+            {"role": "user", "content": "帮我画一幅示意图"},
+        ],
+    })
+    assert unrelated.pi_images == []
+    with pytest.raises(ValueError, match="之前的图片文件已不可用"):
+        runtime._direct_chat_request({
+            "_skip_run_manifest": True,
+            "messages": [
+                {"role": "user", "content": "你能看图？", "images": [{"id": f"image-{'0' * 32}"}]},
+                {"role": "user", "content": "我刚刚的图里有啥？"},
+            ],
+        })
 
 
 def test_image_question_replaces_scientific_system_prompt_without_dropping_image_blocks(
@@ -3530,6 +3954,7 @@ def test_image_question_falls_back_to_ocr_when_local_vision_cannot_start(
     assert request.vision_route["mode"] == "ocr-fallback"
     assert request.vision_route["fallback_reason"] == "local_vision_unavailable"
     assert "群聊截图中的文字" in request.messages[-1]["content"]
+    assert "An image is attached to this turn" not in request.messages[0]["content"]
     assert request.provider_id == "text-provider"
 
 
@@ -3800,9 +4225,14 @@ def test_pi_chat_cuts_off_terminal_repetition_before_it_reaches_the_ui(
     assert any(item["title"] == "移除异常重复" for item in result["message"]["trace"])
 
 
+@pytest.mark.parametrize(("agent_mode", "chat_mode"), [
+    (False, "knowledge"), (True, "knowledge"), (True, "general"),
+])
 def test_direct_knowledge_chat_returns_per_sentence_verified_citations(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
+    agent_mode: bool,
+    chat_mode: str,
 ):
     app, workspace, _evidence = _build_app(tmp_path)
     _configure_local_evidence(workspace)
@@ -3819,7 +4249,9 @@ def test_direct_knowledge_chat_returns_per_sentence_verified_citations(
     monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", direct_model_must_not_run)
     monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", fake_pi_events)
     events = list(app.research_agent.chat_stream({
-        "chat_mode": "knowledge",
+        "agent_mode": agent_mode,
+        "chat_mode": chat_mode,
+        "retrieval_quality": "balanced",
         "notebook_id": "immunotherapy",
         "notebook_ids": ["immunotherapy"],
         "messages": [{"role": "user", "content": "What did Galunisertib reduce?"}],
@@ -3839,6 +4271,7 @@ def test_direct_knowledge_chat_returns_per_sentence_verified_citations(
         "build_verified_answer",
     }
     assert events[-1]["result"]["agent_runtime"]["harness"] == "pi-agent-sdk"
+    assert events[-1]["result"]["agent_runtime"]["agent_mode_requested"] is agent_mode
     assert events[-1]["result"]["agent_runtime"]["pi_success"] is True
     script = app.dispatch("GET", "/app.js").body.decode("utf-8")
     assert "directEvidenceAnswerMarkup" in script
@@ -3848,6 +4281,251 @@ def test_direct_knowledge_chat_returns_per_sentence_verified_citations(
     assert "context_before" in script
     styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
     assert ".citation-context" in styles
+
+
+def test_evidence_reader_shows_excerpt_only_when_full_text_cannot_be_located(tmp_path: Path) -> None:
+    app = NotebookWebApp(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+    reader = script.split("function showEvidenceReader(", 1)[1].split("function closeEvidenceReader(", 1)[0]
+    assert "citationContextMarkup(citation" in reader
+    assert "evidenceDetailsMarkup(citation, true)" in reader
+    assert "命中章节：" in reader
+    assert '<h2>${escapeHtml(sourceTitle(citation))}</h2>' not in reader
+    assert 'class="evidence-reader-summary" hidden' in reader
+    assert 'frame.addEventListener("load"' in reader
+    assert "getElementById(citation.html_anchor)" in reader
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+    assert ".evidence-source-details.is-compact summary" in styles
+    assert 'aria-label="来源详情" title="来源详情">?' in script
+
+
+def test_markdown_reader_locates_saved_quote_after_evidence_index_disappears(tmp_path: Path) -> None:
+    playwright = pytest.importorskip("playwright.sync_api")
+    from scansci_html.webapp import _decorate_evidence_reader_html
+
+    app = NotebookWebApp(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    html = app._markdown_source_reader(
+        "old-doc", {
+            "title": "第 1 页",
+            "source_url": str(tmp_path / "荒漠光伏研究.pdf"),
+            "evidence_db_path": str(tmp_path / "missing.sqlite"),
+        },
+        "摘要\n周某等观察到植被盖度\n下降到 2% 左右。",
+    )
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+    helper = script.split("function locateEvidenceReaderQuote(", 1)[1].split("function centerEvidenceReaderAnchor(", 1)[0]
+    helper = "function locateEvidenceReaderQuote(" + helper
+    citation = {"html_anchor": "old-anchor", "exact_quote": "周某等观察到植被盖度下降到 2% 左右。"}
+
+    assert 'data-scansci-source-text="true"' in html
+    assert "荒漠光伏研究 · 第 1 页" in html
+    assert "当前没有可定位的证据块" in html
+    with playwright.sync_playwright() as browser_driver:
+        try:
+            browser = browser_driver.chromium.launch(channel="msedge" if os.name == "nt" else None)
+        except playwright.Error:
+            pytest.skip("No local Chromium browser is available")
+        backgrounds = []
+        try:
+            for theme in ("light", "dark"):
+                page = browser.new_page()
+                page.set_content(_decorate_evidence_reader_html(html, f"theme={theme}&accent=jade"))
+                page.add_script_tag(content=helper)
+                assert page.evaluate("() => locateEvidenceReaderQuote(document, {exact_quote: 'unrelated text that is absent'})") is False
+                if theme == "light":
+                    source_text = page.locator("[data-scansci-source-text]").text_content()
+                    page.locator("[data-scansci-source-text]").evaluate(
+                        "(element, quote) => { element.textContent += '\\n' + quote; }", citation["exact_quote"]
+                    )
+                    assert page.evaluate("citation => locateEvidenceReaderQuote(document, citation)", citation) is False
+                    assert page.locator("mark[data-scansci-fallback-match]").count() == 0
+                    page.locator("[data-scansci-source-text]").evaluate(
+                        "(element, text) => { element.textContent = text; }", source_text
+                    )
+                assert page.evaluate("citation => locateEvidenceReaderQuote(document, citation)", citation) is True
+                assert page.locator("mark[data-scansci-fallback-match][id='old-anchor']").count() == 1
+                assert page.locator("main details").get_attribute("open") is not None
+                assert page.locator("main .empty").get_attribute("hidden") is not None
+                backgrounds.append(page.locator("main pre").evaluate("element => getComputedStyle(element).backgroundColor"))
+                page.close()
+        finally:
+            browser.close()
+    assert backgrounds[0] != backgrounds[1]
+
+
+def test_evidence_reader_original_file_error_and_theme_switch_keep_panel_state(tmp_path: Path) -> None:
+    playwright = pytest.importorskip("playwright.sync_api")
+    server = create_notebook_server(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        with playwright.sync_playwright() as browser_driver:
+            try:
+                browser = browser_driver.chromium.launch(channel="msedge" if os.name == "nt" else None)
+            except playwright.Error:
+                pytest.skip("No local Chromium browser is available")
+            try:
+                page = browser.new_page()
+                script = (Path(__file__).parents[1] / "src" / "scansci_html" / "web" / "app.js").read_text(encoding="utf-8")
+                page.route("**/app.js*", lambda route: route.fulfill(
+                    status=200, content_type="text/javascript",
+                    body=script + "\nwindow.__readerTest = { showEvidenceReader, applyAppearancePreferences };",
+                ))
+                page.route("**/api/sources/demo/reader**", lambda route: route.fulfill(
+                    status=200, content_type="text/html",
+                    body='<html><head><style data-scansci-reader-theme="true"></style></head>'
+                         '<body><pre data-scansci-source-text="true">摘要：测试引用文字。</pre></body></html>',
+                ))
+                page.route("**/api/sources/demo/original", lambda route: route.fulfill(
+                    status=404, content_type="application/json", body='{"error":{"code":"not_found"}}',
+                ))
+                page.goto(f"http://127.0.0.1:{server.server_port}/")
+                page.wait_for_function("() => !!window.__readerTest")
+                page.evaluate("""() => window.__readerTest.showEvidenceReader({
+                    doc_id: 'demo', paper: '测试文献', html_anchor: 'old-anchor',
+                    exact_quote: '摘要：测试引用文字。',
+                    reader_url: '/api/sources/demo/reader',
+                    original_url: '/api/sources/demo/original'
+                })""")
+                page.locator('[data-action="show-evidence-original"]').evaluate("element => element.click()")
+                page.wait_for_function("() => document.querySelector('.evidence-reader-fallback-label')?.textContent.includes('原始文件无法显示')")
+                assert page.locator("#evidenceReaderFrame").evaluate("frame => frame.contentDocument?.contentType") == "application/json"
+                assert page.locator(".evidence-reader-summary").get_attribute("hidden") is None
+                page.evaluate("window.__readerTest.applyAppearancePreferences()")
+                assert page.locator("#evidenceReaderFrame").get_attribute("src") == "/api/sources/demo/original"
+                assert page.locator('[data-action="show-evidence-original"]').get_attribute("class") == "is-active"
+                page.close()
+            finally:
+                browser.close()
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+
+def test_agent_mode_uses_robot_icon_in_both_composers(tmp_path: Path) -> None:
+    app = NotebookWebApp(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    html = app.dispatch("GET", "/").body.decode("utf-8")
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+    styles = app.dispatch("GET", "/styles.css").body.decode("utf-8")
+    assert html.count('class="composer-agent-button"') == 2
+    assert html.count('<span data-ui-icon="bot"></span>') == 2
+    assert 'bot: \'<path d="M12 8V4H8"' in script
+    assert ".composer-agent-button .ui-icon" in styles
+
+
+def test_evidence_reader_recenters_original_match_after_layout_changes(tmp_path: Path) -> None:
+    app = NotebookWebApp(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    script = app.dispatch("GET", "/app.js").body.decode("utf-8")
+    reader = script.split("function showEvidenceReader(", 1)[1].split("function closeEvidenceReader(", 1)[0]
+    expansion = script.split("function toggleEvidencePanelExpanded(", 1)[1].split("function toggleContextPanel(", 1)[0]
+    centering = script.split("function centerEvidenceReaderAnchor(", 1)[1].split("function showEvidenceReader(", 1)[0]
+    assert 'scrollIntoView({ block: "center", inline: "nearest" })' in centering
+    assert "requestAnimationFrame(centerEvidenceReaderAnchor)" in reader
+    assert "requestAnimationFrame(centerEvidenceReaderAnchor)" in expansion
+
+
+def test_agent_knowledge_writer_failure_stays_inside_evidence_gate(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, workspace, _evidence = _build_app(tmp_path)
+    _configure_local_evidence(workspace)
+    monkeypatch.setattr(app.research_agent, "answer_sync", lambda _payload: {
+        "hits": [{"evidence_id": "paper-1.s0001"}],
+        "citation_verification": {"passed": True},
+        "reader_answer": {
+            "text": "已核验的原文证据。[1]",
+            "citations": [{
+                "citation_no": 1, "quote_id": "q0001", "evidence_id": "paper-1.s0001",
+                "doc_id": "paper-1", "paper": "Evidence paper", "section": "Results",
+                "html_anchor": "s0001", "exact_quote": "The verified source statement.",
+            }],
+        },
+    })
+
+    def failed_pi(*_args, **_kwargs):
+        raise RuntimeError("writer unavailable")
+        yield  # pragma: no cover
+
+    def direct_must_not_run(*_args, **_kwargs):
+        raise AssertionError("Agent evidence writing must stay in Pi")
+
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", failed_pi)
+    monkeypatch.setattr("scansci_html.research_agent.complete_chat_text", direct_must_not_run)
+    events = list(app.research_agent.chat_stream({
+        "agent_mode": True,
+        "chat_mode": "knowledge",
+        "notebook_id": "immunotherapy",
+        "notebook_ids": ["immunotherapy"],
+        "messages": [{"role": "user", "content": "这篇论文说什么？"}],
+    }))
+
+    assert events[-1]["type"] == "RUN_ERROR"
+    assert not any(event.get("type") == "TEXT_MESSAGE_CONTENT" for event in events)
+
+
+def test_sync_agent_knowledge_turn_reuses_verified_stream_route(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: list[dict[str, object]] = []
+
+    def verified_stream(_self, payload):
+        observed.append(payload)
+        yield {"type": "RUN_FINISHED", "result": {"message": {"content": "已核验证据。[1]"}}}
+
+    monkeypatch.setattr(ResearchAgentRuntime, "chat_stream", verified_stream)
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    payload = {
+        "agent_mode": True,
+        "chat_mode": "knowledge",
+        "notebook_id": "library-1",
+        "messages": [{"role": "user", "content": "这篇论文说什么？"}],
+    }
+
+    assert runtime.chat(payload)["message"]["content"] == "已核验证据。[1]"
+    assert observed == [payload]
+
+
+def test_verified_knowledge_clears_unadopted_reasoning_before_fixed_answer(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    app, workspace, _evidence = _build_app(tmp_path)
+    _configure_local_evidence(workspace)
+    observed_payloads = []
+    monkeypatch.setattr(app.research_agent, "answer_sync", lambda payload: observed_payloads.append(payload) or {
+        "hits": [{"evidence_id": "paper-1.s0001"}],
+        "citation_verification": {"passed": True},
+        "reader_answer": {
+            "text": "已核验的原文证据。[1]",
+            "citations": [{
+                "citation_no": 1, "quote_id": "q0001", "evidence_id": "paper-1.s0001",
+                "doc_id": "paper-1", "paper": "Evidence paper", "section": "Results",
+                "html_anchor": "s0001", "exact_quote": "The verified source statement.",
+            }],
+        },
+    })
+
+    def failed_pi(*_args, **_kwargs):
+        yield {"type": "reasoning", "content": "Unfinished model thought"}
+        raise RuntimeError("HTTP 503")
+
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", failed_pi)
+    events = list(app.research_agent.chat_stream({
+        "chat_mode": "knowledge",
+        "notebook_id": "immunotherapy",
+        "notebook_ids": ["immunotherapy"],
+        "messages": [{"role": "user", "content": "这篇论文说什么？"}],
+    }))
+
+    assert events[-1]["type"] == "RUN_FINISHED"
+    assert events[-1]["result"]["message"]["content"] == "已核验的原文证据。[1]"
+    assert observed_payloads[0]["retrieval_quality"] == "precision"
+    assert "reasoning" not in events[-1]["result"]["message"]
+    reasoning_events = [event["value"] for event in events if event.get("name") == "model_reasoning"]
+    assert reasoning_events == [{"delta": "Unfinished model thought"}, {"reset": True}]
 
 
 def test_task_delivery_reuses_artifact_citations_for_plain_answer_text(tmp_path: Path) -> None:
@@ -3997,6 +4675,7 @@ def test_ambiguous_knowledge_turn_never_calls_a_model_before_verified_pi(
             "active_run_id": active_run_id,
             "messages": request.messages,
         })
+        yield {"type": "reasoning", "content": "Checking the cited evidence. "}
         yield {"type": "delta", "content": "The selected library contains relevant photovoltaic evidence.[1]"}
         yield {"type": "done", "stats": {"tokens": {"total_tokens": 12}}}
 
@@ -4014,6 +4693,8 @@ def test_ambiguous_knowledge_turn_never_calls_a_model_before_verified_pi(
     assert pi_calls[0]["task_mode"] == "knowledge"
     assert message["evidence_answer"] is True
     assert message["content"].endswith("[1]")
+    assert message["reasoning"] == "Checking the cited evidence. "
+    assert any(event.get("name") == "model_reasoning" and event.get("value", {}).get("delta") == "Checking the cited evidence. " for event in events)
     assert runtime["harness"] == "pi-agent-sdk"
     assert runtime["pi_success"] is True
 
@@ -4085,6 +4766,7 @@ def test_fixed_verified_workflow_uses_pi_for_model_json_and_an_empty_nested_leas
         "notebook_ids": ["immunotherapy"],
         "agent_harness": "fixed-workflow",
         "task_mode": "evidence",
+        "retrieval_quality": "balanced",
     })
 
     assert direct_calls == []
@@ -4101,6 +4783,54 @@ def test_fixed_verified_workflow_uses_pi_for_model_json_and_an_empty_nested_leas
     assert answer_options["verification_provider"] == "local"
     assert preparation_calls == [(evidence.resolve(), {"quality_profile": "balanced"})]
     assert result["pi_agent"]["harness"] == "pi-fixed-workflow"
+
+
+def test_durable_ask_pi_effect_scope_survives_stage_retry(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    app, workspace, _evidence = _build_app(tmp_path)
+    settings = load_settings(workspace)
+    settings["active_model"] = {"provider_id": "fixture-provider", "model_id": "fixture-model"}
+    settings["providers"] = [{
+        "id": "fixture-provider", "name": "Fixture provider", "kind": "openai-compatible",
+        "base_url": "https://fixture.invalid/v1", "enabled": True,
+        "models": [{"id": "fixture-model", "name": "Fixture model"}],
+    }]
+    save_settings(workspace, settings)
+    run = app.research_agent.store.create_run(
+        notebook_id="immunotherapy", workflow_type="ask", title="One durable tool stage",
+        input_payload={"question": "Draw one bird"}, stages=[StageSpec("tool", "Tool", "tool")],
+    )
+    monkeypatch.setattr(app.research_agent, "prepare_local_evidence", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(
+        app.research_agent, "_local_evidence_stack",
+        lambda *_args, **_kwargs: type("Stack", (), {"embedding_provider": None, "reranker": None})(),
+    )
+    monkeypatch.setattr("scansci_html.research_agent.get_provider_api_key", lambda *_args: "fixture-key")
+    scopes: list[str] = []
+
+    class CapturedScope(BaseException):
+        pass
+
+    def capture_scope(_self, **kwargs):
+        scopes.append(kwargs.get("effect_scope", ""))
+        raise CapturedScope
+
+    monkeypatch.setattr(PiAgentClient, "__init__", capture_scope)
+    payload = {
+        "question": "Draw one bird", "notebook_id": "immunotherapy",
+        "task_mode": "image", "agent_harness": "pi", "retrieval_quality": "balanced",
+        "_research_run_id": run["run_id"],
+    }
+    for _attempt in range(2):
+        with pytest.raises(CapturedScope):
+            app.research_agent.answer_sync(payload)
+
+    assert scopes == [f"research-run:{run['run_id']}:tool:initial"] * 2
+    app.research_agent.store.fail_stage(run["run_id"], "tool", RuntimeError("retry as a new user request"))
+    restarted = app.research_agent.store.prepare_restart(run["run_id"])
+    with pytest.raises(CapturedScope):
+        app.research_agent.answer_sync(payload)
+    assert scopes[2] == f"research-run:{run['run_id']}:tool:{restarted['metadata']['effect_epoch']}"
+    assert scopes[2] != scopes[0]
 
 
 def test_knowledge_writing_keeps_verified_sources_but_returns_a_structured_draft(
@@ -4210,6 +4940,7 @@ def test_knowledge_writing_keeps_verified_sources_but_returns_a_structured_draft
     assert runtime["task_contract"]["task_profile"]["evidence_policy"] == "strict"
     assert any("build_verified_answer" in group for group in runtime["task_contract"]["required_tool_groups"])
     assert observed_payload["force_local_evidence"] is True
+    assert observed_payload["retrieval_quality"] == "precision"
     assert observed_payload["limit"] == 20
     assert observed_payload["max_quotes"] == 12
     assert observed_payload["min_quotes"] == 6
@@ -4467,7 +5198,7 @@ def test_plain_greeting_uses_direct_chat_fast_lane(
     assert result["agent_runtime"]["task_contract"]["initial_tools"] == []
     assert result["agent_runtime"]["harness"] == "direct-provider"
     assert result["agent_runtime"]["routing"] == "direct-chat-fast"
-    assert observed["max_tokens"] == 256
+    assert observed["max_tokens"] is None
     assert observed["thinking_mode"] == "disabled"
     system = observed["messages"][0]["content"]
     assert "ScanSci" in system
@@ -4575,6 +5306,118 @@ def test_direct_chat_web_search_policy_selects_pi_tool_boundary(
         assert result["agent_runtime"]["tool_calls"] == [{"name": "discover_papers", "status": "completed"}]
 
 
+def test_agent_mode_routes_open_request_through_pi_without_expanding_writes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    observed: dict[str, object] = {}
+
+    def fake_pi_events(self, chat_request, *, task_mode=None, session_id=None):
+        observed["task_mode"] = task_mode
+        observed["session_id"] = session_id
+        yield {"type": "tool.completed", "name": "search_tools", "result": {"tools": []}}
+        yield {"type": "delta", "content": "已检查可用工具并完成分析。"}
+        yield {"type": "done", "usage": {"total_tokens": 8}}
+
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", fake_pi_events)
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    events = list(runtime.chat_stream({
+        "agent_mode": True,
+        "web_search": "off",
+        "pi_session_id": "open-task-session",
+        "messages": [{"role": "user", "content": "比较这两种方法的利弊"}],
+    }))
+
+    assert events[-1]["type"] == "RUN_FINISHED"
+    result = events[-1]["result"]
+    assert observed == {"task_mode": "agent", "session_id": "open-task-session"}
+    assert result["agent_runtime"]["harness"] == "pi-agent-sdk"
+    assert result["agent_runtime"]["task_contract"]["risk_level"] == "read_only"
+    assert "create_document" not in result["agent_runtime"]["task_contract"]["allowed_tools"]
+    assert result["agent_runtime"]["tool_calls"] == [{"name": "search_tools", "status": "completed"}]
+
+
+def test_agent_web_off_restricts_the_actual_pi_lease(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    observed: dict[str, object] = {}
+
+    class CapturingHarness:
+        client = None
+
+        def __init__(self, **_kwargs):
+            pass
+
+        def prepare_turn(self, **kwargs):
+            observed["contract"] = kwargs["task_contract"]
+            return object()
+
+        def stream(self, _turn):
+            yield {"type": "done", "usage": {}}
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr("scansci_html.research_agent.ScanSciHarness", CapturingHarness)
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    request = runtime._direct_chat_request({
+        "web_search": "off",
+        "messages": [{"role": "user", "content": "比较两种方法"}],
+    })
+    list(runtime._pi_model_events(request, task_mode="agent"))
+
+    contract = observed["contract"]
+    assert not {"search_web", "agent_reach", "browser_access", "discover_papers"} & set(contract["allowed_tools"])
+    assert contract["allowed_mcp_servers"] == []
+
+
+def test_agent_mode_failure_never_falls_back_to_uninstrumented_chat(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failed_pi_events(self, chat_request, *, task_mode=None, session_id=None):
+        raise RuntimeError("agent loop failed")
+        yield  # pragma: no cover
+
+    def direct_transport_must_not_run(*_args, **_kwargs):
+        raise AssertionError("agent mode must stay in Pi")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", failed_pi_events)
+    monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", direct_transport_must_not_run)
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    events = list(runtime.chat_stream({
+        "agent_mode": True,
+        "web_search": "off",
+        "messages": [{"role": "user", "content": "比较这两种方法的利弊"}],
+    }))
+
+    assert events[-1]["type"] == "RUN_ERROR"
+    assert events[-1]["message"]
+    assert not any(event.get("type") == "compatibility.fallback" for event in events)
+
+
+def test_sync_agent_mode_failure_never_calls_direct_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def failed_pi_events(self, chat_request, *, task_mode=None, session_id=None):
+        raise RuntimeError("agent loop failed")
+        yield  # pragma: no cover
+
+    def direct_transport_must_not_run(*_args, **_kwargs):
+        raise AssertionError("agent mode must stay in Pi")
+
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", failed_pi_events)
+    monkeypatch.setattr("scansci_html.research_agent.complete_chat_text", direct_transport_must_not_run)
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+
+    with pytest.raises(RuntimeError, match="ScanSci Agent 未能完成"):
+        runtime.chat({
+            "agent_mode": True,
+            "web_search": "off",
+            "messages": [{"role": "user", "content": "比较这两种方法的利弊"}],
+        })
+
+
 def test_explicit_web_access_skill_does_not_override_web_search_off(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -4604,6 +5447,32 @@ def test_explicit_web_access_skill_does_not_override_web_search_off(
     assert "web-access" in observed["skills"]
     assert events[-1]["result"]["agent_runtime"]["task_mode"] == "general"
     assert events[-1]["result"]["agent_runtime"]["tool_calls"] == []
+
+
+def test_pi_html_continuation_status_appears_in_process_trace(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fake_pi_events(*_args, **_kwargs):
+        yield {"type": "status", "status": "continuing", "name": "incomplete_html", "attempt": 1}
+        yield {"type": "delta", "content": "<html><body>Game</body></html>"}
+        yield {"type": "done", "stats": {"tokens": {"total_tokens": 4}}}
+
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", fake_pi_events)
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    events = list(runtime.chat_stream({
+        "agent_mode": True,
+        "web_search": "off",
+        "messages": [{"role": "user", "content": "做一个完整的 HTML 坦克大战游戏"}],
+    }))
+
+    assert events[-1]["type"] == "RUN_FINISHED"
+    assert any(
+        event.get("name") == "process_trace"
+        and any(item.get("title") == "自动续写" for item in event.get("value", []))
+        for event in events
+        if event["type"] == "CUSTOM"
+    )
 
 
 @pytest.mark.parametrize("entrypoint", ["chat", "chat_stream"])
@@ -5093,9 +5962,10 @@ def test_synchronous_plain_chat_uses_bounded_direct_fast_transport(
 
     def direct_transport(*_args, **kwargs):
         observed.update(kwargs)
-        return "Direct synchronous reply", {"total_tokens": 5}
+        yield {"type": "delta", "content": "Direct synchronous reply"}
+        yield {"type": "done", "usage": {"total_tokens": 5}}
 
-    monkeypatch.setattr("scansci_html.research_agent.complete_chat_text", direct_transport)
+    monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", direct_transport)
     runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
     monkeypatch.setattr(
         runtime,
@@ -5111,7 +5981,7 @@ def test_synchronous_plain_chat_uses_bounded_direct_fast_transport(
     assert result["agent_runtime"]["compatibility_fallback"] is False
     assert result["agent_runtime"]["compatibility_error"] == ""
     assert result["agent_runtime"]["routing"] == "direct-chat-fast"
-    assert observed["max_tokens"] == 512
+    assert observed["max_tokens"] is None
     assert observed["temperature"] == 0.2
     assert observed["thinking_mode"] == "disabled"
 
@@ -5136,6 +6006,7 @@ def test_streaming_plain_chat_uses_bounded_direct_fast_transport(
 
     def direct_events(*_args, **kwargs):
         observed.update(kwargs)
+        yield {"type": "reasoning", "content": "Checking the workflow. "}
         yield {"type": "delta", "content": "Direct compatibility reply"}
         yield {"type": "done", "usage": {"total_tokens": 3}}
 
@@ -5152,15 +6023,60 @@ def test_streaming_plain_chat_uses_bounded_direct_fast_transport(
     assert events[-1]["type"] == "RUN_FINISHED"
     result = events[-1]["result"]
     assert result["message"]["content"] == "Direct compatibility reply"
+    assert result["message"]["reasoning"] == "Checking the workflow. "
+    assert any(event["type"] == "CUSTOM" and event.get("name") == "model_reasoning" and event["value"]["delta"] == "Checking the workflow. " for event in events)
     assert result["agent_runtime"]["harness"] == "direct-provider"
     assert result["agent_runtime"]["compatibility_fallback"] is False
     assert result["agent_runtime"]["compatibility_error"] == ""
     assert result["agent_runtime"]["routing"] == "direct-chat-fast"
-    assert observed["max_tokens"] == 512
-    assert observed["max_continuations"] == 0
+    assert observed["max_tokens"] is None
+    assert "max_continuations" not in observed
     assert observed["max_requests"] == 1
     assert observed["temperature"] == 0.2
     assert observed["thinking_mode"] == "disabled"
+
+
+def test_direct_stream_does_not_switch_models_after_reasoning_is_visible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def failing_stream(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        yield {"type": "reasoning", "content": "First model thought"}
+        raise RuntimeError("HTTP 503")
+
+    monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", failing_stream)
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    monkeypatch.setattr(runtime, "_managed_fallback_chat_request", lambda request: request)
+    events = list(runtime.chat_stream({"messages": [{"role": "user", "content": "hello"}]}))
+
+    assert calls == 1
+    assert events[-1]["type"] == "RUN_ERROR"
+    assert not any(event.get("type") == "model.fallback" for event in events)
+
+
+def test_pi_stream_does_not_fall_back_after_reasoning_is_visible(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    request = runtime._direct_chat_request({"messages": [{"role": "user", "content": "hello"}]})
+
+    def failing_pi(*_args, **_kwargs):
+        yield {"type": "reasoning", "content": "Pi thought"}
+        raise RuntimeError("HTTP 503")
+
+    monkeypatch.setattr(runtime, "_pi_model_events", failing_pi)
+    monkeypatch.setattr(runtime, "_managed_fallback_chat_request", lambda _request: request)
+    events = []
+    with pytest.raises(RuntimeError, match="HTTP 503"):
+        for event in runtime._pi_events_with_compatibility_fallback(request):
+            events.append(event)
+
+    assert events == [{"type": "reasoning", "content": "Pi thought"}]
 
 
 @pytest.mark.parametrize("entrypoint", ["chat", "chat_stream"])
@@ -5212,22 +6128,6 @@ def test_pi_pre_effect_direct_fallback_materializes_explicit_skill_once(
     assert result["agent_runtime"]["compatibility_fallback"] is True
     fallback_text = json.dumps(observed["messages"], ensure_ascii=False)
     assert fallback_text.count("# web-access Skill") == 1
-
-
-def test_explicit_structured_writing_receives_a_completion_budget_and_safe_continuation() -> None:
-    request = (
-        "请写一份结构完整的科研写作质量检查指南，共六个编号部分。"
-        "每部分至少包含三条可执行检查，不要省略结尾；最后一行必须单独写【回答完毕】。"
-    )
-
-    assert _direct_output_budget(request) == 4_096
-    assert _direct_max_continuations(request) == 1
-    assert _direct_output_budget("你好") == 256
-    assert _direct_output_budget("用一句话概括。") == 384
-    assert _direct_max_continuations("用一句话概括。") == 0
-    assert _direct_output_budget("请审查这篇稿件", [{"id": "nature-reviewer"}]) == 4_096
-    assert _direct_output_budget("用一句话审查稿件", [{"id": "nature-reviewer"}]) == 384
-    assert _direct_output_budget(request, [{"id": "nature-statistics"}]) == 4_096
 
 
 def test_structured_direct_output_keeps_complete_body_and_repairs_only_terminal_marker() -> None:
@@ -5395,6 +6295,42 @@ def test_structured_pi_stream_can_repair_twice_before_delivery(
         for item in events[-1]["result"]["message"]["trace"]
     )
     assert "final automatic repair attempt" in calls[2][-2]["content"]
+
+
+def test_agent_structured_repair_failure_never_uses_direct_provider(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = 0
+
+    def pi_events(_self, _request, **_kwargs):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            yield {"type": "delta", "content": "我会为你准备六个部分。"}
+            yield {"type": "done", "usage": {"total_tokens": 8}}
+            return
+        raise RuntimeError("repair Pi unavailable")
+
+    def direct_must_not_run(*_args, **_kwargs):
+        raise AssertionError("Agent structured repair must stay in Pi")
+        yield  # pragma: no cover
+
+    monkeypatch.setattr(ResearchAgentRuntime, "_pi_model_events", pi_events)
+    monkeypatch.setattr("scansci_html.research_agent.stream_chat_text", direct_must_not_run)
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    events = list(runtime.chat_stream({
+        "agent_mode": True,
+        "web_search": "off",
+        "messages": [{"role": "user", "content": (
+            "请写一份科研检查指南，共六个编号部分。"
+            "每部分至少三条检查；最后一行必须单独写【回答完毕】。"
+        )}],
+    }))
+
+    assert calls >= 2
+    assert events[-1]["type"] == "RUN_ERROR"
+    assert not any(event.get("type") == "TEXT_MESSAGE_CONTENT" for event in events)
 
 
 def test_structured_pi_stream_repairs_prose_checks_into_explicit_checklist_items(
@@ -5942,6 +6878,75 @@ def test_model_health_exposes_models_discovered_from_ollama(tmp_path: Path, monk
     assert "api_key" not in json.dumps(health)
 
 
+def test_recommended_chat_model_only_becomes_primary_after_real_probe(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    app, workspace, _evidence = _build_app(tmp_path)
+    original = load_settings(workspace)["active_model"]
+    monkeypatch.setattr("scansci_html.webapp.detect_local_hardware", lambda: {
+        "platform": "Windows", "vram_gib": 12, "ram_gib": 32, "storage_free_gib": 50,
+    })
+    monkeypatch.setattr(app, "_ollama_status", lambda **_kwargs: {
+        "reachable": True,
+        "base_url": "http://127.0.0.1:11434",
+        "models": [{"name": "qwen3.5:9b"}],
+    })
+    monkeypatch.setattr("scansci_html.webapp.probe_ollama_chat_model", lambda *_args: (_ for _ in ()).throw(RuntimeError("tool call failed")))
+
+    failed = app.dispatch("POST", "/api/local-models/activate-recommended", b'{"id":"qwen3.5:9b"}')
+
+    assert failed.status == 409
+    assert load_settings(workspace)["active_model"] == original
+
+    monkeypatch.setattr("scansci_html.webapp.probe_ollama_chat_model", lambda *_args: {
+        "loaded": True, "citation_verified": True, "tool_call_verified": True,
+    })
+    activated = app.dispatch("POST", "/api/local-models/activate-recommended", b'{"id":"qwen3.5:9b"}')
+
+    assert activated.status == 200
+    assert _payload(activated)["settings"]["active_model"] == {
+        "provider_id": "local-runtime-ollama-qwen3.5-9b", "model_id": "qwen3.5:9b",
+    }
+
+
+def test_ollama_model_market_reports_each_installation_exactly(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    monkeypatch.setattr("scansci_html.webapp.market_catalog", lambda _query: {
+        "items": [
+            {"id": "minicpm-v4.6", "runtime": "ollama"},
+            {"id": "qwen3.5:9b", "runtime": "ollama"},
+        ],
+        "source": "curated",
+    })
+    monkeypatch.setattr("scansci_html.webapp.detect_local_hardware", lambda: {
+        "platform": "Windows", "vram_gib": 12, "ram_gib": 32,
+    })
+    monkeypatch.setattr(app, "_ollama_status", lambda **_kwargs: {
+        "reachable": True, "base_url": "http://127.0.0.1:11434", "models": [{"name": "minicpm-v4.6:latest"}],
+    })
+
+    catalog = _payload(app.dispatch("GET", "/api/local-models/market"))
+
+    assert catalog["items"][0]["ready"] is True
+    assert catalog["items"][1]["ready"] is False
+    assert catalog["recommendation"]["id"] == "qwen3.5:9b"
+
+
+def test_model_market_does_not_recommend_an_ollama_install_to_new_users(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    monkeypatch.setattr("scansci_html.webapp.detect_local_hardware", lambda: {
+        "platform": "Windows", "vram_gib": 8, "ram_gib": 32,
+    })
+    monkeypatch.setattr(app, "_ollama_status", lambda **_kwargs: {
+        "reachable": False, "base_url": "http://127.0.0.1:11434", "models": [],
+    })
+
+    catalog = _payload(app.dispatch("GET", "/api/local-models/market"))
+
+    assert catalog["recommendation"]["available"] is False
+    assert "一体化本地主力模型" in catalog["recommendation"]["reason"]
+
+
 def test_model_health_reuses_one_generic_runtime_probe_for_discovered_models(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     app, workspace, _evidence = _build_app(tmp_path)
     settings = load_settings(workspace)
@@ -6011,17 +7016,21 @@ def test_notebook_webapp_runs_persistent_evidence_workflow(tmp_path: Path):
                     "notebook_id": "immunotherapy",
                     "question": "What did Galunisertib reduce?",
                     "thinking_level": "high",
+                    "retrieval_quality": "balanced",
                 }
             ).encode("utf-8"),
         )
     )
     run_id = created["run_id"]
     completed = created
-    for _ in range(100):
+    # The run thread shares the machine with unrelated desktop load; poll to
+    # a generous deadline instead of assuming a fixed 2-second budget.
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
         completed = _payload(app.dispatch("GET", f"/api/runs/{run_id}"))
         if completed["status"] in {"completed", "failed"}:
             break
-        time.sleep(0.02)
+        time.sleep(0.05)
 
     listing = _payload(app.dispatch("GET", "/api/runs"))
     catalog = _payload(app.dispatch("GET", "/api/runs/catalog"))
@@ -6066,11 +7075,14 @@ def test_webapp_paper_download_batch_reports_per_item_progress(tmp_path: Path, m
     run_id = created["run_id"]
 
     completed = created
-    for _ in range(100):
+    # The run thread shares the machine with unrelated desktop load; poll to
+    # a generous deadline instead of assuming a fixed 2-second budget.
+    deadline = time.monotonic() + 15.0
+    while time.monotonic() < deadline:
         completed = _payload(app.dispatch("GET", f"/api/runs/{run_id}"))
         if completed["status"] in {"completed", "failed"}:
             break
-        time.sleep(0.02)
+        time.sleep(0.05)
 
     assert completed["status"] == "completed"
     execute = next(stage for stage in completed["stages"] if stage["key"] == "execute")
@@ -6313,7 +7325,7 @@ def test_deep_research_task_reader_serves_only_task_scoped_fulltext(tmp_path: Pa
 
     assert response.status == 200
     assert b"data-evidence-id" in response.body
-    assert b"#b9ef45" in response.body
+    assert b"--scansci-evidence-highlight: #62e18f" in response.body
     assert b"outline: none !important" in response.body
     assert "frame-ancestors 'self'" in response.content_security_policy
     assert missing.status == 404
@@ -6582,6 +7594,53 @@ def test_model_download_is_refused_before_a_lightweight_build_has_a_runtime(tmp_
         assert response.status == 409
         assert payload["error"]["code"] == "local_runtime_required"
         assert payload["next_action"] == "configure_local_runtime"
+
+
+def test_recommended_ollama_download_uses_the_requested_model(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    app, _workspace, _evidence = _build_app(tmp_path)
+    observed = []
+    monkeypatch.setattr(app, "_ollama_status", lambda **_kwargs: {
+        "reachable": True, "base_url": app.ollama_installs.base_url, "models": [],
+    })
+    monkeypatch.setattr(app.ollama_installs, "start", lambda model_id, **_kwargs: observed.append(model_id) or {
+        "job_id": f"ollama:{model_id}", "state": "queued", "models": [model_id],
+    })
+
+    response = app.dispatch("POST", "/api/local-models/download", b'{"id":"qwen3.5:9b","runtime":"ollama"}')
+
+    assert response.status == 202
+    assert observed == ["qwen3.5:9b"]
+
+
+def test_custom_ollama_endpoint_stays_consistent_for_download_and_primary_model(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    app, workspace, _evidence = _build_app(tmp_path)
+    endpoint = "http://localhost:11555"
+    monkeypatch.setattr(app, "_ollama_status", lambda **_kwargs: {
+        "reachable": True, "base_url": endpoint, "models": [{"name": "qwen3.5:9b"}],
+    })
+    monkeypatch.setattr("scansci_html.webapp.detect_local_hardware", lambda: {
+        "platform": "Windows", "vram_gib": 12, "ram_gib": 32,
+    })
+
+    mismatched = app.dispatch("POST", "/api/local-models/download", b'{"id":"qwen3.5:9b","runtime":"ollama"}')
+    assert mismatched.status == 409
+
+    app.ollama_installs.base_url = endpoint
+    monkeypatch.setattr(app.ollama_installs, "start", lambda model_id, **_kwargs: {
+        "job_id": f"ollama:{model_id}", "state": "queued", "models": [model_id],
+    })
+    download = app.dispatch("POST", "/api/local-models/download", b'{"id":"qwen3.5:9b","runtime":"ollama"}')
+    assert download.status == 202
+
+    monkeypatch.setattr("scansci_html.webapp.probe_ollama_chat_model", lambda *_args: {
+        "loaded": True, "citation_verified": True, "tool_call_verified": True, "pi_context_verified": True,
+    })
+    activated = app.dispatch("POST", "/api/local-models/activate-recommended", b'{"id":"qwen3.5:9b"}')
+    assert activated.status == 200
+    preset = next(item for item in load_settings(workspace)["local_models"] if item["id"] == "ollama-qwen3.5-9b")
+    assert preset["base_url"] == f"{endpoint}/v1"
 
 
 def test_unexpected_local_model_download_error_returns_json_instead_of_closing_connection(
@@ -7036,3 +8095,55 @@ def test_app_update_close_button_overrides_hover_and_focus_reveal():
     assert "Do not remove is-card-closed here" in web_script
     assert ".app-update:not(.is-card-closed):hover .app-update-card" in styles
     assert ".app-update:not(.is-card-closed):focus-within .app-update-card" in styles
+
+
+def test_strata_activation_keeps_previous_model_on_probe_failure(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
+    app, workspace, _evidence = _build_app(tmp_path)
+    settings = load_settings(workspace)
+    original = dict(settings["active_model"])
+    settings["local_models"].append({
+        "id": "strata", "name": "Strata", "runtime": "strata",
+        "base_url": "http://127.0.0.1:8080/v1", "model_id": "", "enabled": True,
+    })
+    save_settings(workspace, settings)
+    checked_urls = []
+
+    def connection(local_model, **_kwargs):
+        checked_urls.append(local_model["base_url"])
+        return {"ok": True, "models": ["strata"], "max_context": 32768}
+
+    monkeypatch.setattr("scansci_html.webapp.test_local_model_connection", connection)
+    monkeypatch.setattr("scansci_html.webapp.probe_strata_agent_model", lambda *_args: (_ for _ in ()).throw(RuntimeError("工具调用预检未通过")))
+    body = json.dumps({"local_model_id": "strata", "model_id": "strata"}).encode("utf-8")
+
+    candidate = app.dispatch("POST", "/api/local-models/test-strata", json.dumps({"base_url": "http://127.0.0.1:8082/v1"}).encode("utf-8"))
+    assert candidate.status == 200
+    assert _payload(candidate)["models"] == ["strata"]
+    assert next(item for item in load_settings(workspace)["local_models"] if item["id"] == "strata")["base_url"] == "http://127.0.0.1:8080/v1"
+
+    failed = app.dispatch("POST", "/api/local-models/activate-strata", body)
+    assert failed.status == 409
+    assert "工具调用预检未通过" in _payload(failed)["error"]["message"]
+    assert load_settings(workspace)["active_model"] == original
+
+    monkeypatch.setattr("scansci_html.webapp.probe_strata_agent_model", lambda *_args: {
+        "model_id": "strata", "stream_verified": True, "citation_verified": True, "tool_call_verified": True,
+    })
+    alternate = json.dumps({"local_model_id": "strata", "model_id": "strata", "base_url": "http://127.0.0.1:8081/v1"}).encode("utf-8")
+    activated = app.dispatch("POST", "/api/local-models/activate-strata", alternate)
+    assert activated.status == 200
+    assert _payload(activated)["settings"]["active_model"] == {"provider_id": "local-runtime-strata", "model_id": "strata"}
+    assert load_settings(workspace)["model_roles"]["writing"] == "provider:local-runtime-strata:strata"
+    assert next(item for item in load_settings(workspace)["local_models"] if item["id"] == "strata")["base_url"] == "http://127.0.0.1:8081/v1"
+    assert checked_urls == ["http://127.0.0.1:8082/v1", "http://127.0.0.1:8080/v1", "http://127.0.0.1:8081/v1"]
+
+
+def test_strata_setup_ui_guides_install_and_does_not_request_a_key():
+    script = (Path(__file__).parents[1] / "src" / "scansci_html" / "web" / "app.js").read_text(encoding="utf-8")
+    assert "function renderStrataSetupMarkup()" in script
+    assert "https://github.com/Niko1221/Strata/releases/latest" in script
+    assert 'data-action="connect-strata"' in script
+    assert 'data-action="activate-strata"' in script
+    assert 'data-action="disconnect-strata"' in script
+    assert 'data-strata-url' in script
+    assert 'isLocalConnection ? `<p class="cherry-field-hint">本机运行时连接无需 API 密钥。' in script

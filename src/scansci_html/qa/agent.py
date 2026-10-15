@@ -230,6 +230,24 @@ def answer_question(
     adequacy = _soften_adequacy_for_review(query_plan, adequacy)
     evidence_by_id = {str(hit.get("evidence_id", "")): hit for hit in hits}
     evidence_table = build_evidence_table(quotes, evidence_by_id)
+    _score_cross_language_facets(query_plan, evidence_table, hits, reranker)
+    if query_plan.get("required_facets") and any(
+        bool(re.search(r"[\u4e00-\u9fff]", question))
+        != bool(re.search(r"[\u4e00-\u9fff]", str(row.get("exact_quote", ""))))
+        for row in evidence_table
+    ):
+        # A multilingual hit can be relevant to the full question while
+        # saying nothing about any requested dimension. Keep only quotes
+        # whose original text or facet rerank score supports a facet.
+        evidence_table = [
+            row for row in evidence_table
+            if assess_facet_coverage(
+                query_plan,
+                [{"exact_quote": row.get("exact_quote", ""),
+                  "semantic_facet_scores": row.get("semantic_facet_scores", {})}],
+                strict=True,
+            )["covered_facets"]
+        ]
     # Generic relevance gate: a question whose non-stopword domain terms
     # never appear in any retrieved quote has no topical connection to this
     # library.  The specialised causal grounding check above only covers
@@ -682,6 +700,53 @@ def assess_evidence_adequacy(
     }
 
 
+def _score_cross_language_facets(
+    query_plan: dict[str, Any],
+    evidence_rows: list[dict[str, Any]],
+    hits: list[dict[str, Any]],
+    reranker: Any | None,
+) -> None:
+    """Attach Qwen3 facet scores when exact lexical matching crosses languages."""
+
+    if reranker is None or not evidence_rows or not any(
+        float(hit.get("qwen3_score", 0.0) or 0.0) >= 0.65 for hit in hits
+    ):
+        return
+    missing = assess_facet_coverage(query_plan, evidence_rows, strict=True)["missing_facets"]
+    relevant_ids = {
+        str(hit.get("evidence_id", "")) for hit in hits
+        if float(hit.get("qwen3_score", 0.0) or 0.0) >= 0.65
+    }
+    candidates = [
+        {"quote_id": row["quote_id"], "text": row["exact_quote"]}
+        for row in evidence_rows
+        if str(row.get("evidence_id", "")) in relevant_ids
+        and bool(re.search(r"[\u4e00-\u9fff]", str(row.get("exact_quote", ""))))
+        != bool(re.search(r"[\u4e00-\u9fff]", str(query_plan.get("query", ""))))
+    ]
+    if not candidates:
+        return
+    rows_by_quote = {str(row["quote_id"]): row for row in evidence_rows}
+    question = str(query_plan.get("query", ""))
+    subject_match = re.search(r"^(?P<subject>[^?？。]{1,60}?)对(?!比)", question)
+    subject = subject_match.group("subject").strip(" ：:，,") if subject_match else ""
+    for facet in missing:
+        facet_query = (
+            f"{subject}对{facet}的影响" if subject and "影响" in question
+            else f"{facet}的变化" if re.search(r"影响|变化|作用", question)
+            else str(facet)
+        )
+        ranked = reranker.rerank(facet_query, candidates)
+        if not ranked:
+            continue
+        strongest = max(ranked, key=lambda hit: float(hit.get("qwen3_raw_score", hit.get("qwen3_score", 0.0)) or 0.0))
+        score = float(strongest.get("qwen3_raw_score", strongest.get("qwen3_score", 0.0)) or 0.0)
+        if score >= 0.65:
+            row = rows_by_quote.get(str(strongest.get("quote_id", "")))
+            if row is not None:
+                row.setdefault("semantic_facet_scores", {})[str(facet)] = round(score, 6)
+
+
 def assess_facet_coverage(
     query_plan: dict[str, Any] | None,
     evidence_rows: list[dict[str, Any]],
@@ -744,6 +809,10 @@ def assess_facet_coverage(
         facet_id = str(facet["id"])
         terms = [str(term) for term in facet["terms"]]
         score = _facet_match_score(terms, text, strict=strict)
+        score = max([score] + [
+            float(dict(row.get("semantic_facet_scores", {}) or {}).get(facet_id, 0.0) or 0.0)
+            for row in evidence_rows if isinstance(row, dict)
+        ])
         facet_scores[facet_id] = round(score, 6)
         if score >= 0.6:
             covered.append(facet_id)
@@ -1177,7 +1246,7 @@ def _semantic_relevance_score(hits: list[dict[str, Any]]) -> float:
     for hit in hits:
         if not isinstance(hit, dict):
             continue
-        for field in ("siliconflow_score", "cross_encoder_score", "jina_score", "semantic_score"):
+        for field in ("qwen3_score", "siliconflow_score", "cross_encoder_score", "jina_score", "semantic_score"):
             value = hit.get(field)
             if value is None:
                 continue

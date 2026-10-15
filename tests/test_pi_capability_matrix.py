@@ -171,3 +171,23 @@ def test_general_turn_does_not_receive_reversible_authority_without_workflow_aut
     }
 
     assert reversible.isdisjoint(contract["allowed_tools"])
+
+
+def test_explicit_agent_turn_uses_pi_discovery_with_read_only_authority() -> None:
+    contract = compile_task_contract(task_mode="agent", user_text="比较两项研究并核查关键结论")
+
+    assert contract["task_profile"]["route"] == "tool_agent"
+    assert contract["task_profile"]["requires_tools"] is True
+    assert contract["risk_level"] == "read_only"
+    assert contract["initial_tools"] == []
+    assert _ready_read_only_ids() <= set(contract["allowed_tools"])
+    assert "create_document" not in contract["allowed_tools"]
+    assert contract["max_tool_budget"] > compile_task_contract(task_mode="general", user_text="解释一个概念")["max_tool_budget"]
+
+
+def test_explicit_agent_choice_is_honored_even_for_a_greeting() -> None:
+    contract = compile_task_contract(task_mode="agent", user_text="你好")
+
+    assert contract["task_profile"]["route"] == "tool_agent"
+    assert contract["allowed_tools"]
+    assert "greeting" not in contract["task_profile"]["reasons"]

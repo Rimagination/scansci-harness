@@ -62,6 +62,22 @@ def test_direct_history_restores_only_bounded_image_model_ids(tmp_path: Path) ->
         assert excluded not in persisted
 
 
+def test_direct_history_preserves_agent_choice_for_edit_and_retry(tmp_path: Path) -> None:
+    workspace = tmp_path / "workspace.sqlite"
+    DirectChatHistoryStore(workspace).upsert({
+        "conversation_id": "agent-retry",
+        "messages": [
+            {"role": "user", "content": "比较两种方法", "agent_mode": True},
+            {"role": "assistant", "content": "比较结果", "reasoning": "先比较样本与方法。"},
+        ],
+    })
+
+    restored = DirectChatHistoryStore(workspace).get("agent-retry")["messages"]
+    assert restored[0]["agent_mode"] is True
+    assert "agent_mode" not in restored[1]
+    assert restored[1]["reasoning"] == "先比较样本与方法。"
+
+
 def test_direct_history_keeps_twenty_turns_and_appends_session_events(tmp_path: Path) -> None:
     store = DirectChatHistoryStore(tmp_path / "workspace.sqlite")
     saved = store.upsert(

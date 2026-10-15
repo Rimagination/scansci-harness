@@ -131,17 +131,20 @@ def test_tool_authorization_denies_missing_empty_spoofed_and_over_budget_calls()
         "call_count": 0,
     }
 
-    with pytest.raises(ToolAuthorizationError, match="missing"):
+    with pytest.raises(ToolAuthorizationError, match="missing") as missing:
         authorize_tool_call(tool_name="inspect_workspace", contract={}, **base)
-    with pytest.raises(ToolAuthorizationError, match="empty"):
+    assert missing.value.code == "missing_lease"
+    with pytest.raises(ToolAuthorizationError, match="empty") as empty:
         authorize_tool_call(tool_name="inspect_workspace", contract={"allowed_tools": []}, **base)
-    with pytest.raises(ToolAuthorizationError, match="another request"):
+    assert empty.value.code == "empty_lease"
+    with pytest.raises(ToolAuthorizationError, match="another request") as stale:
         authorize_tool_call(
             tool_name="inspect_workspace",
             contract={"allowed_tools": ["inspect_workspace"], "max_tool_budget": 2},
             **{**base, "request_id": "request-stale"},
         )
-    with pytest.raises(ToolAuthorizationError, match="budget"):
+    assert stale.value.code == "request_mismatch"
+    with pytest.raises(ToolAuthorizationError, match="budget") as exhausted:
         authorize_tool_call(
             tool_name="inspect_workspace",
             contract={
@@ -151,6 +154,7 @@ def test_tool_authorization_denies_missing_empty_spoofed_and_over_budget_calls()
             },
             **{**base, "call_count": 1},
         )
+    assert exhausted.value.code == "budget_exhausted"
 
 
 def test_legacy_scientific_tool_contracts_remain_authorizable_for_migration() -> None:
@@ -172,6 +176,7 @@ def test_legacy_scientific_tool_contracts_remain_authorizable_for_migration() ->
         call_count=0,
     )
     assert decision.allowed is True
+    assert decision.approval_required is False
 
 
 def test_approval_token_is_created_only_for_explicit_request_scoped_approve() -> None:
@@ -183,7 +188,7 @@ def test_approval_token_is_created_only_for_explicit_request_scoped_approve() ->
 
     assert token is not None
     assert token.request_id == "request-a"
-    with pytest.raises(ToolAuthorizationError, match="approved plan"):
+    with pytest.raises(ToolAuthorizationError, match="approved plan") as unapproved:
         authorize_tool_call(
             tool_name="download_and_index",
             contract={
@@ -198,6 +203,7 @@ def test_approval_token_is_created_only_for_explicit_request_scoped_approve() ->
             approval_token=token,
             call_count=0,
         )
+    assert unapproved.value.code == "approval_required"
 
     decision = authorize_tool_call(
         tool_name="download_and_index",
@@ -214,3 +220,4 @@ def test_approval_token_is_created_only_for_explicit_request_scoped_approve() ->
         call_count=0,
     )
     assert decision.allowed is True
+    assert decision.approval_required is True

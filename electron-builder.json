@@ -1,0 +1,29 @@
+{
+  "appId": "org.scansci.desktop",
+  "productName": "ScanSci",
+  "asar": true,
+  "electronDist": "node_modules/electron/dist",
+  "directories": {
+    "output": "dist-electron"
+  },
+  "files": [
+    "electron/**/*",
+    "package.json",
+    "!node_modules/**",
+    "!**/*.map"
+  ],
+  "extraResources": [
+    {
+      "from": "dist-electron-backend/ScanSciBackend",
+      "to": "backend"
+    },
+    {
+      "from": "src/scansci_html/web/scansci.ico",
+      "to": "assets/scansci.ico"
+    }
+  ],
+  "win": {
+    "icon": "src/scansci_html/web/scansci.ico",
+    "signAndEditExecutable": false
+  }
+}

@@ -16,6 +16,7 @@ from scansci_html.app_settings import (
     managed_model_ids,
     managed_probe_model_ids,
     provider_presets,
+    remote_retrieval_granted,
     save_settings,
     set_notion_api_token,
     set_provider_api_key,
@@ -68,6 +69,21 @@ def test_default_settings_use_the_managed_glm_service_without_a_local_key(tmp_pa
     assert not settings_path(tmp_path / "workspace.sqlite").exists()
 
 
+def test_hidden_composer_model_is_kept_in_settings(tmp_path: Path):
+    workspace = tmp_path / "workspace.sqlite"
+    settings = load_settings(workspace)
+    provider = next(item for item in settings["providers"] if item["id"] == "siliconflow")
+    model = next(item for item in provider["models"] if item["id"] == "BAAI/bge-reranker-v2-m3")
+    model["show_in_composer"] = False
+
+    saved = save_settings(workspace, settings)
+    reloaded = load_settings(workspace)
+    for result in (saved, reloaded):
+        models = next(item for item in result["providers"] if item["id"] == "siliconflow")["models"]
+        assert next(item for item in models if item["id"] == model["id"])["show_in_composer"] is False
+        assert len(models) == len(provider["models"])
+
+
 def test_notion_token_availability_is_redacted_and_scoped_to_workspace(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -84,6 +100,278 @@ def test_notion_token_availability_is_redacted_and_scoped_to_workspace(
     assert get_notion_api_token(workspace) == "notion-test-secret"
     assert load_settings(preview_workspace)["notion_api_token_configured"] is False
     assert "notion-test-secret" not in json.dumps(settings)
+
+
+def test_saved_credentials_survive_workspace_move_without_reentering_keys(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    backend = FakeProviderKeyring()
+    monkeypatch.setitem(sys.modules, "keyring", backend)
+    original = tmp_path / "before" / "workspace.sqlite"
+    moved = tmp_path / "after" / "workspace.sqlite"
+
+    set_provider_api_key(original, "siliconflow", "provider-secret")
+    app_settings.set_document_service_api_key(original, "ocr", "ocr-secret")
+    set_notion_api_token(original, "notion-secret")
+    raw = json.loads(settings_path(original).read_text(encoding="utf-8"))
+    assert len(raw["credential_scope_id"]) == 32
+    assert "credential_scope_id" not in load_settings(original)
+
+    moved.parent.mkdir()
+    settings_path(original).replace(settings_path(moved))
+    assert get_provider_api_key(moved, "siliconflow") == "provider-secret"
+    assert app_settings.get_document_service_api_key(moved, "ocr") == "ocr-secret"
+    assert get_notion_api_token(moved) == "notion-secret"
+
+
+def test_provider_key_is_reused_across_workspaces_only_for_the_same_endpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    backend = FakeProviderKeyring()
+    monkeypatch.setitem(sys.modules, "keyring", backend)
+    first = tmp_path / "first" / "workspace.sqlite"
+    second = tmp_path / "second" / "workspace.sqlite"
+
+    set_provider_api_key(first, "siliconflow", "shared-secret")
+    assert get_provider_api_key(second, "siliconflow") == "shared-secret"
+
+    settings = load_settings(second)
+    provider = next(item for item in settings["providers"] if item["id"] == "siliconflow")
+    provider["base_url"] = "https://private.example/v1"
+    save_settings(second, settings)
+    assert get_provider_api_key(second, "siliconflow") == ""
+    assert get_provider_api_key(first, "siliconflow") == "shared-secret"
+
+    set_provider_api_key(second, "siliconflow", "private-secret")
+    set_provider_api_key(first, "siliconflow", "")
+    assert get_provider_api_key(first, "siliconflow") == ""
+    assert get_provider_api_key(second, "siliconflow") == "private-secret"
+
+
+def test_builtin_environment_key_does_not_follow_a_changed_endpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    backend = FakeProviderKeyring()
+    monkeypatch.setitem(sys.modules, "keyring", backend)
+    monkeypatch.setenv("SILICONFLOW_API_KEY", "environment-secret")
+    workspace = tmp_path / "workspace.sqlite"
+    settings = load_settings(workspace)
+    next(item for item in settings["providers"] if item["id"] == "siliconflow")["base_url"] = "https://custom.example/v1"
+    save_settings(workspace, settings)
+
+    provider = next(item for item in load_settings(workspace)["providers"] if item["id"] == "siliconflow")
+    assert provider["api_key_configured"] is False
+    assert provider["api_key_source"] == "endpoint_mismatch"
+    assert get_provider_api_key(workspace, "siliconflow") == ""
+    set_provider_api_key(workspace, "siliconflow", "custom-secret")
+    assert get_provider_api_key(workspace, "siliconflow") == "custom-secret"
+
+
+def test_conflicting_legacy_provider_keys_keep_their_workspace_values(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    backend = FakeProviderKeyring()
+    monkeypatch.setitem(sys.modules, "keyring", backend)
+    first = tmp_path / "first" / "workspace.sqlite"
+    second = tmp_path / "second" / "workspace.sqlite"
+    backend.set_password(app_settings._SERVICE_NAME, app_settings._legacy_provider_secret_name(first, "siliconflow"), "first-secret")
+    backend.set_password(app_settings._SERVICE_NAME, app_settings._legacy_provider_secret_name(second, "siliconflow"), "second-secret")
+
+    load_settings(first)
+    load_settings(second)
+    assert get_provider_api_key(first, "siliconflow") == "first-secret"
+    assert get_provider_api_key(second, "siliconflow") == "second-secret"
+    assert backend.get_password(app_settings._SERVICE_NAME, app_settings._legacy_provider_secret_name(second, "siliconflow")) is None
+
+
+def test_scoped_v2_provider_key_migrates_and_cannot_follow_a_new_endpoint(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    class StickyScopedKeyring(FakeProviderKeyring):
+        def delete_password(self, service_name: str, username: str) -> None:
+            if not username.startswith("model-provider:v2:"):
+                super().delete_password(service_name, username)
+
+    backend = StickyScopedKeyring()
+    monkeypatch.setitem(sys.modules, "keyring", backend)
+    workspace = tmp_path / "workspace.sqlite"
+    app_settings.set_document_service_api_key(workspace, "ocr", "ocr-secret")
+    scope = json.loads(settings_path(workspace).read_text(encoding="utf-8"))["credential_scope_id"]
+    backend.set_password(app_settings._SERVICE_NAME, f"model-provider:v2:{scope}:siliconflow", "scoped-secret")
+
+    marker = app_settings._provider_scoped_endpoint_marker(scope, "siliconflow")
+    assert backend.get_password(app_settings._SERVICE_NAME, marker) is None
+    settings = json.loads(settings_path(workspace).read_text(encoding="utf-8"))
+    provider = next(item for item in settings["providers"] if item["id"] == "siliconflow")
+    original_endpoint = provider["base_url"]
+    provider["base_url"] = "https://other.example/v1"
+    save_settings(workspace, settings)
+    assert get_provider_api_key(workspace, "siliconflow") == ""
+    provider["base_url"] = original_endpoint
+    save_settings(workspace, settings)
+    assert get_provider_api_key(workspace, "siliconflow") == "scoped-secret"
+
+
+@pytest.mark.parametrize("change", ["remove", "local"])
+def test_scoped_v2_key_is_pinned_before_provider_removal_or_kind_change(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    change: str,
+):
+    backend = FakeProviderKeyring()
+    monkeypatch.setitem(sys.modules, "keyring", backend)
+    workspace = tmp_path / "workspace.sqlite"
+    settings = load_settings(workspace)
+    provider = {
+        "id": "private-provider",
+        "name": "Private",
+        "kind": "openai-compatible",
+        "base_url": "https://old.example/v1",
+        "auth_mode": "key",
+        "enabled": True,
+        "models": [{"id": "chat-model", "name": "Chat", "capabilities": ["chat"]}],
+    }
+    settings["providers"].append(provider)
+    save_settings(workspace, settings)
+    app_settings.set_document_service_api_key(workspace, "ocr", "ocr-secret")
+    scope = json.loads(settings_path(workspace).read_text(encoding="utf-8"))["credential_scope_id"]
+    backend.set_password(app_settings._SERVICE_NAME, f"model-provider:v2:{scope}:private-provider", "old-secret")
+    old_digest = app_settings._provider_endpoint_digest(workspace, "private-provider")
+
+    raw = json.loads(settings_path(workspace).read_text(encoding="utf-8"))
+    if change == "remove":
+        raw["providers"] = [item for item in raw["providers"] if item["id"] != "private-provider"]
+    else:
+        next(item for item in raw["providers"] if item["id"] == "private-provider")["kind"] = "local"
+    save_settings(workspace, raw)
+    marker = app_settings._provider_scoped_endpoint_marker(scope, "private-provider")
+    assert backend.get_password(app_settings._SERVICE_NAME, marker) == old_digest
+
+    raw = json.loads(settings_path(workspace).read_text(encoding="utf-8"))
+    if change == "remove":
+        raw["providers"].append({**provider, "base_url": "https://new.example/v1"})
+    else:
+        item = next(item for item in raw["providers"] if item["id"] == "private-provider")
+        item.update({"kind": "openai-compatible", "base_url": "https://new.example/v1"})
+    save_settings(workspace, raw)
+    assert get_provider_api_key(workspace, "private-provider") == ""
+
+
+def test_legacy_provider_key_stays_at_old_endpoint_when_settings_url_changes_first(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    backend = FakeProviderKeyring()
+    monkeypatch.setitem(sys.modules, "keyring", backend)
+    workspace = tmp_path / "workspace.sqlite"
+    backend.set_password(
+        app_settings._SERVICE_NAME,
+        app_settings._legacy_provider_secret_name(workspace, "siliconflow"),
+        "legacy-secret",
+    )
+    settings = app_settings._normalize_settings({})
+    provider = next(item for item in settings["providers"] if item["id"] == "siliconflow")
+    original_endpoint = provider["base_url"]
+    provider["base_url"] = "https://other.example/v1"
+
+    save_settings(workspace, settings)
+    assert get_provider_api_key(workspace, "siliconflow") == ""
+    provider["base_url"] = original_endpoint
+    save_settings(workspace, settings)
+    assert get_provider_api_key(workspace, "siliconflow") == "legacy-secret"
+
+
+def test_orphaned_legacy_key_is_not_used_when_provider_id_is_added_again(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    backend = FakeProviderKeyring()
+    monkeypatch.setitem(sys.modules, "keyring", backend)
+    workspace = tmp_path / "workspace.sqlite"
+    old_username = app_settings._legacy_provider_secret_name(workspace, "private-provider")
+    backend.set_password(app_settings._SERVICE_NAME, old_username, "old-secret")
+    settings = app_settings._normalize_settings({})
+    settings["providers"].append({
+        "id": "private-provider",
+        "name": "Private",
+        "kind": "openai-compatible",
+        "base_url": "https://new.example/v1",
+        "auth_mode": "key",
+        "models": [{"id": "chat-model", "name": "Chat", "capabilities": ["chat"]}],
+    })
+
+    save_settings(workspace, settings)
+    assert get_provider_api_key(workspace, "private-provider") == ""
+    assert backend.get_password(app_settings._SERVICE_NAME, old_username) == "old-secret"
+
+
+def test_legacy_credentials_migrate_together_and_removed_key_stays_removed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    backend = FakeProviderKeyring()
+    monkeypatch.setitem(sys.modules, "keyring", backend)
+    original = tmp_path / "before" / "workspace.sqlite"
+    moved = tmp_path / "after" / "workspace.sqlite"
+    backend.set_password(app_settings._SERVICE_NAME, app_settings._legacy_provider_secret_name(original, "siliconflow"), "old-provider")
+    backend.set_password(app_settings._SERVICE_NAME, app_settings._legacy_document_service_secret_name(original, "ocr"), "old-ocr")
+    backend.set_password(app_settings._SERVICE_NAME, app_settings._legacy_notion_secret_name(original), "old-notion")
+
+    assert next(item for item in load_settings(original)["providers"] if item["id"] == "siliconflow")["api_key_configured"]
+    assert backend.get_password(app_settings._SERVICE_NAME, app_settings._legacy_provider_secret_name(original, "siliconflow")) is None
+    moved.parent.mkdir()
+    settings_path(original).replace(settings_path(moved))
+    assert get_provider_api_key(moved, "siliconflow") == "old-provider"
+    assert app_settings.get_document_service_api_key(moved, "ocr") == "old-ocr"
+    assert get_notion_api_token(moved) == "old-notion"
+
+    set_provider_api_key(moved, "siliconflow", "")
+    assert get_provider_api_key(moved, "siliconflow") == ""
+
+
+def test_remote_retrieval_consent_is_persisted_and_checked_before_each_request(tmp_path: Path):
+    workspace = tmp_path / "workspace.sqlite"
+    settings = load_settings(workspace)
+    provider = next(item for item in settings["providers"] if item["id"] == "siliconflow")
+    provider["enabled"] = True
+    model = "Qwen/Qwen3-Embedding-8B"
+    endpoint = provider["base_url"]
+    settings["model_roles"]["embedding"] = f"provider:siliconflow:{model}"
+
+    save_settings(workspace, settings)
+    assert not remote_retrieval_granted(workspace, "siliconflow", "embedding", model, endpoint)
+
+    provider["remote_rag_allowed"] = True
+    save_settings(workspace, settings)
+    assert next(item for item in load_settings(workspace)["providers"] if item["id"] == "siliconflow")["remote_rag_allowed"] is True
+    assert remote_retrieval_granted(workspace, "siliconflow", "embedding", model, endpoint)
+    assert not remote_retrieval_granted(workspace, "siliconflow", "reranking", model, endpoint)
+    assert not remote_retrieval_granted(workspace, "siliconflow", "embedding", model, "https://wrong.example/v1")
+
+    provider["remote_rag_allowed"] = False
+    save_settings(workspace, settings)
+    assert not remote_retrieval_granted(workspace, "siliconflow", "embedding", model, endpoint)
+
+    provider["base_url"] = "https://new.example/v1"
+    provider["remote_rag_allowed"] = True
+    updated = save_settings(workspace, settings)
+    updated_provider = next(item for item in updated["providers"] if item["id"] == "siliconflow")
+    assert updated_provider["remote_rag_allowed"] is False
+    assert not remote_retrieval_granted(workspace, "siliconflow", "embedding", model, provider["base_url"])
+    updated_provider["remote_rag_allowed"] = True
+    save_settings(workspace, updated)
+    assert remote_retrieval_granted(workspace, "siliconflow", "embedding", model, provider["base_url"])
+
+
+def test_browser_settings_cannot_choose_another_workspace_credential_scope(tmp_path: Path):
+    workspace = tmp_path / "workspace.sqlite"
+    save_settings(workspace, {"credential_scope_id": "a" * 32})
+    assert json.loads(settings_path(workspace).read_text(encoding="utf-8"))["credential_scope_id"] == ""
 
 
 def test_workspace_profile_distinguishes_temporary_preview_from_persistent_store(
@@ -208,6 +496,57 @@ def test_runtime_inventory_adds_new_models_and_deduplicates_latest_alias():
     assert provider["models"][0]["id"] == "qwen3.8-4b-distill:latest"
 
 
+def test_discovery_repairs_existing_local_evidence_model_without_model_id(
+    tmp_path: Path, monkeypatch,
+):
+    workspace = tmp_path / "workspace.sqlite"
+    settings_path(workspace).write_text(
+        json.dumps({"local_models": [{
+            "id": "embedding-qwen-qwen3-embedding-0.6b",
+            "name": "Qwen3 Embedding 0.6B",
+            "runtime": "local-huggingface",
+            "model_id": "",
+            "enabled": True,
+            "capabilities": ["embedding"],
+        }]}),
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(app_settings, "installed_models", lambda: [{
+        "id": "Qwen/Qwen3-Embedding-0.6B",
+        "name": "Qwen3 Embedding 0.6B",
+        "kind": "embedding",
+        "ready": True,
+    }])
+
+    models = load_settings(workspace)["local_models"]
+
+    assert next(item for item in models if item["id"] == "embedding-qwen-qwen3-embedding-0.6b")["model_id"] == "Qwen/Qwen3-Embedding-0.6B"
+
+
+def test_verified_local_preset_can_become_the_single_default_assistant(tmp_path: Path):
+    workspace = tmp_path / "workspace.sqlite"
+    before = load_settings(workspace)
+
+    selected = app_settings.ensure_local_model_preset(workspace, "ollama-qwen3.5-9b", make_primary=True)
+
+    assert selected["active_model"] == {
+        "provider_id": "local-runtime-ollama-qwen3.5-9b",
+        "model_id": "qwen3.5:9b",
+    }
+    reference = "provider:local-runtime-ollama-qwen3.5-9b:qwen3.5:9b"
+    assert all(selected["model_roles"][role] == reference for role in ("reasoning", "writing", "slides"))
+    assert selected["model_roles"]["embedding"] == before["model_roles"]["embedding"]
+    assert load_settings(workspace)["active_model"] == selected["active_model"]
+
+
+def test_qwen_four_billion_preset_exposes_verified_vision_capability(tmp_path: Path):
+    settings = app_settings.ensure_local_model_preset(tmp_path / "workspace.sqlite", "ollama-qwen3.5-4b")
+    provider = next(item for item in settings["providers"] if item["id"] == "local-runtime-ollama-qwen3.5-4b")
+
+    assert "vision" in provider["models"][0]["capabilities"]
+    assert provider["models"][0]["context_window"] == "32K"
+
+
 @pytest.mark.skip(reason="Qwen removed; WIP")
 def test_managed_standby_route_is_visible_but_cannot_be_auto_selected(tmp_path: Path):
     settings = load_settings(tmp_path / "workspace.sqlite")
@@ -294,6 +633,33 @@ def test_default_settings_include_disabled_common_provider_catalog(tmp_path: Pat
     assert providers["opencode-go"]["api_surface"] == "auto"
     assert len(providers["opencode-go"]["models"]) == 26
     assert "vision" in next(model for model in providers["opencode-go"]["models"] if model["id"] == "deepseek-v4-flash-vision-exp")["capabilities"]
+
+
+def test_l0veyou_is_an_opt_in_openai_compatible_provider(tmp_path: Path):
+    workspace = tmp_path / "workspace.sqlite"
+    settings = load_settings(workspace)
+    provider = next(item for item in settings["providers"] if item["id"] == "l0veyou")
+
+    assert provider["base_url"] == "https://l0veyou.com/v1"
+    assert provider["kind"] == "openai-compatible"
+    assert provider["api_surface"] == "chat_completions"
+    assert provider["enabled"] is False
+    assert provider["api_key_configured"] is False
+    assert provider["api_key_env"] == "L0VEYOU_API_KEY"
+    assert {model["id"] for model in provider["models"]} == {
+        "openai/gpt-6-luna",
+        "deepseek/deepseek-v4.1-flash",
+        "muse-spark-1.3",
+    }
+    assert settings["active_model"]["provider_id"] == "scansci-managed"
+
+    save_settings(workspace, settings)
+    previous = json.loads(settings_path(workspace).read_text(encoding="utf-8"))
+    previous["providers"] = [item for item in previous["providers"] if item["id"] != "l0veyou"]
+    settings_path(workspace).write_text(json.dumps(previous), encoding="utf-8")
+    restored = load_settings(workspace)
+    assert next(item for item in restored["providers"] if item["id"] == "l0veyou")["enabled"] is False
+    assert restored["active_model"] == settings["active_model"]
 
 
 def test_jev_is_kept_out_of_the_conversation_model_route(tmp_path: Path):
@@ -551,7 +917,7 @@ def test_provider_and_local_runtime_presets_are_credential_free():
 
     assert {item["id"] for item in providers} >= {"openai", "anthropic", "gemini", "deepseek", "dashscope", "openrouter", "zai", "moonshot", "minimax", "siliconflow", "paratera"}
     assert all("api_key" not in item for item in providers)
-    assert {item["runtime"] for item in runtimes} == {"ollama", "lm-studio", "llama.cpp", "local-huggingface"}
+    assert {item["runtime"] for item in runtimes} == {"ollama", "lm-studio", "llama.cpp", "strata", "local-huggingface"}
 
 
 def test_ollama_minicpm_preset_is_optional_when_transformers_is_the_default_local_route():

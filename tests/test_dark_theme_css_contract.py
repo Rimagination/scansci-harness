@@ -116,11 +116,14 @@ def test_dark_history_is_readable_without_flattening_status_meaning() -> None:
     assert_last_property(
         'html[data-theme="dark"] .task-item time', "color", "var(--muted)"
     )
+    assert_last_property(".task-row:hover", "background", "var(--hover-background)")
     assert_last_property(
-        'html[data-theme="dark"] .task-item:hover',
+        ".task-row:has(.task-item.is-active)",
         "background",
-        "var(--control-background-hover)",
+        "var(--selection-background)",
     )
+    assert_property('html[data-theme="dark"]', "--hover-background", "#2c2f30")
+    assert_property('html[data-theme="dark"]', "--selection-background", "#373a3b")
     assert_last_property(
         'html[data-theme="dark"] .history-empty', "color", "var(--muted)"
     )
@@ -187,23 +190,63 @@ def test_settings_surface_is_flat_in_both_themes() -> None:
 
 
 def test_settings_content_keeps_the_top_left_corner_rounded_in_both_themes() -> None:
-    assert_last_property(".settings-content", "border-top-left-radius", "24px")
+    assert_last_property(".settings-content", "border-top-left-radius", "var(--radius-2xl)")
     assert_last_property(
         ".settings-view.is-active > .settings-content",
         "border-top-left-radius",
-        "24px",
+        "var(--radius-2xl)",
     )
     assert_last_property(
         'html[data-theme="dark"] .settings-view', "background", "var(--canvas)"
     )
 
 
-def test_active_settings_nav_shadow_is_soft_and_follows_the_rounded_pill() -> None:
-    assert_last_property(".settings-nav.is-active", "border-radius", "999px")
+def test_active_settings_nav_uses_soft_neutral_selection() -> None:
+    assert_last_property(".settings-nav.is-active", "border-radius", "var(--radius-md)")
+    assert_last_property(".settings-nav.is-active", "color", "var(--ink)")
     assert_last_property(
-        ".settings-nav.is-active",
+        ".settings-nav.is-active", "background", "var(--selection-background)"
+    )
+    assert_last_property(".settings-nav.is-active", "box-shadow", "none")
+
+
+def test_corner_radii_use_one_scale_and_square_artwork_masks() -> None:
+    for token, value in {
+        "xs": "4px", "sm": "8px", "md": "12px", "lg": "16px",
+        "xl": "20px", "2xl": "24px", "logo": "23%",
+        "circle": "50%", "pill": "999px",
+    }.items():
+        assert_last_property(":root", f"--radius-{token}", value)
+
+    radius_values = re.findall(
+        r"\bborder-(?:(?:top|bottom)-(?:left|right)-)?radius\s*:\s*([^;]+);",
+        CSS_WITHOUT_COMMENTS,
+    )
+    assert radius_values
+    assert all(
+        not re.sub(r"var\(--radius-[\w-]+\)|\b(?:0|inherit)\b|\s+", "", value)
+        for value in radius_values
+    )
+    assert_last_property(".ima-source-entry img", "border-radius", "var(--radius-logo)")
+    assert_last_property(".ima-library-title > img", "border-radius", "var(--radius-logo)")
+    assert_last_property(".settings-brand img", "border-radius", "var(--radius-logo)")
+    assert_last_property(".provider-logo.is-large", "border-radius", "var(--radius-logo)")
+    personal_icon = (STYLES_PATH.parent / "knowledge-personal.svg").read_text(encoding="utf-8")
+    zotero_icon = (STYLES_PATH.parent / "zotero-logo.svg").read_text(encoding="utf-8")
+    assert 'width="48" height="48" rx="11"' in personal_icon
+    assert 'width="48" height="48" rx="11"' in zotero_icon
+
+
+def test_library_search_can_shrink_beside_onboarding_back() -> None:
+    assert_last_property(".ima-library-appbar-actions", "flex", "0 1 auto")
+    assert_last_property(".ima-library-appbar-search-field", "min-width", "96px")
+
+
+def test_dark_open_mode_keeps_keyboard_focus_glow() -> None:
+    assert_last_property(
+        'html[data-theme="dark"] .mode-picker.is-open .mode-trigger:focus-visible',
         "box-shadow",
-        "0 4px 14px color-mix(in srgb, var(--ink) 10%, transparent)",
+        "var(--focus-glow)",
     )
 
 
@@ -446,12 +489,12 @@ def test_mcp_product_accents_follow_the_selected_theme() -> None:
     assert_last_property(
         ".mcp-market-search:focus-within",
         "border-color",
-        "var(--accent-border)",
+        "var(--accent)",
     )
     assert_last_property(
         ".mcp-market-search:focus-within",
         "box-shadow",
-        "0 0 0 3px var(--accent-ring)",
+        "var(--focus-glow)",
     )
 
     for selector in (
@@ -587,9 +630,8 @@ def test_connected_ima_library_consumes_semantic_surfaces_and_text() -> None:
         ".ima-library-appbar-search-field input", "color", "var(--ink)"
     )
     assert_last_property(
-        ".ima-library-toolbar label", "background", "var(--control-background)"
+        ".ima-library-appbar-search-field:focus-within", "border-color", "var(--accent)"
     )
-    assert_last_property(".ima-library-toolbar input", "color", "var(--ink)")
     assert_last_property(".ima-source-entry", "color", "var(--ink)")
     assert_last_property(
         ".ima-library-sources > header", "color", "var(--muted)"
@@ -618,6 +660,28 @@ def test_connected_ima_library_consumes_semantic_surfaces_and_text() -> None:
         "background",
         "var(--control-background)",
     )
+
+
+def test_library_dialog_uses_a_thin_border_and_soft_focus_in_both_themes() -> None:
+    assert_last_property(".library-path-dialog", "border", "1px solid var(--rule-strong)")
+    assert_last_property(".library-path-dialog", "box-shadow", "none")
+    assert_last_property(".library-path-dialog textarea", "border", "1px solid var(--rule-strong)")
+    assert_last_property(".library-path-dialog textarea", "background", "var(--control-background)")
+    assert_last_property(".library-path-dialog textarea:focus", "border-color", "var(--accent)")
+    assert_last_property(".library-path-dialog textarea:focus", "outline", "0")
+    assert_last_property("#libraryPathSubmit", "box-shadow", "none")
+
+
+def test_interactive_focus_and_selection_have_no_thick_outer_rings() -> None:
+    assert "--focus-glow: 0 0 9px color-mix(in srgb, var(--accent) 14%, transparent)" in STYLES
+    for selectors, body in RULES:
+        if not any(
+            token in selector
+            for selector in selectors
+            for token in (":focus", ".is-selected", ":has(input:checked)")
+        ):
+            continue
+        assert not re.search(r"(?:box-shadow\s*:[^;]*0\s+0\s+0\s+[2-9]px|outline\s*:\s*[2-9]px)", body), selectors
 
 
 def test_extensions_market_consumes_semantic_surfaces_and_text() -> None:

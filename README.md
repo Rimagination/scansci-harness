@@ -1,8 +1,27 @@
-# ScanSci Harness
+<p align="center">
+  <img src="assets/scansci-harness-mark.svg" alt="ScanSci Harness 标识" width="88" height="88">
+</p>
 
-![ScanSci Harness product banner](assets/scansci-pi-banner.png)
+<h1 align="center">ScanSci Harness</h1>
 
-**证据优先的科研 AI 工作台。** 找论文、读资料、核验证据、写综述、做幻灯片——每一步都绑定原文出处，证据不足时明确说明，不编造。
+<p align="center">
+  <img alt="Windows desktop" src="https://img.shields.io/badge/Windows-desktop-087f70?style=flat-square">
+  <img alt="Powered by Pi" src="https://img.shields.io/badge/Agent-Pi-078ba9?style=flat-square">
+  <img alt="Evidence first" src="https://img.shields.io/badge/Research-evidence--first-0b1b3a?style=flat-square">
+</p>
+
+<p align="center">
+  <strong>证据优先的科研 AI 工作台：从找论文到交付成果，每一步都能回到原文。</strong><br>
+  多源检索并获取全文，在本地知识库做句子级证据召回、原文高亮与引用核验，支撑证据问答和文献综述。<br>
+  Pi Agent 按任务编排模型、工具与技能，进一步制作学术幻灯片；证据不足时明确说明，不编造。
+</p>
+
+<p align="center">
+  <a href="https://github.com/Rimagination/scansci-harness#user-content-核心能力">核心能力</a> ·
+  <a href="https://github.com/Rimagination/scansci-harness#user-content-界面预览">界面预览</a> ·
+  <a href="https://github.com/Rimagination/scansci-harness#user-content-快速开始">快速开始</a> ·
+  <a href="https://github.com/Rimagination/scansci-harness/releases">下载</a>
+</p>
 
 本项目名称为 `scansci-harness`；桌面产品沿用 ScanSci 品牌，Pi 作为模型执行驱动。
 
@@ -54,7 +73,7 @@
 
 ### Windows 安装包
 
-从 [GitHub Releases](https://github.com/Rimagination/scansci-pi/releases) 下载测试版安装包。安装前请核对发布页的 SHA-256；当前测试版可能显示"未知发布者"或 SmartScreen 提示。
+从 [GitHub Releases](https://github.com/Rimagination/scansci-harness/releases) 下载测试版安装包。安装前请核对发布页的 SHA-256；当前测试版可能显示"未知发布者"或 SmartScreen 提示。
 
 桌面版更新支持 blockmap 差分下载：有可用的上一版缓存且下载服务支持 HTTP `Range` 时，只下载变化区块；否则自动回退到经过 SHA-256 校验的完整 ZIP。主程序更新不会重新下载独立的 `local-transformers` 运行组件。
 

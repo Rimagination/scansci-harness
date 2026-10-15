@@ -38,6 +38,8 @@
         "tests/test_mcp_bridge.py",
         "tests/test_pi_security.py",
         "tests/test_pi_agent.py",
+        "tests/test_pi_effect_ledger.py",
+        "tests/test_run_message_submissions.py",
         "tests/test_scansci_harness.py",
         "-q",
         "--junitxml",
@@ -89,6 +91,7 @@
         "-m",
         "pytest",
         "tests/test_desktop.py",
+        "tests/test_electron_backend.py",
         "tests/test_webapp.py",
         "tests/test_llm.py",
         "tests/test_skill_manager.py",
@@ -109,8 +112,11 @@
         "tests/test_verify_update_channel.py",
         "tests/test_direct_chat_queue_ui.py",
         "tests/test_direct_chat_history.py",
+        "tests/test_direct_chat_submissions.py",
         "tests/test_image_generation.py",
         "tests/test_app_settings.py",
+        "tests/test_ollama_runtime.py",
+        "tests/test_local_model_recommendation.py",
         "tests/test_direct_chat_recovery_ui.py",
         "tests/test_dark_theme_css_contract.py",
         "tests/test_research_tools.py",
@@ -131,6 +137,15 @@
         "node",
         "--check",
         "src/scansci_html/web/app.js"
+      ]
+    },
+    {
+      "id": "electron-boundary-tests",
+      "title": "Electron 外部网址与应用来源隔离回归",
+      "command": [
+        "npm.cmd",
+        "run",
+        "test:electron"
       ]
     },
     {
@@ -278,8 +293,8 @@
     "signature_required": true,
     "release_public_key": "",
     "release_key_id": "scansci-release-v1",
-    "update_manifest_url": "https://github.com/Rimagination/scansci-pi/releases/latest/download/stable.json",
-    "update_package_url": "https://github.com/Rimagination/scansci-pi/releases/download/v{version}/ScanSci-{version}-windows-x64.zip",
+    "update_manifest_url": "https://github.com/Rimagination/scansci-harness/releases/latest/download/stable.json",
+    "update_package_url": "https://github.com/Rimagination/scansci-harness/releases/download/v{version}/ScanSci-{version}-windows-x64.zip",
     "runtime_manifest_url": "https://github.com/Rimagination/scansci-portal/releases/download/local-runtime-v1.0.0/local-transformers.json",
     "node_component_manifest_url": "https://github.com/Rimagination/scansci-portal/releases/download/runtime-components-v1/node.json",
     "tectonic_component_manifest_url": "https://github.com/Rimagination/scansci-portal/releases/download/runtime-components-v1/tectonic.json",

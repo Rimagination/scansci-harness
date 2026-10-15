@@ -7,7 +7,6 @@ const state = {
   page: 1,
   scale: 1.2,
   renderTask: null,
-  url: "",
 };
 
 const element = (id) => document.getElementById(id);
@@ -59,7 +58,7 @@ async function renderPage() {
 
 async function openPdf(url, name = "PDF", page = 1) {
   const dialog = element("pdfViewerDialog");
-  if (!dialog || !String(url || "").toLowerCase().includes(".pdf") && !String(name).toLowerCase().endsWith(".pdf")) {
+  if (!dialog) {
     window.open(url, "_blank", "noopener,noreferrer");
     return;
   }
@@ -67,10 +66,10 @@ async function openPdf(url, name = "PDF", page = 1) {
   element("pdfViewerStage").classList.add("is-loading");
   if (!dialog.open) dialog.showModal();
   try {
-    if (state.url !== url) {
-      state.document = await pdfjs.getDocument({ url }).promise;
-      state.url = url;
-    }
+    const previous = state.document;
+    state.document = await pdfjs.getDocument({ url }).promise;
+    if (state.renderTask) state.renderTask.cancel();
+    await previous?.loadingTask?.destroy();
     state.page = Math.max(1, Math.min(Number(page) || 1, state.document.numPages));
     await renderPage();
   } catch (error) {
@@ -111,4 +110,3 @@ window.addEventListener("DOMContentLoaded", () => {
     if (event.target === event.currentTarget) closePdf();
   });
 });
-

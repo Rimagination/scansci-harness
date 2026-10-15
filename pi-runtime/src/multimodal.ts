@@ -87,7 +87,19 @@ export function modelRuntimeBudgets(contextWindow: number): {
   keep_recent_tokens: number;
   max_output_tokens: number;
 } {
-  const window = Math.max(32 * 1024, Math.floor(contextWindow));
+  const window = Math.max(16 * 1024, Math.floor(contextWindow));
+  if (window < 32 * 1024) {
+    const contextGuard = 1024;
+    const reserve = bounded(roundedDown(Math.floor(window / 8)), 1024, 32 * 1024);
+    const keepRecent = bounded(roundedDown(Math.floor(window / 10)), 1024, 32 * 1024);
+    return {
+      provider_input_tokens: window - reserve - contextGuard,
+      context_guard_tokens: contextGuard,
+      compaction_reserve_tokens: reserve,
+      keep_recent_tokens: keepRecent,
+      max_output_tokens: reserve,
+    };
+  }
   const contextGuard = bounded(roundedDown(Math.floor(window / 32)), 1024, 8192);
   const reserve = bounded(roundedDown(Math.floor(window / 8)), 4096, 32 * 1024);
   const keepRecent = bounded(roundedDown(Math.floor(window / 10)), 4096, 32 * 1024);
@@ -128,7 +140,7 @@ export function validateModelRuntimeDescriptor(
   if (
     typeof contextWindow !== "number"
     || !Number.isSafeInteger(contextWindow)
-    || contextWindow < 32 * 1024
+    || contextWindow < 16 * 1024
     || contextWindow > MAX_CONTEXT_WINDOW
   ) {
     throw new Error("Invalid model runtime context window");

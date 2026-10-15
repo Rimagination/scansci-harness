@@ -9,10 +9,29 @@ import threading
 import time
 from typing import Any, Callable
 from urllib import error, request
+from urllib.parse import urlparse
 
 
 OLLAMA_DEFAULT_URL = "http://127.0.0.1:11434"
 OLLAMA_VISION_MODEL = "minicpm-v4.6"
+OLLAMA_CHAT_MODEL_SPECS = {
+    "qwen3.5:9b": {"name": "Qwen3.5 9B · Q4_K_M", "download_gb": 6.6, "context_tokens": 16384},
+    "qwen3.5:4b": {"name": "Qwen3.5 4B · Q4_K_M", "download_gb": 3.4, "context_tokens": 32768},
+    "qwen3.5:2b": {"name": "Qwen3.5 2B · Q4_K_M", "download_gb": 2.7, "context_tokens": 16384},
+}
+OLLAMA_CHAT_CATALOG_ITEMS = tuple(
+    {
+        "id": model_id,
+        "name": spec["name"],
+        "kind": "chat",
+        "runtime": "ollama",
+        "source": "ollama",
+        "size_hint": f"约 {spec['download_gb']} GB",
+        "description": "可作为本地助手模型；安装后验证生成、工具调用和证据引用。",
+        "icon_url": "https://ollama.com/public/ollama.png",
+    }
+    for model_id, spec in OLLAMA_CHAT_MODEL_SPECS.items()
+)
 OLLAMA_VISION_CATALOG_ITEM = {
     "id": OLLAMA_VISION_MODEL,
     "name": "MiniCPM-V 4.6（Ollama）",
@@ -32,6 +51,25 @@ def ollama_base_url(value: str | None = None) -> str:
     return clean or OLLAMA_DEFAULT_URL
 
 
+def is_local_ollama_url(value: str) -> bool:
+    try:
+        endpoint = urlparse(value)
+        return endpoint.scheme == "http" and endpoint.hostname in {"127.0.0.1", "localhost", "::1"} and endpoint.port is not None
+    except ValueError:
+        return False
+
+
+def chat_thinking_parameters(base_url: str, model_id: str, thinking_mode: str | None) -> dict[str, Any]:
+    """Use the parameter Ollama's OpenAI endpoint actually honors for Qwen3.5."""
+
+    # A user may configure Ollama on another loopback port.  Ollama's v1
+    # endpoint requires reasoning_effort to keep visible answers out of thinking.
+    local_ollama = is_local_ollama_url(base_url)
+    if local_ollama and model_id.startswith("qwen3.5:"):
+        return {"reasoning_effort": "medium" if thinking_mode == "enabled" else "none"}
+    return {"thinking": {"type": thinking_mode}} if thinking_mode in {"enabled", "disabled"} else {}
+
+
 def _request_json(base_url: str, path: str, *, method: str = "GET", payload: dict[str, Any] | None = None, timeout: float = 3.0) -> dict[str, Any]:
     body = None
     headers = {"Accept": "application/json"}
@@ -45,6 +83,46 @@ def _request_json(base_url: str, path: str, *, method: str = "GET", payload: dic
         raise ValueError("Ollama 响应过大")
     value = json.loads(raw.decode("utf-8")) if raw else {}
     return value if isinstance(value, dict) else {}
+
+
+def warm_ollama_chat_model(base_url: str, model_id: str):
+    """Report and complete a cold Ollama load before sending the real prompt."""
+
+    if not is_local_ollama_url(base_url):
+        raise ValueError("仅允许预加载本机 Ollama 模型")
+    try:
+        running = _request_json(base_url, "/api/ps", timeout=3.0)
+        names = {
+            str(item.get("name", "")).strip()
+            for item in list(running.get("models", []) or [])
+            if isinstance(item, dict)
+        }
+        if model_id in names or f"{model_id}:latest" in names:
+            return
+        yield {"type": "status", "status": "local_model_loading", "name": model_id}
+        _request_json(
+            base_url,
+            "/api/chat",
+            method="POST",
+            payload={"model": model_id, "messages": [], "stream": False, "keep_alive": "5m"},
+            timeout=120.0,
+        )
+        yield {"type": "status", "status": "local_model_ready", "name": model_id}
+    except error.HTTPError as exc:
+        try:
+            payload = json.loads(exc.read(2048).decode("utf-8", errors="replace"))
+        except ValueError:
+            payload = {}
+        finally:
+            exc.close()
+        detail = str(payload.get("error") or exc.reason) if isinstance(payload, dict) else str(exc.reason)
+        raise RuntimeError(f"Ollama 加载 {model_id} 失败（HTTP {exc.code}）：{detail[:500]}") from exc
+    except TimeoutError as exc:
+        raise RuntimeError(f"Ollama 加载 {model_id} 超过 120 秒；请检查模型占用和 Ollama 日志。") from exc
+    except error.URLError as exc:
+        if isinstance(exc.reason, TimeoutError):
+            raise RuntimeError(f"Ollama 加载 {model_id} 超过 120 秒；请检查模型占用和 Ollama 日志。") from exc
+        raise RuntimeError(f"无法连接 Ollama 以加载 {model_id}；请检查服务状态。") from exc
 
 
 def ollama_status(
@@ -73,6 +151,19 @@ def ollama_status(
             "error": "",
         }
     except (OSError, ValueError, json.JSONDecodeError, error.URLError) as exc:
+        if isinstance(exc, error.HTTPError):
+            try:
+                payload = json.loads(exc.read(2048).decode("utf-8", errors="replace"))
+            except ValueError:
+                payload = {}
+            finally:
+                exc.close()
+            detail = str(payload.get("error") or exc.reason) if isinstance(payload, dict) else str(exc.reason)
+            message = f"Ollama 已响应，但接口返回 HTTP {exc.code}：{detail}"
+        elif isinstance(exc, (OSError, error.URLError)):
+            message = "无法连接 Ollama，请检查服务状态和连接地址。"
+        else:
+            message = str(exc)
         return {
             "reachable": False,
             "installed": False,
@@ -81,8 +172,96 @@ def ollama_status(
             "models": [],
             "model_ready": False,
             "model_id": wanted_model,
-            "error": "Ollama 未运行，请先安装并启动 Ollama" if isinstance(exc, (OSError, error.URLError)) else str(exc),
+            "error": message,
         }
+
+
+def probe_ollama_chat_model(base_url: str, model_id: str) -> dict[str, Any]:
+    """Check direct chat and the native 16K route used by Pi."""
+
+    if model_id not in OLLAMA_CHAT_MODEL_SPECS:
+        raise ValueError("该模型不在已审核的本地助手推荐目录中")
+    status = ollama_status(base_url, model_id=model_id)
+    if not status.get("model_ready"):
+        raise RuntimeError("推荐模型尚未完整安装到 Ollama")
+    options = {
+        "model": model_id,
+        "stream": False,
+        "reasoning_effort": "none",
+        "max_tokens": 128,
+        "temperature": 0,
+    }
+    answer = _request_json(
+        base_url,
+        "/v1/chat/completions",
+        method="POST",
+        payload={
+            **options,
+            "messages": [
+                {"role": "system", "content": "只根据给定证据作答，并保留证据编号。"},
+                {"role": "user", "content": "证据 [E1]：样地 A 有 12 株乔木。样地 A 有多少株乔木？请简短回答并引用 [E1]。"},
+            ],
+        },
+        timeout=180,
+    )
+    content = str(((answer.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
+    if "12" not in content or "[E1]" not in content:
+        raise RuntimeError("模型已加载，但证据引用探测未通过")
+    tool = _request_json(
+        base_url,
+        "/v1/chat/completions",
+        method="POST",
+        payload={
+            **options,
+            "messages": [
+                {"role": "system", "content": "回答前必须先调用 lookup_evidence 工具。"},
+                {"role": "user", "content": "请调用 lookup_evidence 查询编号 E1。"},
+            ],
+            "tools": [{
+                "type": "function",
+                "function": {
+                    "name": "lookup_evidence",
+                    "description": "按编号读取证据。",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {"id": {"type": "string"}},
+                        "required": ["id"],
+                    },
+                },
+            }],
+        },
+        timeout=180,
+    )
+    calls = ((tool.get("choices") or [{}])[0].get("message") or {}).get("tool_calls") or []
+    if not any(isinstance(call, dict) and (call.get("function") or {}).get("name") == "lookup_evidence" for call in calls):
+        raise RuntimeError("模型已加载，但工具调用探测未通过")
+    native = _request_json(
+        base_url,
+        "/api/chat",
+        method="POST",
+        payload={
+            "model": model_id,
+            "stream": False,
+            "think": False,
+            "options": {"num_ctx": OLLAMA_CHAT_MODEL_SPECS[model_id]["context_tokens"], "num_predict": 128},
+            "messages": [
+                {"role": "system", "content": "只根据给定证据作答，并保留证据编号。"},
+                {"role": "user", "content": "证据 [E1]：样地 A 有 12 株乔木。样地 A 有多少株乔木？请简短回答并引用 [E1]。"},
+            ],
+        },
+        timeout=180,
+    )
+    native_content = str((native.get("message") or {}).get("content") or "")
+    if "12" not in native_content or "[E1]" not in native_content:
+        raise RuntimeError("模型已加载，但 Pi 16K 上下文探测未通过")
+    return {
+        "model_id": model_id,
+        "loaded": True,
+        "citation_verified": True,
+        "tool_call_verified": True,
+        "pi_context_verified": True,
+        "completion_tokens": int((answer.get("usage") or {}).get("completion_tokens") or 0),
+    }
 
 
 class OllamaInstallManager:
@@ -101,10 +280,10 @@ class OllamaInstallManager:
 
     def start(self, model_id: str = OLLAMA_VISION_MODEL, *, job_id: str = "", on_complete: Callable[[dict[str, Any]], None] | None = None) -> dict[str, Any]:
         model = str(model_id or "").strip()
-        if model != OLLAMA_VISION_MODEL:
-            raise ValueError("当前 Ollama 视觉下载器只支持 MiniCPM-V 4.6")
+        if model not in {OLLAMA_VISION_MODEL, *OLLAMA_CHAT_MODEL_SPECS}:
+            raise ValueError("当前 Ollama 下载器不支持该模型")
         identifier = str(job_id or f"ollama:{model}").strip()[:180]
-        current_status = ollama_status(self.base_url)
+        current_status = ollama_status(self.base_url, model_id=model)
         with self._lock:
             if on_complete is not None:
                 self._callbacks[identifier] = on_complete
@@ -163,10 +342,12 @@ class OllamaInstallManager:
         return self._control(job_id, "cancel")
 
     def resume(self, job_id: str) -> dict[str, Any]:
-        return self.start(job_id=job_id)
+        with self._lock:
+            model = str(self._jobs.get(job_id, {}).get("current_model") or "")
+        return self.start(model, job_id=job_id)
 
     def retry(self, job_id: str) -> dict[str, Any]:
-        return self.start(job_id=job_id)
+        return self.resume(job_id)
 
     def _control(self, job_id: str, action: str) -> dict[str, Any]:
         with self._lock:
@@ -191,7 +372,7 @@ class OllamaInstallManager:
                 method="POST",
             )
             with request.urlopen(req, timeout=300) as response:  # nosec B310 - local Ollama endpoint
-                self._update(job_id, state="downloading", message="Ollama 正在下载视觉模型")
+                self._update(job_id, state="downloading", message="Ollama 正在下载模型")
                 for raw_line in response:
                     with self._lock:
                         control = self._controls.get(job_id, "")
@@ -205,15 +386,15 @@ class OllamaInstallManager:
                     total = int(event.get("total", 0) or 0)
                     completed = int(event.get("completed", 0) or 0)
                     progress = min(1.0, max(0.0, completed / total)) if total else 0.0
-                    self._update(job_id, state="downloading", progress=progress, completed_bytes=completed, total_bytes=total, message=str(event.get("status", "正在下载视觉模型") or "正在下载视觉模型"))
-            status = ollama_status(self.base_url)
+                    self._update(job_id, state="downloading", progress=progress, completed_bytes=completed, total_bytes=total, message=str(event.get("status", "正在下载模型") or "正在下载模型"))
+            status = ollama_status(self.base_url, model_id=model)
             if not status.get("model_ready"):
                 raise RuntimeError(str(status.get("error", "Ollama 未确认模型已安装")))
-            self._update(job_id, state="ready", progress=1.0, completed_models=[model], current_model_progress=1.0, message="视觉模型已安装并通过 Ollama 校验", error="")
+            self._update(job_id, state="ready", progress=1.0, completed_models=[model], current_model_progress=1.0, message="模型已安装并通过 Ollama 清单校验", error="")
             if on_complete:
                 on_complete(self.status(job_id))
         except Exception as exc:
-            self._update(job_id, state="failed", message="Ollama 视觉模型下载未完成", error=f"{type(exc).__name__}: {exc}"[:1200])
+            self._update(job_id, state="failed", message="Ollama 模型下载未完成", error=f"{type(exc).__name__}: {exc}"[:1200])
 
     def _update(self, job_id: str, **changes: Any) -> None:
         with self._lock:

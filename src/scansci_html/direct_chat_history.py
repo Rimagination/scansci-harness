@@ -38,6 +38,10 @@ _STATUSES = {
 }
 
 
+class DirectConversationNotFound(FileNotFoundError):
+    """The requested conversation row is absent from the history snapshot."""
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -96,8 +100,10 @@ def _message(raw: Any) -> dict[str, Any] | None:
         "branch_id",
         "created_at",
         "mode",
+        "agent_mode",
         "processing_ms",
         "usage",
+        "reasoning",
         "model",
         "knowledgeScopes",
         "reader_answer",
@@ -326,15 +332,27 @@ class DirectChatHistoryStore:
         row["events"] = events
         row["event_sequence"] = sequence
 
-    def _read_unlocked(self) -> list[dict[str, Any]]:
-        if not self.path.is_file():
+    def _read_unlocked(self, *, strict: bool = False) -> list[dict[str, Any]]:
+        if not strict and not self.path.is_file():
             return []
         try:
             payload = json.loads(self.path.read_text(encoding="utf-8"))
-        except (OSError, json.JSONDecodeError, UnicodeDecodeError):
+        except FileNotFoundError:
+            return []
+        except (OSError, json.JSONDecodeError, UnicodeDecodeError) as error:
+            if strict:
+                raise RuntimeError("对话历史无法读取，删除尚未完成") from error
             # A corrupt history must never prevent the main workspace from
             # opening.  The next successful save will replace it atomically.
             return []
+        if strict and (
+            not isinstance(payload, dict)
+            or not isinstance(payload.get("conversations"), list)
+            or len(payload["conversations"]) > _MAX_CONVERSATIONS
+            or any(not isinstance(row, dict) or not str(row.get("conversation_id", "")).strip()
+                   for row in payload["conversations"])
+        ):
+            raise RuntimeError("对话历史格式损坏，删除尚未完成")
         rows = payload.get("conversations", []) if isinstance(payload, dict) else []
         return [
             self._upgrade_row(row)
@@ -661,9 +679,9 @@ class DirectChatHistoryStore:
     def delete(self, conversation_id: str) -> dict[str, Any]:
         wanted = _text(conversation_id, 160)
         with self._lock:
-            rows = self._read_unlocked()
+            rows = self._read_unlocked(strict=True)
             remaining = [row for row in rows if str(row.get("conversation_id", "")) != wanted]
             if len(remaining) == len(rows):
-                raise FileNotFoundError("Direct conversation does not exist")
+                raise DirectConversationNotFound("Direct conversation does not exist")
             self._write_unlocked(remaining)
             return {"ok": True, "conversation_id": wanted}

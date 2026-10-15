@@ -16,7 +16,6 @@
         <div class="desktop-titlebar-brand pywebview-drag-region" data-titlebar-drag>
           <span class="titlebar-app-mark" aria-hidden="true"><img src="/scansci-mark.png" alt="" /></span>
           <strong data-i18n="brand">ScanSci | 搜索科学</strong>
-          <span class="runtime-mode-badge" id="runtimeModeBadge" hidden></span>
         </div>
         <div class="desktop-titlebar-nav chrome-controls" aria-label="导航操作">
           <button type="button" class="chrome-icon sidebar-toggle" data-action="toggle-sidebar" aria-label="切换侧边栏" aria-expanded="true">
@@ -30,6 +29,9 @@
           </button>
           <button type="button" class="chrome-icon titlebar-new-task" data-action="new-task" aria-label="新建研究" title="新建研究">
             <span data-ui-icon="plus"></span>
+          </button>
+          <button type="button" class="chrome-icon titlebar-browser" data-action="toggle-embedded-browser" aria-label="打开内置浏览器" aria-pressed="false" title="打开内置浏览器" hidden>
+            <span data-ui-icon="globe"></span>
           </button>
           <button type="button" class="chrome-icon titlebar-settings" data-action="open-settings" data-settings-panel="general" aria-label="打开设置" title="打开设置">
             <span data-ui-icon="settings"></span>
@@ -48,7 +50,7 @@
                 <button type="button" data-action="check-app-update" aria-label="重新检查更新" title="重新检查更新">
                   <span data-ui-icon="refresh"></span>
                 </button>
-                <button type="button" data-action="close-app-update" aria-label="关闭更新卡片">×</button>
+                <button type="button" data-action="close-app-update" aria-label="关闭更新卡片"><span data-ui-icon="x"></span></button>
               </div>
             </header>
             <div class="app-update-body">
@@ -76,9 +78,9 @@
       </header>
       <aside class="project-sidebar" aria-label="ScanSci navigation">
         <nav class="primary-actions" aria-label="Primary actions">
-          <button type="button" class="sidebar-action" data-action="new-task"><span class="action-icon">⊕</span><span data-i18n="newResearch">新建研究</span><kbd>Ctrl+N</kbd></button>
-          <button type="button" class="sidebar-action" data-action="open-mode" data-mode="library"><span class="action-icon">▤</span><span data-i18n="knowledgeBase">知识库</span><kbd>Ctrl+K</kbd></button>
-          <button type="button" class="sidebar-action extension-sidebar-action" data-action="open-extensions"><span class="action-icon">✦</span><span data-i18n="extensions">插件和技能</span></button>
+          <button type="button" class="sidebar-action" data-action="new-task"><span data-ui-icon="circle-plus" data-icon-class="action-icon"></span><span data-i18n="newResearch">新建研究</span><kbd>Ctrl+N</kbd></button>
+          <button type="button" class="sidebar-action" data-action="open-mode" data-mode="library"><span data-ui-icon="library" data-icon-class="action-icon"></span><span data-i18n="knowledgeBase">知识库</span><kbd>Ctrl+K</kbd></button>
+          <button type="button" class="sidebar-action extension-sidebar-action" data-action="open-extensions"><span data-ui-icon="puzzle" data-icon-class="action-icon"></span><span data-i18n="extensions">插件和技能</span></button>
           <button type="button" class="sidebar-action mcp-sidebar-action" data-action="open-mcp-marketplace"><span data-ui-icon="server" data-icon-class="action-icon" aria-hidden="true"></span><span data-i18n="mcpServers">MCP 服务器</span></button>
         </nav>
 
@@ -120,7 +122,7 @@
               </div>
             </div>
           </div>
-          <button type="button" class="settings-trigger" data-action="open-settings" data-settings-panel="general" aria-label="打开设置">⚙</button>
+          <button type="button" class="settings-trigger" data-action="open-settings" data-settings-panel="general" aria-label="打开设置"><span data-ui-icon="settings"></span></button>
         </footer>
       </aside>
 
@@ -134,7 +136,6 @@
             <p id="homeSubline">直接描述你想完成的事</p>
             <form class="prompt-card" id="homeAskForm">
               <input id="homeModeSelect" type="hidden" value="general" />
-              <section class="first-run-welcome" id="firstRunWelcome" aria-live="polite" hidden></section>
               <div class="composer-knowledge-strip" id="homeKnowledgeScope" aria-live="polite" hidden></div>
               <div class="composer-source-strip" id="homeSourceAttachments" aria-live="polite" hidden></div>
               <div class="paper-list-attachment" id="homePaperBatchAttachment" aria-live="polite" hidden></div>
@@ -153,7 +154,7 @@
                       <button type="button" data-action="choose-presentation-sources" data-composer-key="home" role="menuitem"><span data-ui-icon="presentation"></span><span>添加演示材料</span></button>
                     </div>
                   </div>
-                  <button type="button" class="composer-knowledge-button" data-action="open-knowledge-scope" aria-label="选择本轮要检索的知识库" title="选择本轮要检索的知识库"><span data-ui-icon="library"></span><span class="composer-knowledge-button-label">知识库</span></button><span class="composer-external-research-status" hidden><span data-ui-icon="globe-2"></span><span>联网学术来源</span></span>
+                  <button type="button" class="composer-knowledge-button" data-action="open-knowledge-scope" aria-label="选择本轮要检索的知识库" title="选择本轮要检索的知识库"><span data-ui-icon="library"></span><span class="composer-knowledge-button-label">知识库</span></button><button type="button" class="composer-agent-button" data-action="toggle-agent-mode" aria-label="Agent 编排模式" aria-pressed="false" title="Agent 编排：让 Pi 自主规划并调用已授权的工具"><span data-ui-icon="bot"></span></button><span class="composer-external-research-status" hidden><span data-ui-icon="globe-2"></span><span>联网学术来源</span></span>
                 </div>
                 <div class="prompt-send"><div class="context-usage-control" data-context-usage><button type="button" class="context-usage-trigger" data-action="toggle-context-usage" aria-haspopup="dialog" aria-expanded="false" aria-controls="homeContextUsageMenu" aria-label="查看上下文容量" title="查看上下文容量"><span class="context-usage-ring" data-context-ring role="progressbar" aria-label="上下文占用" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><svg viewBox="0 0 20 20" aria-hidden="true"><circle class="context-usage-ring-track" cx="10" cy="10" r="7.5"></circle><circle class="context-usage-ring-progress" cx="10" cy="10" r="7.5" pathLength="100"></circle></svg><span data-context-percent>—</span></span></button><div class="context-usage-popover" id="homeContextUsageMenu" role="dialog" aria-label="上下文容量统计"></div></div><div class="composer-model composer-settings" data-composer-model><button type="button" class="composer-model-trigger" data-action="toggle-composer-model" aria-haspopup="dialog" aria-expanded="false" aria-controls="homeModelMenu"><span data-ui-icon="globe" data-icon-class="composer-model-network-icon" aria-hidden="true"></span><span id="homeModelLabel">选择模型</span><span data-ui-icon="chevron-down" data-icon-class="composer-model-chevron"></span></button><div class="composer-model-popover" id="homeModelMenu" role="dialog" aria-label="模型、联网与思考设置"></div></div><button type="button" class="composer-record-button" data-action="toggle-composer-recording" data-composer-key="home" aria-label="语音输入" aria-pressed="false"><span class="composer-record-idle" data-recording-idle><span data-ui-icon="mic"></span></span><span class="composer-record-active" data-recording-active hidden><span class="composer-recording-wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span><strong data-recording-duration>00:00</strong><span class="composer-record-stop" aria-hidden="true"></span></span><span class="composer-record-processing" data-recording-processing hidden><span class="composer-record-spinner" aria-hidden="true"></span></span></button><button type="submit" class="send-button" aria-label="发送问题"><span data-ui-icon="send"></span></button></div>
               </div>
@@ -162,11 +163,13 @@
               <input class="composer-source-input" id="homeSourceFileInput" data-composer-source-file="home" type="file" accept=".pdf,.docx,.pptx,.xlsx,.xls,.csv,.json,.xml,.html,.htm,.md,.markdown,.txt,.rtf,.epub,.zip,.png,.jpg,.jpeg,.webp,.gif,.wav,.mp3,.m4a,.flac" multiple />
               <input class="composer-source-input" id="homePaperBatchFile" type="file" accept=".txt,.bib,.csv,text/plain" data-action="pick-home-batch-file" />
             </form>
+            <section class="first-run-welcome" id="firstRunWelcome" aria-live="polite" hidden></section>
             <nav class="home-capability-shortcuts" aria-label="功能快捷入口">
               <button type="button" data-action="select-composer-mode" data-mode-value="academic" data-composer-mode-shortcut aria-pressed="false"><span class="capability-shortcut-icon"><span data-ui-icon="search"></span></span><span>学术搜索</span></button>
               <button type="button" data-action="select-composer-mode" data-mode-value="knowledge" data-composer-mode-shortcut aria-pressed="false"><span class="capability-shortcut-icon"><span data-ui-icon="message-circle"></span></span><span>证据问答</span></button>
               <button type="button" data-action="select-composer-mode" data-mode-value="slides" data-composer-mode-shortcut aria-pressed="false"><span class="capability-shortcut-icon"><span data-ui-icon="presentation"></span></span><span>学术 PPT</span></button>
               <button type="button" data-action="select-composer-mode" data-mode-value="download" data-composer-mode-shortcut aria-pressed="false"><span class="capability-shortcut-icon"><span data-ui-icon="download"></span></span><span>文献下载</span></button>
+              <button type="button" data-action="open-translation" aria-label="打开文献翻译"><span class="capability-shortcut-icon"><span data-ui-icon="book-open"></span></span><span>文献翻译</span></button>
             </nav>
             <div class="slide-template-dock" data-slide-template-dock data-composer-key="home" hidden>
               <button type="button" class="slide-template-trigger" data-action="open-slide-templates" aria-haspopup="dialog">
@@ -181,7 +184,7 @@
 
         <section class="app-view conversation-view" data-view="conversation" aria-label="Research conversation">
           <header class="conversation-header">
-            <button type="button" class="back-button" data-action="new-task">←</button>
+            <button type="button" class="back-button" data-action="new-task" aria-label="返回工作区"><span data-ui-icon="arrow-left"></span></button>
             <div class="conversation-title-group"><h1 id="conversationTitle">新研究</h1><input id="conversationTitleInput" maxlength="120" aria-label="会话标题：Enter 保存，Esc 取消" hidden /><button type="button" class="conversation-title-edit" id="renameConversationButton" data-action="rename-direct-conversation" aria-label="重命名会话" title="重命名会话" hidden><span data-ui-icon="pen"></span></button></div>
             <div class="conversation-header-actions">
               <button type="button" class="evidence-panel-expand" id="evidencePanelExpand" data-action="toggle-evidence-panel-expand" aria-label="展开全文证据面板" aria-controls="contextPanel" aria-expanded="false" title="展开全文证据面板" hidden>
@@ -195,6 +198,13 @@
           <div class="conversation-layout" id="conversationLayout">
               <section class="conversation-main">
                 <div class="answer-area" id="answerArea" aria-live="polite"><div class="chat-empty">提出一个问题，回答将只引用当前资料库。</div></div>
+                <nav class="conversation-turn-nav" id="conversationTurnNav" aria-label="对话跳转" hidden>
+                  <div class="conversation-turn-list" id="conversationTurnList"></div>
+                  <div class="conversation-turn-preview" id="conversationTurnPreview" role="tooltip" hidden>
+                    <strong id="conversationTurnPreviewQuestion"></strong>
+                    <p id="conversationTurnPreviewAnswer"></p>
+                  </div>
+                </nav>
                 <div class="conversation-composer-dock">
                 <button type="button" class="conversation-jump-latest" id="conversationJumpLatest" data-action="jump-conversation-latest" aria-label="回到最新消息" title="回到最新消息" hidden>
                   <span data-ui-icon="chevron-down"></span>
@@ -219,7 +229,7 @@
                         <button type="button" data-action="choose-presentation-sources" data-composer-key="chat" role="menuitem"><span data-ui-icon="presentation"></span><span>添加演示材料</span></button>
                       </div>
                     </div>
-                    <button type="button" class="composer-knowledge-button" data-action="open-knowledge-scope" aria-label="选择本轮要检索的知识库" title="选择本轮要检索的知识库"><span data-ui-icon="library"></span><span class="composer-knowledge-button-label">知识库</span></button><span class="composer-external-research-status" hidden><span data-ui-icon="globe-2"></span><span>联网学术来源</span></span>
+                    <button type="button" class="composer-knowledge-button" data-action="open-knowledge-scope" aria-label="选择本轮要检索的知识库" title="选择本轮要检索的知识库"><span data-ui-icon="library"></span><span class="composer-knowledge-button-label">知识库</span></button><button type="button" class="composer-agent-button" data-action="toggle-agent-mode" aria-label="Agent 编排模式" aria-pressed="false" title="Agent 编排：让 Pi 自主规划并调用已授权的工具"><span data-ui-icon="bot"></span></button><span class="composer-external-research-status" hidden><span data-ui-icon="globe-2"></span><span>联网学术来源</span></span>
                   </div>
                   <div class="composer-right"><div class="context-usage-control" data-context-usage><button type="button" class="context-usage-trigger" data-action="toggle-context-usage" aria-haspopup="dialog" aria-expanded="false" aria-controls="chatContextUsageMenu" aria-label="查看上下文容量" title="查看上下文容量"><span class="context-usage-ring" data-context-ring role="progressbar" aria-label="上下文占用" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0"><svg viewBox="0 0 20 20" aria-hidden="true"><circle class="context-usage-ring-track" cx="10" cy="10" r="7.5"></circle><circle class="context-usage-ring-progress" cx="10" cy="10" r="7.5" pathLength="100"></circle></svg><span data-context-percent>—</span></span></button><div class="context-usage-popover" id="chatContextUsageMenu" role="dialog" aria-label="上下文容量统计"></div></div><div class="composer-model composer-settings" data-composer-model><button type="button" class="composer-model-trigger" data-action="toggle-composer-model" aria-haspopup="dialog" aria-expanded="false" aria-controls="chatModelMenu"><span data-ui-icon="globe" data-icon-class="composer-model-network-icon" aria-hidden="true"></span><span id="chatModelLabel">选择模型</span><span data-ui-icon="chevron-down" data-icon-class="composer-model-chevron"></span></button><div class="composer-model-popover" id="chatModelMenu" role="dialog" aria-label="模型、联网与思考设置"></div></div><button type="button" class="composer-record-button" data-action="toggle-composer-recording" data-composer-key="chat" aria-label="语音输入" aria-pressed="false"><span class="composer-record-idle" data-recording-idle><span data-ui-icon="mic"></span></span><span class="composer-record-active" data-recording-active hidden><span class="composer-recording-wave" aria-hidden="true"><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i><i></i></span><strong data-recording-duration>00:00</strong><span class="composer-record-stop" aria-hidden="true"></span></span><span class="composer-record-processing" data-recording-processing hidden><span class="composer-record-spinner" aria-hidden="true"></span></span></button><button type="submit" class="send-button" aria-label="发送问题"><span data-ui-icon="send"></span></button></div>
                 </div>
@@ -251,7 +261,7 @@
 
         <section class="app-view mode-view" data-view="mode" aria-label="Research mode">
           <header class="mode-header">
-            <button type="button" class="back-button" data-action="new-task">←</button>
+            <button type="button" class="back-button" data-action="new-task" aria-label="返回工作区"><span data-ui-icon="arrow-left"></span></button>
             <div><p class="overline" id="modeOverline">ScanSci Suite</p><h1 id="modeTitle">功能</h1></div>
           </header>
           <div class="mode-content" id="modeContent" aria-live="polite"></div>
@@ -259,9 +269,9 @@
 
         <section class="app-view extensions-view" data-view="extensions" aria-label="Plugins and Skills">
           <header class="extensions-header">
-            <button type="button" class="back-button" data-action="new-task" aria-label="返回工作区">←</button>
+            <button type="button" class="back-button" data-action="new-task" aria-label="返回工作区"><span data-ui-icon="arrow-left"></span></button>
             <div><p class="overline">ScanSci Extension Hub</p><h1>插件和技能</h1></div>
-            <button type="button" class="extensions-refresh" data-action="check-extension-updates">↻ 检查更新</button>
+            <button type="button" class="extensions-refresh" data-action="check-extension-updates"><span data-ui-icon="refresh"></span><span class="extensions-refresh-label">检查更新</span></button>
           </header>
           <main class="extensions-content" id="extensionsContent" aria-live="polite"></main>
         </section>
@@ -311,13 +321,13 @@
     <div class="resource-onboarding" id="resourceOnboarding" hidden></div>
 
     <template id="sourceTemplate">
-      <article class="source-item"><button type="button" class="source-open"><span class="source-copy"><strong></strong><small></small></span><span class="source-arrow">›</span></button></article>
+      <article class="source-item"><button type="button" class="source-open"><span class="source-copy"><strong></strong><small></small></span><span class="source-arrow"><span data-ui-icon="chevron-right"></span></span></button></article>
     </template>
     <dialog class="slide-template-dialog" id="slideTemplateDialog" aria-labelledby="slideTemplateTitle">
       <div class="slide-template-browser">
         <header class="slide-template-header">
           <div><span>演示模板</span><h2 id="slideTemplateTitle">选择模板</h2></div>
-          <button type="button" data-action="close-slide-templates" aria-label="关闭模板库">×</button>
+          <button type="button" data-action="close-slide-templates" aria-label="关闭模板库"><span data-ui-icon="x"></span></button>
         </header>
         <div class="slide-template-body">
           <aside class="slide-template-catalog">
@@ -343,11 +353,34 @@
     </dialog>
     <dialog class="library-path-dialog" id="libraryPathDialog" aria-labelledby="libraryPathTitle">
       <form id="libraryPathForm">
-        <header><div><span>本地资料</span><h2 id="libraryPathTitle">选择资料文件夹</h2></div><button type="button" data-action="close-library-dialog" aria-label="关闭">×</button></header>
+        <header><div><span>本地资料</span><h2 id="libraryPathTitle">选择资料文件夹</h2></div><button type="button" data-action="close-library-dialog" aria-label="关闭"><span data-ui-icon="x"></span></button></header>
         <label for="libraryPathInput" id="libraryPathLabel">文件夹路径</label>
         <textarea id="libraryPathInput" rows="2" spellcheck="false" placeholder="例如 D:\Research\papers"></textarea>
         <p id="libraryPathHint">将索引文件夹中的 HTML 或 Markdown 文献。</p>
         <footer><button type="button" class="secondary-button" data-action="close-library-dialog">取消</button><button type="submit" class="primary-button" id="libraryPathSubmit">链接</button></footer>
+      </form>
+    </dialog>
+    <dialog class="library-path-dialog translation-dialog" id="translationDialog" aria-labelledby="translationTitle">
+      <form id="translationForm">
+        <header><h2 id="translationTitle">文献翻译</h2><button type="button" data-action="close-translation" aria-label="关闭"><span data-ui-icon="x"></span></button></header>
+        <input class="visually-hidden translation-file-input" id="translationFile" type="file" accept=".pdf,application/pdf" aria-describedby="translationFileHint" required />
+        <label class="translation-file-picker" id="translationFilePicker" for="translationFile">
+          <span class="translation-file-picker-icon"><span data-ui-icon="file-plus"></span></span>
+          <span class="translation-file-picker-copy"><strong id="translationFileName" aria-live="polite">选择 PDF</strong><small id="translationFileHint">最大 50 MB</small></span>
+          <span class="translation-file-picker-action">浏览<span data-ui-icon="chevron-right"></span></span>
+        </label>
+        <div class="translation-language-row"><label for="translationLanguage">译为</label><select id="translationLanguage"><option value="简体中文">简体中文</option><option value="繁体中文">繁体中文</option><option value="English">English</option></select></div>
+        <details class="translation-location" id="translationLocation">
+          <summary><span>保存到</span><strong>翻译库</strong><small id="translationLocationPath"></small><span data-ui-icon="chevron-down"></span></summary>
+          <div class="translation-location-content">
+            <label for="translationParentPath">文件夹路径</label>
+            <div class="translation-folder-row"><input id="translationParentPath" type="text" spellcheck="false" placeholder="当前工作区" /><button type="button" class="secondary-button" data-action="pick-translation-folder">浏览</button><button type="button" class="secondary-button" data-action="save-translation-folder">关联</button></div>
+            <small>译文存入翻译库，原文保留原位。</small>
+          </div>
+        </details>
+        <details class="translation-runtime"><summary>运行信息<span data-ui-icon="chevron-down"></span></summary><p id="translationRouteStatus"></p></details>
+        <div id="translationStatus" role="status" aria-live="polite" hidden></div>
+        <footer><button type="submit" class="primary-button" id="translationSubmit">开始翻译</button></footer>
       </form>
     </dialog>
     <dialog class="academic-search-plan-dialog" id="academicSearchPlanDialog" aria-labelledby="academicSearchPlanTitle">

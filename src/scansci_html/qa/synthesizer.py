@@ -103,7 +103,8 @@ def _select_facet_rows(
                 for field in ("exact_quote", "claim_target")
                 if str(row.get(field, "")).strip()
             ).casefold()
-            if any(term and term in text for term in terms):
+            semantic_score = float(dict(row.get("semantic_facet_scores", {}) or {}).get(str(facet.get("id", "")), 0.0) or 0.0)
+            if any(term and term in text for term in terms) or semantic_score >= 0.65:
                 selected.append(row)
                 selected_ids.add(row_id)
                 break

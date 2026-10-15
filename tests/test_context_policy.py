@@ -58,6 +58,7 @@ _HIGH_ENTROPY_TOOL_SCHEMA = json.dumps(
     ("raw", "expected"),
     [
         (32_768, 32_768),
+        ("16K", 16 * 1024),
         ("32K", 32 * 1024),
         ("200K", 200 * 1024),
         ("1.5M", int(1.5 * 1024 * 1024)),
@@ -69,7 +70,7 @@ def test_context_window_parser_accepts_numeric_and_human_units(raw: object, expe
     assert parse_context_window_tokens(raw) == expected
 
 
-@pytest.mark.parametrize("raw", [None, "", "本地", "unknown", -1, 0, 8_192, "16K", True, False, object()])
+@pytest.mark.parametrize("raw", [None, "", "本地", "unknown", -1, 0, 8_192, "8K", True, False, object()])
 def test_context_window_parser_fails_closed_to_32k(raw: object) -> None:
     assert parse_context_window_tokens(raw) == DEFAULT_CONTEXT_WINDOW_TOKENS
 
@@ -108,6 +109,18 @@ def test_runtime_descriptor_uses_trusted_record_and_declares_budget_invariants()
     assert small.compaction_reserve_tokens == 4_096
     assert small.keep_recent_tokens == 4_096
     assert small.max_output_tokens == 4_096
+
+    local = descriptor_from_model_record(
+        provider_id="local-runtime-ollama-qwen3.5-9b",
+        provider_kind="openai-compatible",
+        model_id="qwen3.5:9b",
+        model_record={"id": "qwen3.5:9b", "context_window": "16K", "capabilities": ["reasoning", "tool"]},
+    )
+    assert local.context_window_tokens == 16_384
+    assert local.provider_input_tokens == 13_312
+    assert local.compaction_reserve_tokens == 2_048
+    assert local.max_output_tokens == 2_048
+    assert ModelRuntimeDescriptor.from_payload(local.to_dict()) == local
 
 
 def test_runtime_descriptor_marks_unknown_local_and_boolean_metadata_as_degraded() -> None:

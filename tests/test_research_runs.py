@@ -158,6 +158,126 @@ def test_local_evidence_stack_uses_fast_path_while_models_prepare(tmp_path: Path
     release.set()
 
 
+def test_precision_answer_rejects_temporary_lexical_fallback_when_evidence_is_indexed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    evidence_db = tmp_path / "evidence.sqlite"
+    with sqlite3.connect(evidence_db) as connection:
+        connection.execute("create table evidence_spans (evidence_id text)")
+        connection.execute("insert into evidence_spans values ('span-1')")
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite", evidence_db=evidence_db,
+    )
+    monkeypatch.setattr(runtime, "_requested_notebook", lambda _payload: {"notebook_id": "test"})
+    monkeypatch.setattr(runtime, "_notebook", lambda _notebook_id: {"notebook_id": "test"})
+    monkeypatch.setattr(runtime, "_evidence_db_for_notebook", lambda _notebook: evidence_db)
+    monkeypatch.setattr(runtime, "prepare_local_evidence", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(runtime, "_local_evidence_stack", lambda *_args, **_kwargs: SimpleNamespace(
+        metadata={"preparing": True, "effective_quality_profile": "fast-preparing"},
+    ))
+
+    with pytest.raises(RuntimeError, match="高精度检索模型正在加载"):
+        runtime.answer_sync({"question": "问题", "retrieval_quality": "precision"})
+
+
+def test_precision_answer_requires_selected_provider_vector_cache(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    evidence_db = tmp_path / "evidence.sqlite"
+    with sqlite3.connect(evidence_db) as connection:
+        connection.execute("create table evidence_spans (evidence_id text)")
+        connection.execute("insert into evidence_spans values ('span-1')")
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite", evidence_db=evidence_db,
+    )
+    monkeypatch.setattr(runtime, "_requested_notebook", lambda _payload: {"notebook_id": "test"})
+    monkeypatch.setattr(runtime, "_notebook", lambda _notebook_id: {"notebook_id": "test"})
+    monkeypatch.setattr(runtime, "_evidence_db_for_notebook", lambda _notebook: evidence_db)
+    monkeypatch.setattr(runtime, "prepare_local_evidence", lambda *_args, **_kwargs: {})
+    monkeypatch.setattr(runtime, "_local_evidence_stack", lambda *_args, **_kwargs: SimpleNamespace(
+        embedding_provider=SimpleNamespace(cache_key="selected-provider", dimensions=1024),
+        metadata={
+            "effective_quality_profile": "precision",
+            "local_neural_embedding": True,
+            "local_neural_reranker": True,
+        },
+    ))
+    monkeypatch.setattr("scansci_html.retrieval._has_ready_document_cards", lambda _path: True)
+    requested = []
+    monkeypatch.setattr(research_agent, "vector_cache_status", lambda *_args, **kwargs: requested.append(kwargs) or {"ready": False})
+    warmed = []
+    monkeypatch.setattr(runtime, "_maybe_warm_cache_in_background", lambda path, _stack: warmed.append(path))
+
+    with pytest.raises(RuntimeError, match="知识库向量索引仍在构建"):
+        runtime.answer_sync({"question": "问题"})
+
+    assert requested == [{"provider": "selected-provider", "dimensions": 1024}]
+    assert warmed == [evidence_db]
+
+
+def test_forced_model_preparation_rebuilds_cached_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    evidence_db = tmp_path / "evidence.sqlite"
+    evidence_db.write_bytes(b"x" * 1_100_000)
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite", evidence_db=evidence_db,
+    )
+    calls = []
+
+    def fake_stack(**kwargs):
+        calls.append(kwargs)
+        ready = len(calls) > 1
+        return SimpleNamespace(
+            embedding_provider=object(),
+            reranker=object(),
+            metadata={
+                "fallback": not ready,
+                "local_neural_embedding": ready,
+                "local_neural_reranker": ready,
+                "effective_quality_profile": "precision" if ready else "fast",
+            },
+        )
+
+    monkeypatch.setattr(research_agent, "vector_cache_status", lambda *_args, **_kwargs: {"ready": False})
+    monkeypatch.setattr(research_agent, "build_local_evidence_stack", fake_stack)
+    monkeypatch.setattr(runtime, "_maybe_warm_cache_in_background", lambda *_args: None)
+    assert runtime._local_evidence_stack(evidence_db, quality_profile="precision", _allow_neural_build=True).metadata["fallback"]
+
+    runtime.prepare_local_evidence(evidence_db, quality_profile="precision", force=True)
+    deadline = time.time() + 3
+    while time.time() < deadline:
+        if runtime.local_evidence_status(evidence_db, quality_profile="precision")["state"] == "ready":
+            break
+        time.sleep(0.02)
+
+    assert len(calls) == 2
+    assert runtime.local_evidence_status(evidence_db, quality_profile="precision")["state"] == "ready"
+
+
+def test_precision_stack_loads_neural_models_for_small_library(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+):
+    evidence_db = tmp_path / "evidence.sqlite"
+    evidence_db.write_bytes(b"small library")
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite", evidence_db=evidence_db,
+    )
+    requested = []
+    monkeypatch.setattr(research_agent, "vector_cache_status", lambda *_args, **_kwargs: {"ready": False})
+    monkeypatch.setattr(research_agent, "build_local_evidence_stack", lambda **kwargs: requested.append(kwargs) or SimpleNamespace(
+        metadata={"effective_quality_profile": "precision"},
+    ))
+    monkeypatch.setattr(runtime, "_maybe_warm_cache_in_background", lambda *_args: None)
+
+    stack = runtime._local_evidence_stack(
+        evidence_db, quality_profile="precision", _allow_neural_build=True,
+    )
+
+    assert stack.metadata["effective_quality_profile"] == "precision"
+    assert requested[0]["quality_profile"] == "precision"
+
+
 def test_local_evidence_status_resolves_the_selected_notebook_database(tmp_path: Path, monkeypatch: pytest.MonkeyPatch):
     selected_db = tmp_path / "selected.sqlite"
     selected_db.write_bytes(b"selected")
@@ -468,6 +588,60 @@ def test_pi_managed_rate_limit_without_backup_does_not_replay_compatibility_tran
     monkeypatch.setattr(research_agent, "stream_chat_text", must_not_replay)
 
     with pytest.raises(PiAgentRunError):
+        list(runtime._pi_events_with_compatibility_fallback(request))
+
+
+def test_non_idempotent_tool_authorization_blocks_compatibility_replay(
+    tmp_path: Path, monkeypatch,
+) -> None:
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    request = runtime._direct_chat_request({
+        "messages": [{"role": "user", "content": "请生成一份文档。"}],
+    })
+
+    def failed_pi(*_args, **_kwargs):
+        yield {
+            "type": "tool.authorization", "name": "create_document",
+            "decision": "allow", "idempotent": False,
+        }
+        raise RuntimeError("connection lost after authorization")
+
+    monkeypatch.setattr(runtime, "_pi_model_events", failed_pi)
+    monkeypatch.setattr(
+        runtime, "_managed_fallback_chat_request",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("authorized writer must not replay")),
+    )
+
+    with pytest.raises(RuntimeError, match="connection lost after authorization"):
+        list(runtime._pi_events_with_compatibility_fallback(request))
+
+
+def test_non_idempotent_mcp_start_blocks_compatibility_replay(tmp_path: Path, monkeypatch) -> None:
+    runtime = ResearchAgentRuntime(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    request = runtime._direct_chat_request({
+        "messages": [{"role": "user", "content": "请更新一条记录。"}],
+    })
+
+    def failed_pi(*_args, **_kwargs):
+        yield {
+            "type": "status", "status": "mcp_effect_start",
+            "details": {"effect": "write", "idempotent": False},
+        }
+        raise RuntimeError("connection lost after MCP write started")
+
+    monkeypatch.setattr(runtime, "_pi_model_events", failed_pi)
+    monkeypatch.setattr(
+        runtime, "_managed_fallback_chat_request",
+        lambda *_args: (_ for _ in ()).throw(AssertionError("MCP write must not replay")),
+    )
+
+    with pytest.raises(RuntimeError, match="connection lost after MCP write started"):
         list(runtime._pi_events_with_compatibility_fallback(request))
 
 
@@ -1095,7 +1269,7 @@ def test_local_evidence_stack_uses_selected_siliconflow_reranker(tmp_path: Path,
     monkeypatch.setattr(
         research_agent,
         "load_settings",
-        lambda _workspace: {
+        lambda _workspace, **_kwargs: {
             "model_roles": {
                 "embedding": "local:builtin-embedding",
                 "reranking": "provider:siliconflow:BAAI/bge-reranker-v2-m3",
@@ -1113,6 +1287,7 @@ def test_local_evidence_stack_uses_selected_siliconflow_reranker(tmp_path: Path,
                     "id": "siliconflow",
                     "kind": "openai-compatible",
                     "enabled": True,
+                    "remote_rag_allowed": True,
                     "base_url": "https://api.siliconflow.cn/v1",
                     "models": [
                         {
@@ -1137,6 +1312,8 @@ def test_local_evidence_stack_uses_selected_siliconflow_reranker(tmp_path: Path,
     )
     stack = runtime._local_evidence_stack()
 
+    assert len(build_calls) == 1
+    assert callable(build_calls[0][1].pop("authorization_check"))
     assert build_calls == [
         (
             "siliconflow",
@@ -1152,6 +1329,43 @@ def test_local_evidence_stack_uses_selected_siliconflow_reranker(tmp_path: Path,
     assert stack.reranker.stages[1][0] is remote
 
 
+def test_local_evidence_stack_keeps_pdf_retrieval_local_without_cloud_consent(tmp_path: Path, monkeypatch):
+    evidence_db = tmp_path / "evidence.sqlite"
+    evidence_db.write_bytes(b"x" * 2_000_000)
+    monkeypatch.setattr(research_agent, "installed_models", lambda: [])
+    monkeypatch.setattr(
+        research_agent,
+        "load_settings",
+        lambda _workspace, **_kwargs: {
+            "model_roles": {
+                "embedding": "provider:siliconflow:Qwen/Qwen3-Embedding-8B",
+                "reranking": "provider:siliconflow:Qwen/Qwen3-Reranker-8B",
+            },
+            "local_models": [],
+            "providers": [{
+                "id": "siliconflow",
+                "enabled": True,
+                "base_url": "https://api.siliconflow.cn/v1",
+                "models": [
+                    {"id": "Qwen/Qwen3-Embedding-8B", "capabilities": ["embedding"]},
+                    {"id": "Qwen/Qwen3-Reranker-8B", "capabilities": ["reranking"]},
+                ],
+            }],
+        },
+    )
+    monkeypatch.setattr(research_agent, "get_provider_api_key", lambda *_args: "secret")
+    def reject_remote(*_args, **_kwargs):
+        raise AssertionError("remote retrieval must remain disabled")
+
+    monkeypatch.setattr(research_agent, "build_embedding_provider", reject_remote)
+    monkeypatch.setattr(research_agent, "build_reranker", reject_remote)
+
+    runtime = ResearchAgentRuntime(workspace=tmp_path / "workspace.sqlite", evidence_db=evidence_db)
+    stack = runtime._local_evidence_stack(evidence_db, embedding_only=True)
+    assert getattr(stack.embedding_provider, "device", "local") != "remote"
+    assert stack.metadata["remote_embedding_active"] is False
+
+
 def test_local_evidence_stack_uses_selected_siliconflow_embedding_and_reranker(tmp_path: Path, monkeypatch):
     evidence_db = tmp_path / "evidence.sqlite"
     evidence_db.write_bytes(b"x" * 2_000_000)
@@ -1159,17 +1373,20 @@ def test_local_evidence_stack_uses_selected_siliconflow_embedding_and_reranker(t
         cache_key="siliconflow:https://api.siliconflow.cn/v1:Qwen/Qwen3-Embedding-8B:4096",
         dimensions=4096,
         device="remote",
+        api_key="secret",
     )
     reranker = SimpleNamespace(
         cache_key="siliconflow:https://api.siliconflow.cn/v1:Qwen/Qwen3-Reranker-8B",
         device="remote",
+        api_key="secret",
     )
     build_calls = []
+    current_key = ["secret"]
 
     monkeypatch.setattr(
         research_agent,
         "load_settings",
-        lambda _workspace: {
+        lambda _workspace, **_kwargs: {
             "model_roles": {
                 "embedding": "provider:siliconflow:Qwen/Qwen3-Embedding-8B",
                 "reranking": "provider:siliconflow:Qwen/Qwen3-Reranker-8B",
@@ -1180,6 +1397,7 @@ def test_local_evidence_stack_uses_selected_siliconflow_embedding_and_reranker(t
                     "id": "siliconflow",
                     "kind": "openai-compatible",
                     "enabled": True,
+                    "remote_rag_allowed": True,
                     "base_url": "https://api.siliconflow.cn/v1",
                     "models": [
                         {"id": "Qwen/Qwen3-Embedding-8B", "capabilities": ["embedding"]},
@@ -1189,16 +1407,21 @@ def test_local_evidence_stack_uses_selected_siliconflow_embedding_and_reranker(t
             ],
         },
     )
-    monkeypatch.setattr(research_agent, "get_provider_api_key", lambda _workspace, _provider: "secret")
+    monkeypatch.setattr(research_agent, "get_provider_api_key", lambda _workspace, _provider: current_key[0])
+    monkeypatch.setattr(research_agent, "remote_retrieval_granted", lambda *_args: True)
     monkeypatch.setattr(
         research_agent,
         "build_embedding_provider",
-        lambda provider, **kwargs: build_calls.append(("embedding", provider, kwargs)) or embedding,
+        lambda provider, **kwargs: build_calls.append(("embedding", provider, kwargs)) or (
+            embedding if kwargs["api_key"] == "secret" else SimpleNamespace(**{**vars(embedding), "api_key": kwargs["api_key"]})
+        ),
     )
     monkeypatch.setattr(
         research_agent,
         "build_reranker",
-        lambda provider, **kwargs: build_calls.append(("reranker", provider, kwargs)) or reranker,
+        lambda provider, **kwargs: build_calls.append(("reranker", provider, kwargs)) or (
+            reranker if kwargs["api_key"] == "secret" else SimpleNamespace(**{**vars(reranker), "api_key": kwargs["api_key"]})
+        ),
     )
 
     runtime = ResearchAgentRuntime(
@@ -1207,6 +1430,9 @@ def test_local_evidence_stack_uses_selected_siliconflow_embedding_and_reranker(t
     )
     stack = runtime._local_evidence_stack(evidence_db)
 
+    assert len(build_calls) == 2
+    authorization_checks = [kwargs.pop("authorization_check") for _, _, kwargs in build_calls]
+    assert all(callable(check) for check in authorization_checks)
     assert build_calls == [
         (
             "embedding",
@@ -1233,6 +1459,17 @@ def test_local_evidence_stack_uses_selected_siliconflow_embedding_and_reranker(t
     assert stack.metadata["remote_reranker_active"] is True
     assert stack.metadata["embedding_device"] == "remote"
     assert stack.metadata["reranker_device"] == "remote"
+    for check in authorization_checks:
+        check()
+
+    current_key[0] = "rotated-secret"
+    for check in authorization_checks:
+        with pytest.raises(PermissionError):
+            check()
+    rotated = runtime._local_evidence_stack(evidence_db)
+    assert rotated is not stack
+    assert rotated.embedding_provider.api_key == "rotated-secret"
+    assert rotated.reranker.stages[1][0].api_key == "rotated-secret"
 
 
 def test_prepare_remote_evidence_marks_ready_without_local_model_loading(tmp_path: Path, monkeypatch):
@@ -1245,7 +1482,7 @@ def test_prepare_remote_evidence_marks_ready_without_local_model_loading(tmp_pat
     monkeypatch.setattr(
         research_agent,
         "load_settings",
-        lambda _workspace: {
+        lambda _workspace, **_kwargs: {
             "model_roles": {
                 "embedding": "provider:siliconflow:Qwen/Qwen3-Embedding-8B",
                 "reranking": "provider:siliconflow:Qwen/Qwen3-Reranker-8B",
@@ -2634,7 +2871,7 @@ def test_failed_follow_up_persists_a_failure_marker_and_keeps_context_clean(
     # Both transports are pinned so the test stays offline and deterministic
     # regardless of which route the router picks for this turn.
     monkeypatch.setattr(runtime, "_complete_with_pi", _fail)
-    monkeypatch.setattr(research_agent, "complete_chat_text", _fail)
+    monkeypatch.setattr(runtime, "_direct_events_with_managed_fallback", _fail)
 
     with pytest.raises(Exception):
         runtime.continue_run_conversation(run["run_id"], {"content": "请解释一下显著性水平。"})
@@ -2871,6 +3108,7 @@ def test_prepare_restart_resets_all_stage_state_but_keeps_audit_rows(tmp_path: P
     assert restarted["status"] == "queued"
     assert restarted["current_stage"] == "plan"
     assert restarted["output_artifact_id"] == ""
+    assert restarted["metadata"]["effect_epoch"]
     assert all(stage["status"] == "pending" for stage in restarted["stages"])
     assert all(stage["summary"] == "" and stage["error_message"] == "" for stage in restarted["stages"])
 

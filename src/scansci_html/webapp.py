@@ -13,6 +13,7 @@ from copy import deepcopy
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from html import escape as html_escape
+from hashlib import sha256
 from http import HTTPStatus
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from ipaddress import ip_address
@@ -25,7 +26,7 @@ import sqlite3
 from tempfile import TemporaryDirectory
 import threading
 import time
-from typing import Any
+from typing import Any, Callable
 from urllib.parse import parse_qs, quote, unquote, urljoin, urlparse
 from urllib.request import Request, urlopen
 from uuid import uuid4
@@ -35,7 +36,6 @@ import zipfile
 from .app_settings import (
     apply_storage_directories,
     ensure_local_model_preset,
-    get_provider_api_key,
     load_settings,
     local_model_presets,
     provider_presets,
@@ -50,10 +50,12 @@ from .app_update import AppUpdateService
 from .build_info import current_build_info
 from .deep_research_evidence import task_evidence_reader_path
 from .direct_chat_history import DirectChatHistoryStore
+from .direct_chat_submissions import DirectChatSubmissionStore
 from .audio_attachments import audio_attachment_asset
 from .image_attachments import attachment_asset
 from .image_generation import generated_image_asset
 from .ingestion import ingest_sources, ingestion_source_path, ingestion_source_text
+from .literature_translation import bind_translation_library, register_translation, translate_pdf, translation_root
 from .library_manager import (
     connect_local_zotero,
     import_library_files,
@@ -77,11 +79,12 @@ from .local_model_market import (
     installed_models,
     market_catalog,
 )
+from .local_model_recommendation import detect_local_hardware, recommend_chat_model
 from .local_runtime_component import LocalRuntimeComponent
 from .local_transformers_runtime import ensure_local_transformers_runtime
 from .runtime_components import default_node_component, default_tectonic_component
 from .model_health import build_model_health
-from .ollama_runtime import OLLAMA_VISION_MODEL, OllamaInstallManager, ollama_status
+from .ollama_runtime import OLLAMA_CHAT_MODEL_SPECS, OLLAMA_VISION_MODEL, OllamaInstallManager, is_local_ollama_url, ollama_status, probe_ollama_chat_model
 from .mcp_marketplace import (
     install_marketplace_server,
     marketplace_catalog,
@@ -91,6 +94,7 @@ from .mcp_marketplace import (
 )
 from .pi_agent import PiAgentClient
 from .research_agent import ResearchAgentRuntime
+from .research_runs import StageSpec
 from .research_tools import (
     analyze_references,
     build_ppt_outline,
@@ -101,6 +105,7 @@ from .research_tools import (
     search_journals,
     search_paper_atlas,
     test_local_model_connection,
+    probe_strata_agent_model,
     test_provider_connection,
     verify_doi_metadata,
 )
@@ -130,6 +135,7 @@ from .workspace import (
     record_citation_audit,
     set_notebook_root_path,
     update_notebook_metadata,
+    translation_folder_files,
 )
 
 
@@ -191,11 +197,11 @@ def _safe_note_folder_name(value: str) -> str:
 _SITE_ICON_LOCAL_HOSTS = {"localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"}
 
 _EVIDENCE_READER_PALETTES = {
-    ("light", "jade"): {"highlight": "#caff4d", "ink": "#17210b", "surface": "#ffffff", "text": "#242b20"},
+    ("light", "jade"): {"highlight": "#79f2a6", "ink": "#14351f", "surface": "#ffffff", "text": "#242b20"},
     ("light", "ocean"): {"highlight": "#8eeeff", "ink": "#06242b", "surface": "#ffffff", "text": "#1d292c"},
     ("light", "plum"): {"highlight": "#e7bdff", "ink": "#2d1237", "surface": "#ffffff", "text": "#2b242e"},
     ("light", "amber"): {"highlight": "#ffe66a", "ink": "#2b2100", "surface": "#ffffff", "text": "#302916"},
-    ("dark", "jade"): {"highlight": "#b9ef45", "ink": "#162005", "surface": "#171a18", "text": "#edf1ec"},
+    ("dark", "jade"): {"highlight": "#62e18f", "ink": "#10351f", "surface": "#171a18", "text": "#edf1ec"},
     ("dark", "ocean"): {"highlight": "#7bdbf0", "ink": "#052128", "surface": "#171a1c", "text": "#edf1f1"},
     ("dark", "plum"): {"highlight": "#deb0ff", "ink": "#261132", "surface": "#1b181c", "text": "#f0ecf2"},
     ("dark", "amber"): {"highlight": "#f5d65c", "ink": "#2b2100", "surface": "#1c1a16", "text": "#f2efe8"},
@@ -213,9 +219,17 @@ def _decorate_evidence_reader_html(text: str, query: str = "") -> str:
     if accent not in {"jade", "ocean", "plum", "amber"}:
         accent = "jade"
     palette = _EVIDENCE_READER_PALETTES[(theme, accent)]
+    paper_theme = '''
+.paper { background: var(--scansci-evidence-surface) !important; color: var(--scansci-evidence-text) !important; border-color: color-mix(in srgb, var(--scansci-evidence-text) 25%, var(--scansci-evidence-surface)) !important; }
+.paper h2, .paper th, .paper td { border-color: color-mix(in srgb, var(--scansci-evidence-text) 25%, var(--scansci-evidence-surface)) !important; }
+.paper th { background: color-mix(in srgb, var(--scansci-evidence-text) 8%, var(--scansci-evidence-surface)) !important; }
+.paper figcaption, .paper caption { color: color-mix(in srgb, var(--scansci-evidence-text) 72%, var(--scansci-evidence-surface)) !important; }
+.paper a { color: var(--scansci-evidence-highlight) !important; }
+''' if theme == "dark" else ""
     style = f'''<style data-scansci-reader-theme="true">
-:root {{ color-scheme: {theme}; --scansci-evidence-highlight: {palette["highlight"]}; --scansci-evidence-ink: {palette["ink"]}; }}
+:root {{ color-scheme: {theme}; --scansci-evidence-highlight: {palette["highlight"]}; --scansci-evidence-ink: {palette["ink"]}; --scansci-evidence-surface: {palette["surface"]}; --scansci-evidence-text: {palette["text"]}; }}
 html, body {{ background: {palette["surface"]}; color: {palette["text"]}; }}
+{paper_theme}
 [data-evidence-id] {{ scroll-margin-top: 6rem; }}
 [data-evidence-id]:target {{
   background: var(--scansci-evidence-highlight) !important;
@@ -226,6 +240,29 @@ html, body {{ background: {palette["surface"]}; color: {palette["text"]}; }}
   border-radius: 0 !important;
   -webkit-box-decoration-break: clone;
   box-decoration-break: clone;
+}}
+[data-scansci-fallback-match] {{
+  background: var(--scansci-evidence-highlight);
+  color: var(--scansci-evidence-ink);
+  scroll-margin-top: 6rem;
+}}
+body.scansci-markdown-reader header {{
+  background: var(--scansci-evidence-surface);
+  border-color: color-mix(in srgb, var(--scansci-evidence-text) 16%, transparent);
+}}
+body.scansci-markdown-reader header span,
+body.scansci-markdown-reader .evidence-block > span {{
+  color: color-mix(in srgb, var(--scansci-evidence-text) 55%, transparent);
+}}
+body.scansci-markdown-reader h2,
+body.scansci-markdown-reader summary,
+body.scansci-markdown-reader .empty {{ color: var(--scansci-evidence-text); }}
+body.scansci-markdown-reader details {{
+  border-color: color-mix(in srgb, var(--scansci-evidence-text) 16%, transparent);
+}}
+body.scansci-markdown-reader pre {{
+  color: var(--scansci-evidence-text);
+  background: color-mix(in srgb, var(--scansci-evidence-text) 6%, var(--scansci-evidence-surface));
 }}
 </style>'''
     for marker in ("data-scansci-evidence-style", "data-scansci-reader-theme"):
@@ -398,10 +435,15 @@ class NotebookWebApp:
         self.tesseract_installs = TesseractInstallManager()
         self.model_installs = create_install_manager()
         self.ollama_installs = OllamaInstallManager(
+            base_url=self._ollama_base_url() or None,
             state_path=self.workspace.parent / ".scansci-ollama-download-jobs.json",
         )
         self.library_imports = LibraryImportManager(self._run_library_import_job)
         self.direct_chat_history = DirectChatHistoryStore(self.workspace)
+        self.direct_chat_submissions = DirectChatSubmissionStore(self.workspace)
+        self.run_message_submissions = DirectChatSubmissionStore(
+            self.workspace, filename=self.workspace.name,
+        )
         self._retrieval_setup_errors: dict[str, str] = {}
         self._retrieval_setup_lock = threading.RLock()
         self._local_runtime_activation_lock = threading.RLock()
@@ -409,6 +451,8 @@ class NotebookWebApp:
         self._local_runtime_activation_models: set[str] = set()
         self._site_icon_cache: dict[str, tuple[float, str, bytes]] = {}
         self._site_icon_cache_lock = threading.RLock()
+        self._translation_lock = threading.Lock()
+        self._translation_active = ""
         self.research_agent = ResearchAgentRuntime(
             workspace=self.workspace,
             evidence_db=self.evidence_db,
@@ -473,7 +517,7 @@ class NotebookWebApp:
                     None,
                 )
                 if not preset or not preset.get("enabled"):
-                    ensure_local_model_preset(self.workspace, "ollama-minicpm-v4.6")
+                    ensure_local_model_preset(self.workspace, "ollama-minicpm-v4.6", base_url=str(status.get("base_url") or ""))
             except Exception:
                 # Status reporting must remain available even if a stale or
                 # read-only settings file prevents automatic registration.
@@ -566,6 +610,15 @@ class NotebookWebApp:
             ],
             "local_models": deepcopy(list(catalog.get("local_models", []) or [])),
         }
+        health["runtime_connections"] = {
+            identifier: {
+                "ok": bool(check.get("ok")),
+                "status": str(check.get("status") or ("connected" if check.get("ok") else "unavailable")),
+                "models": list(check.get("models", []) or []),
+                "error": str(check.get("error", ""))[:500],
+            }
+            for identifier, check in checks.items()
+        }
         return health
 
     def _extension_updates(self) -> dict[str, Any]:
@@ -628,9 +681,9 @@ class NotebookWebApp:
         )
         return {"jobs": jobs, "active": active}
 
-    def _enable_installed_local_model(self, preset_id: str) -> None:
+    def _enable_installed_local_model(self, preset_id: str, base_url: str = "") -> None:
         try:
-            ensure_local_model_preset(self.workspace, preset_id)
+            ensure_local_model_preset(self.workspace, preset_id, base_url=base_url)
         except Exception:
             # The model itself is already installed.  A settings write failure
             # must not turn a successful download into a false download error.
@@ -829,6 +882,8 @@ class NotebookWebApp:
             return WebResponse(HTTPStatus.OK, "application/zip", bundle.read_bytes())
         if path == "/api/workspace":
             return self._json(HTTPStatus.OK, load_workspace_summary(self.workspace))
+        if path == "/api/translations/library":
+            return self._json(HTTPStatus.OK, {"root_path": str(translation_root(self.workspace)), "files": translation_folder_files(translation_root(self.workspace))})
         if path == "/api/connectors":
             return self._json(HTTPStatus.OK, connector_catalog(self.workspace))
         if path == "/api/settings/document-processing/ocr/status":
@@ -848,6 +903,8 @@ class NotebookWebApp:
             return self._json(HTTPStatus.OK, load_settings(self.workspace))
         if path == "/api/model-health":
             return self._json(HTTPStatus.OK, self._model_health())
+        if path == "/api/strata/preflight":
+            return self._json(HTTPStatus.OK, detect_local_hardware())
         if path == "/api/settings/presets":
             return self._json(
                 HTTPStatus.OK,
@@ -872,13 +929,20 @@ class NotebookWebApp:
             search = str(parse_qs(query).get("q", [""])[0] or "")
             catalog = market_catalog(search)
             ollama = self._ollama_status(register_ready=True)
+            names = {
+                str(model.get("name") or model.get("model") or "").strip()
+                for model in list(ollama.get("models", []) or [])
+                if isinstance(model, dict)
+            }
             for item in list(catalog.get("items", []) or []):
                 if str(item.get("runtime", "")).strip().lower() != "ollama":
                     continue
-                item["installed"] = bool(ollama.get("model_ready"))
-                item["ready"] = bool(ollama.get("model_ready"))
+                model_id = str(item.get("id") or "")
+                item["installed"] = model_id in names or f"{model_id}:latest" in names
+                item["ready"] = item["installed"]
                 item["runtime_reachable"] = bool(ollama.get("reachable"))
                 item["runtime_error"] = str(ollama.get("error", "") or "")
+            catalog["recommendation"] = recommend_chat_model(detect_local_hardware(), ollama)
             return self._json(HTTPStatus.OK, catalog)
         if path == "/api/local-models/install-status":
             job_id = str(parse_qs(query).get("job_id", [""])[0] or "")
@@ -954,8 +1018,25 @@ class NotebookWebApp:
             return self._json(HTTPStatus.OK, self.update_service.status())
 
         parts = self._path_parts(path)
+        if len(parts) == 4 and parts[:3] == ["api", "translations", "files"]:
+            return self._translation_file(parts[3])
+        if len(parts) == 4 and parts[:2] == ["api", "translations"] and parts[3] == "pdf":
+            return self._translation_result(parts[2])
+        if len(parts) == 3 and parts[:2] == ["api", "translations"]:
+            run = self.research_agent.store.get_run(parts[2])
+            if run.get("workflow_type") != "pdf-translation":
+                raise FileNotFoundError("文献翻译任务不存在")
+            return self._json(HTTPStatus.OK, run)
         if len(parts) == 4 and parts[:3] == ["api", "chat", "history"]:
-            return self._json(HTTPStatus.OK, self.direct_chat_history.get(parts[3]))
+            conversation_id = self.direct_chat_submissions.conversation_id(parts[3])
+            return self._json(HTTPStatus.OK, self.direct_chat_history.get(conversation_id))
+        if len(parts) == 4 and parts[:3] == ["api", "chat", "submissions"]:
+            conversation_id = self.direct_chat_submissions.conversation_id(
+                parse_qs(query).get("conversation_id", [""])[0]
+            )
+            key = self.direct_chat_submissions.request_key({"idempotency_key": parts[3]})
+            state, terminal = self.direct_chat_submissions.status(key, conversation_id)
+            return self._json(HTTPStatus.OK, {"state": state, "terminal": terminal})
         if len(parts) == 6 and parts[:3] == ["api", "slides", "templates"] and parts[4] == "pages":
             asset = slide_template_asset(parts[3], parts[5], self.slides_root)
             return WebResponse(HTTPStatus.OK, "image/svg+xml; charset=utf-8", asset.read_bytes())
@@ -1040,6 +1121,19 @@ class NotebookWebApp:
     def _post(self, path: str, body: bytes) -> WebResponse:
         payload = self._json_body(body)
         parts = self._path_parts(path)
+        if path == "/api/translations/library":
+            with self._translation_lock:
+                if self._translation_active:
+                    raise ValueError("当前有文献正在翻译，请完成后再更改保存位置")
+                result = bind_translation_library(self.workspace, str(payload.get("parent_path", "")))
+            return self._json(HTTPStatus.CREATED, {**result, "workspace": load_workspace_summary(self.workspace)})
+        if path == "/api/translations":
+            return self._json(HTTPStatus.ACCEPTED, self._start_translation(payload))
+        if len(parts) == 4 and parts[:2] == ["api", "translations"] and parts[3] == "cancel":
+            run = self.research_agent.store.get_run(parts[2])
+            if run.get("workflow_type") != "pdf-translation":
+                raise FileNotFoundError("文献翻译任务不存在")
+            return self._json(HTTPStatus.OK, self.research_agent.store.request_cancel(parts[2]))
         if path == "/api/library/import-jobs":
             return self._json(HTTPStatus.ACCEPTED, self.library_imports.start(payload))
         if path == "/api/library/bind-folder":
@@ -1053,26 +1147,48 @@ class NotebookWebApp:
         if path == "/api/chat/title":
             return self._json(HTTPStatus.OK, self.research_agent.generate_conversation_title(payload))
         if path == "/api/chat":
-            return self._json(HTTPStatus.OK, self.research_agent.chat(payload))
+            return self._guarded_effect_post(
+                self.direct_chat_submissions, "sync-chat", payload,
+                lambda _key: self.research_agent.chat(payload),
+                conversation_id=self.direct_chat_submissions.conversation_id(payload.get("conversation_id")),
+            )
         if path == "/api/chat/history":
-            return self._json(HTTPStatus.OK, self.direct_chat_history.upsert(payload))
+            conversation_id = self.direct_chat_submissions.conversation_id(payload.get("conversation_id"))
+            return self._json(HTTPStatus.OK, self.direct_chat_submissions.save_history(
+                conversation_id, lambda: self.direct_chat_history.upsert(payload),
+            ))
+        if len(parts) == 5 and parts[:3] == ["api", "chat", "submissions"] and parts[4] == "abandon":
+            conversation_id = self.direct_chat_submissions.conversation_id(payload.get("conversation_id"))
+            key = self.direct_chat_submissions.request_key({"idempotency_key": parts[3]})
+            state = self.direct_chat_submissions.abandon_missing(key, conversation_id)
+            return self._json(HTTPStatus.OK, {"state": state})
         if len(parts) == 5 and parts[:3] == ["api", "chat", "history"]:
-            conversation_id, action = parts[3], parts[4]
+            conversation_id = self.direct_chat_submissions.conversation_id(parts[3])
+            action = parts[4]
             if action == "title":
                 return self._json(
                     HTTPStatus.OK,
-                    self.direct_chat_history.set_title(
+                    self.direct_chat_submissions.save_history(
                         conversation_id,
-                        str(payload.get("title", "") or ""),
-                        source=str(payload.get("title_source", "") or ""),
+                        lambda: self.direct_chat_history.set_title(
+                            conversation_id,
+                            str(payload.get("title", "") or ""),
+                            source=str(payload.get("title_source", "") or ""),
+                        ),
                     ),
                 )
             if action == "archive":
-                return self._json(HTTPStatus.OK, self.direct_chat_history.set_archived(conversation_id, True))
+                return self._json(HTTPStatus.OK, self.direct_chat_submissions.save_history(
+                    conversation_id, lambda: self.direct_chat_history.set_archived(conversation_id, True),
+                ))
             if action == "restore":
-                return self._json(HTTPStatus.OK, self.direct_chat_history.set_archived(conversation_id, False))
+                return self._json(HTTPStatus.OK, self.direct_chat_submissions.save_history(
+                    conversation_id, lambda: self.direct_chat_history.set_archived(conversation_id, False),
+                ))
             if action == "delete":
-                return self._json(HTTPStatus.OK, self.direct_chat_history.delete(conversation_id))
+                return self._json(HTTPStatus.OK, self.direct_chat_submissions.erase_conversation(
+                    conversation_id, lambda: self.direct_chat_history.delete(conversation_id),
+                ))
         if path == "/api/chat/compact":
             return self._json(HTTPStatus.OK, self.research_agent.compact_chat(payload))
         if path == "/api/chat/cancel":
@@ -1125,9 +1241,18 @@ class NotebookWebApp:
         if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "restore":
             return self._json(HTTPStatus.OK, self.research_agent.store.restore_run(parts[2]))
         if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "delete":
-            return self._json(HTTPStatus.OK, self.research_agent.store.delete_run(parts[2]))
+            return self._json(HTTPStatus.OK, self.run_message_submissions.erase_after(
+                f"run:{parts[2]}",
+                lambda connection: self.research_agent.store.delete_run_in_transaction(connection, parts[2]),
+            ))
         if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "messages":
-            return self._json(HTTPStatus.OK, self.research_agent.continue_run_conversation(parts[2], payload))
+            return self._guarded_effect_post(
+                self.run_message_submissions, f"run-message:{parts[2]}", payload,
+                lambda key: self.research_agent.continue_run_conversation(
+                    parts[2], payload, effect_scope=key,
+                ),
+                conversation_id=f"run:{parts[2]}",
+            )
         if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "branch":
             return self._json(HTTPStatus.ACCEPTED, self.research_agent.branch_run(parts[2], payload))
         if len(parts) == 4 and parts[:2] == ["api", "runs"] and parts[3] == "recover":
@@ -1509,8 +1634,6 @@ class NotebookWebApp:
             )
         if len(parts) == 5 and parts[:3] == ["api", "settings", "providers"] and parts[4] == "api-key":
             return self._set_provider_api_key(parts[3], payload)
-        if len(parts) == 6 and parts[:3] == ["api", "settings", "providers"] and parts[4:] == ["api-key", "reveal"]:
-            return self._reveal_provider_api_key(parts[3], payload)
         if len(parts) == 5 and parts[:3] == ["api", "settings", "providers"] and parts[4] == "test":
             return self._test_provider(parts[3])
         if len(parts) == 5 and parts[:3] == ["api", "settings", "providers"] and parts[4] == "models":
@@ -1533,10 +1656,35 @@ class NotebookWebApp:
             return self._json(HTTPStatus.OK, delete_installed_model(model_id))
         if path == "/api/local-models/recheck":
             return self._recheck_local_model(str(payload.get("id", "")).strip())
+        if path == "/api/local-models/test-strata":
+            return self._json(HTTPStatus.OK, test_local_model_connection({
+                "runtime": "strata", "base_url": str(payload.get("base_url", "")),
+            }, timeout=4.0))
+        if path == "/api/local-models/activate-strata":
+            return self._activate_strata_model(payload)
+        if path == "/api/local-models/activate-recommended":
+            model_id = str(payload.get("id", "") or "").strip()
+            ollama = self._ollama_status()
+            recommendation = recommend_chat_model(detect_local_hardware(), ollama)
+            if not recommendation.get("available") or model_id != recommendation.get("id"):
+                return self._json(HTTPStatus.CONFLICT, {"error": {"message": "该模型已不符合当前本机推荐，请刷新模型页。"}})
+            if not recommendation.get("runtime_reachable") or not recommendation.get("installed"):
+                return self._json(HTTPStatus.CONFLICT, {"error": {"message": "推荐模型尚未在 Ollama 中完整安装。"}})
+            try:
+                probe = probe_ollama_chat_model(str(ollama.get("base_url") or ""), model_id)
+            except (OSError, RuntimeError, ValueError) as exc:
+                return self._json(HTTPStatus.CONFLICT, {"error": {"message": str(exc)[:500]}})
+            preset_id = f"ollama-{model_id.replace(':', '-')}"
+            settings = ensure_local_model_preset(
+                self.workspace, preset_id, make_primary=True, base_url=str(ollama.get("base_url") or ""),
+            )
+            return self._json(HTTPStatus.OK, {"settings": settings, "probe": probe})
         if path == "/api/local-models/download":
             repo_id = str(payload.get("id", ""))
             runtime = str(payload.get("runtime", "") or "").strip().lower()
             if runtime == "ollama" or repo_id == OLLAMA_VISION_MODEL:
+                if repo_id not in {OLLAMA_VISION_MODEL, *OLLAMA_CHAT_MODEL_SPECS}:
+                    return self._json(HTTPStatus.BAD_REQUEST, {"error": {"message": "该 Ollama 模型不在推荐目录中。"}})
                 ollama = self._ollama_status()
                 if not ollama.get("reachable"):
                     return self._json(
@@ -1549,10 +1697,16 @@ class NotebookWebApp:
                             "ollama": ollama,
                         },
                     )
+                endpoint = str(ollama.get("base_url") or "")
+                if not is_local_ollama_url(endpoint) or endpoint != self.ollama_installs.base_url:
+                    return self._json(HTTPStatus.CONFLICT, {"error": {"message": "Ollama 地址已变更或不是本机地址，请检查连接并重启 ScanSci。"}})
                 install = self.ollama_installs.start(
-                    OLLAMA_VISION_MODEL,
-                    job_id=f"ollama:{OLLAMA_VISION_MODEL}",
-                    on_complete=lambda _job: self._enable_installed_local_model("ollama-minicpm-v4.6"),
+                    repo_id,
+                    job_id=f"ollama:{repo_id}",
+                    on_complete=lambda _job: self._enable_installed_local_model(
+                        "ollama-minicpm-v4.6" if repo_id == OLLAMA_VISION_MODEL else f"ollama-{repo_id.replace(':', '-')}",
+                        endpoint,
+                    ),
                 )
                 return self._json(HTTPStatus.ACCEPTED, install)
             blocked = self._audio_model_download_requires_runtime() if repo_id == QWEN3_ASR_NATIVE_MODEL_ID else self._model_download_requires_runtime()
@@ -1730,16 +1884,220 @@ class NotebookWebApp:
         return self._json_error(HTTPStatus.NOT_FOUND, "not_found", "No route matches this path.")
 
     def _ask(self, payload: dict[str, Any]) -> WebResponse:
-        return self._json(HTTPStatus.OK, self.research_agent.answer_sync(payload))
+        public_payload = {key: value for key, value in payload.items() if key != "_research_run_id"}
+        return self._guarded_effect_post(
+            self.run_message_submissions, "sync-ask", public_payload,
+            lambda _key: self.research_agent.answer_sync(public_payload),
+            cache_result=False,
+        )
+
+    def _guarded_effect_post(
+        self,
+        submissions: DirectChatSubmissionStore,
+        route: str,
+        payload: dict[str, Any],
+        execute: Callable[[str], dict[str, Any]],
+        *,
+        conversation_id: str = "",
+        cache_result: bool = True,
+    ) -> WebResponse:
+        client_key = submissions.request_key(payload)
+        key = sha256(f"{route}\0{client_key}".encode("utf-8")).hexdigest()
+        digest = submissions.payload_digest({**payload, "_host_route": route})
+        identity = conversation_id or f"sync:{key}"
+        state, terminal = submissions.reserve(key, digest, identity)
+        if state == "completed" and isinstance(terminal, dict) and isinstance(terminal.get("result"), dict):
+            return self._json(HTTPStatus.OK, terminal["result"])
+        if state != "new":
+            code = (
+                "idempotency_conflict" if state == "conflict"
+                else "conversation_deleted" if state == "erased"
+                else "submission_in_progress" if state == "running"
+                else "submission_completed" if state == "completed"
+                else "submission_uncertain"
+            )
+            status = HTTPStatus.GONE if state == "erased" else HTTPStatus.CONFLICT
+            return self._json_error(status, code, f"提交状态为 {state}；请查看已有结果后再决定是否新建请求。")
+        try:
+            result = execute(key)
+            submissions.finish(key, {"type": "RUN_FINISHED", **({"result": result} if cache_result else {})})
+            return self._json(HTTPStatus.OK, result)
+        except BaseException:
+            submissions.interrupt(key)
+            raise
 
     def stream_chat(self, payload: dict[str, Any]):
         """Expose direct-chat deltas to the loopback HTTP handler."""
 
-        return self.research_agent.chat_stream(payload)
+        if not payload.get("idempotency_key") and not payload.get("image_request_id"):
+            return self.research_agent.chat_stream(payload)
+        return self._guarded_chat_stream(payload)
+
+    def _guarded_chat_stream(self, payload: dict[str, Any]):
+        key = self.direct_chat_submissions.request_key(payload)
+        conversation_id = self.direct_chat_submissions.conversation_id(payload.get("conversation_id"))
+        digest = self.direct_chat_submissions.payload_digest(payload)
+        state, terminal = self.direct_chat_submissions.reserve(key, digest, conversation_id)
+        if state != "new":
+            if state in {"completed", "failed"} and terminal is not None:
+                yield terminal
+                return
+            code = (
+                "idempotency_conflict" if state == "conflict"
+                else "conversation_deleted" if state == "erased"
+                else "submission_in_progress" if state == "running"
+                else "submission_uncertain"
+            )
+            message = (
+                "相同请求 ID 对应不同内容，已拒绝重复提交。" if state == "conflict"
+                else "这条对话已经删除，已拒绝旧请求。" if state == "erased"
+                else "该请求仍在执行，请等待当前结果。" if state == "running"
+                else "该请求可能已执行工具；请查看会话状态后再决定是否重新提交。"
+            )
+            yield {"type": "RUN_ERROR", "code": code, "message": message,
+                   "failure": {"code": code, "message": message, "retryable": False}}
+            return
+        finished = False
+        try:
+            for event in self.research_agent.chat_stream(payload):
+                if event.get("type") in {"RUN_FINISHED", "RUN_ERROR", "done", "error"}:
+                    self.direct_chat_submissions.finish(key, event)
+                    finished = True
+                yield event
+        finally:
+            if not finished:
+                self.direct_chat_submissions.interrupt(key)
 
     def _attachment_asset(self, attachment_id: str) -> WebResponse:
         path, content_type = attachment_asset(self.workspace, attachment_id)
         return WebResponse(HTTPStatus.OK, content_type, path.read_bytes())
+
+    def _start_translation(self, payload: dict[str, Any]) -> dict[str, Any]:
+        name = str(payload.get("filename", "") or "").replace("\\", "/").split("/")[-1].strip()
+        if not name.lower().endswith(".pdf") or len(name) > 180:
+            raise ValueError("请选择名称有效的 PDF 文件")
+        language = str(payload.get("target_language", "简体中文") or "简体中文")
+        if language not in {"简体中文", "繁体中文", "English"}:
+            raise ValueError("当前不支持这个目标语言")
+        data_url = str(payload.get("data_url", "") or "")
+        header, separator, encoded = data_url.partition(",")
+        if not separator or not header.startswith("data:") or not header.endswith(";base64"):
+            raise ValueError("PDF 上传数据格式无效")
+        try:
+            pdf_bytes = base64.b64decode(encoded, validate=True)
+        except (ValueError, base64.binascii.Error) as error:
+            raise ValueError("PDF 上传数据损坏") from error
+        if not pdf_bytes.startswith(b"%PDF-") or len(pdf_bytes) > 50 * 1024 * 1024:
+            raise ValueError("请选择不超过 50 MB 的有效 PDF")
+        import pymupdf
+
+        try:
+            with pymupdf.open(stream=pdf_bytes, filetype="pdf") as document:
+                if document.is_encrypted or not 0 < document.page_count <= 300:
+                    raise ValueError("PDF 已加密、没有页面或超过 300 页")
+        except pymupdf.FileDataError as error:
+            raise ValueError("无法打开此 PDF") from error
+        with self._translation_lock:
+            # ponytail: one active local translation keeps the selected model and folder stable;
+            # use a queue if batch translation becomes a product requirement.
+            if self._translation_active:
+                raise ValueError("已有文献正在翻译，请完成后再提交下一篇")
+            self._translation_active = "preparing"
+        source = None
+        run_id = ""
+        try:
+            if not load_workspace_summary(self.workspace, notebook_id="translation-library").get("notebooks"):
+                bind_translation_library(self.workspace)
+            root = translation_root(self.workspace)
+            store = self.research_agent.store
+            run = store.create_run(
+                notebook_id="translation-library",
+                workflow_type="pdf-translation",
+                title=f"文献翻译：{name}",
+                input_payload={"filename": name, "target_language": language},
+                stages=[StageSpec("translate", "识别、翻译并排版", "tool"), StageSpec("save", "保存到翻译库", "tool")],
+                metadata={"source": "literature_translation"},
+            )
+            run_id = str(run["run_id"])
+            staging = self.workspace.parent / ".scansci-translation-inputs"
+            staging.mkdir(parents=True, exist_ok=True)
+            source = staging / f"{run_id}.pdf"
+            source.write_bytes(pdf_bytes)
+            safe_stem = re.sub(r'[<>:"/\\|?*\x00-\x1f]', "_", Path(name).stem).strip(" .")[:80] or "文献"
+            output = root / f"{safe_stem}（{language}）-{run_id}.pdf"
+            self._translation_active = run_id
+            threading.Thread(
+                target=self._translation_worker,
+                args=(run_id, source, output, name, language),
+                name=f"scansci-translation-{run_id[-8:]}",
+                daemon=True,
+            ).start()
+            return {"run_id": run_id, "status": "queued", "root_path": str(root)}
+        except Exception as error:
+            if run_id:
+                self.research_agent.store.fail_stage(run_id, "translate", error)
+            if source is not None:
+                source.unlink(missing_ok=True)
+            with self._translation_lock:
+                self._translation_active = ""
+            raise
+
+    def _translation_worker(self, run_id: str, source: Path, output: Path, name: str, language: str) -> None:
+        store = self.research_agent.store
+        stage = "translate"
+        try:
+            if store.cancel_requested(run_id):
+                store.mark_cancelled(run_id)
+                return
+            store.begin_run(run_id)
+            store.start_stage(run_id, stage)
+            result = translate_pdf(
+                source, output, workspace=self.workspace, target_language=language,
+                progress=lambda done, total: store.update_stage_progress(
+                    run_id, stage, fraction=done / total, summary=f"已处理 {done:.1f}/{total} 页"
+                ),
+                cancelled=lambda: store.cancel_requested(run_id),
+            )
+            store.complete_stage(run_id, stage, summary=f"已翻译 {result['pages']} 页", output=result)
+            if store.cancel_requested(run_id):
+                store.mark_cancelled(run_id)
+                return
+            stage = "save"
+            store.start_stage(run_id, stage)
+            saved = register_translation(
+                self.workspace, output, run_id=run_id, source_name=name,
+                target_language=language, result=result,
+            )
+            artifact = store.create_artifact(
+                run_id, artifact_type="translated_pdf", title=saved["title"],
+                summary="译文 PDF 已保存到翻译库", payload={**saved, **result}, file_path=str(output),
+            )
+            store.complete_stage(run_id, stage, summary="已保存到翻译库", output=saved)
+            store.complete_run(run_id, output_artifact_id=str(artifact["artifact_id"]))
+        except InterruptedError:
+            store.mark_cancelled(run_id)
+        except Exception as error:
+            store.fail_stage(run_id, stage, error)
+        finally:
+            source.unlink(missing_ok=True)
+            with self._translation_lock:
+                if self._translation_active == run_id:
+                    self._translation_active = ""
+
+    def _translation_file(self, file_id: str) -> WebResponse:
+        item = next((item for item in translation_folder_files(translation_root(self.workspace)) if item["id"] == file_id), None)
+        if item is None:
+            raise FileNotFoundError("翻译库中没有这份 PDF")
+        return WebResponse(HTTPStatus.OK, "application/pdf", Path(item["path"]).read_bytes(), _EMBEDDED_SOURCE_CONTENT_SECURITY_POLICY)
+
+    def _translation_result(self, run_id: str) -> WebResponse:
+        run = self.research_agent.store.get_run(run_id)
+        if run.get("workflow_type") != "pdf-translation" or run.get("status") != "completed":
+            raise FileNotFoundError("译文 PDF 尚未完成")
+        path = Path(str(dict(run.get("output_artifact") or {}).get("file_path", ""))).resolve()
+        if translation_root(self.workspace).resolve() not in path.parents or not path.is_file():
+            raise FileNotFoundError("译文 PDF 文件不存在")
+        return WebResponse(HTTPStatus.OK, "application/pdf", path.read_bytes(), _EMBEDDED_SOURCE_CONTENT_SECURITY_POLICY)
 
     def _audio_attachment_asset(self, attachment_id: str) -> WebResponse:
         path, content_type = audio_attachment_asset(self.workspace, attachment_id)
@@ -1873,28 +2231,6 @@ class NotebookWebApp:
         settings = set_provider_api_key(self.workspace, provider_id, str(payload.get("api_key", "")))
         return self._json(HTTPStatus.OK, settings)
 
-    def _reveal_provider_api_key(self, provider_id: str, payload: dict[str, Any]) -> WebResponse:
-        """Return a saved provider key only after an explicit local UI action.
-
-        Provider secrets remain absent from the normal settings contract.  The
-        desktop UI calls this POST route only when the person clicks the eye
-        control; all HTTP responses are already marked ``Cache-Control:
-        no-store`` by the loopback server.
-        """
-
-        if payload.get("reveal") is not True:
-            raise ValueError("需要明确确认后才能显示 API 密钥")
-        settings = load_settings(self.workspace)
-        provider = next((item for item in settings.get("providers", []) if item.get("id") == provider_id), None)
-        if provider is None:
-            raise FileNotFoundError("找不到模型提供商")
-        if provider.get("kind") == "local" or provider.get("auth_mode") == "managed":
-            raise ValueError("这个模型服务没有可显示的本机 API 密钥")
-        secret = get_provider_api_key(self.workspace, provider_id)
-        if not secret:
-            raise FileNotFoundError("尚未保存 API 密钥")
-        return self._json(HTTPStatus.OK, {"api_key": secret})
-
     def _set_document_service_api_key(self, service_id: str, payload: dict[str, Any]) -> WebResponse:
         settings = set_document_service_api_key(self.workspace, service_id, str(payload.get("api_key", "")))
         return self._json(HTTPStatus.OK, settings)
@@ -1925,6 +2261,38 @@ class NotebookWebApp:
         if local_model is None:
             raise FileNotFoundError("找不到本地模型")
         return self._json(HTTPStatus.OK, test_local_model_connection(dict(local_model)))
+
+    def _activate_strata_model(self, payload: dict[str, Any]) -> WebResponse:
+        """Promote only the exact Strata route that passed a live Agent probe."""
+
+        local_id = str(payload.get("local_model_id", "strata") or "strata").strip()
+        model_id = str(payload.get("model_id", "") or "").strip()
+        settings = load_settings(self.workspace)
+        local_model = next((item for item in settings.get("local_models", []) if item.get("id") == local_id), None)
+        if local_model is None or local_model.get("runtime") != "strata" or not local_model.get("enabled"):
+            raise ValueError("请先在运行时页面连接并启用 Strata")
+        base_url = str(payload.get("base_url") or local_model.get("base_url") or "").strip()
+        status = test_local_model_connection({**local_model, "base_url": base_url}, timeout=4.0)
+        if not status.get("ok"):
+            return self._json(HTTPStatus.CONFLICT, {"error": {"message": str(status.get("error") or "Strata 尚未就绪")}})
+        if model_id not in status.get("models", []):
+            raise ValueError("请选择 Strata 当前返回的模型")
+        try:
+            probe = probe_strata_agent_model(base_url, model_id)
+        except (OSError, RuntimeError, ValueError) as exc:
+            return self._json(HTTPStatus.CONFLICT, {"error": {"message": str(exc)[:500]}})
+        local_model["model_id"] = model_id
+        local_model["base_url"] = base_url
+        local_model["capabilities"] = ["reasoning", "tool"]
+        local_model["agent_verified_for"] = f"{str(local_model.get('base_url', '')).strip().rstrip('/')}\n{model_id}"
+        context = status.get("max_context")
+        if isinstance(context, int) and context > 0:
+            local_model["context_window"] = str(context)
+        provider_id = f"local-runtime-{local_id}"
+        settings["active_model"] = {"provider_id": provider_id, "model_id": model_id}
+        reference = f"provider:{provider_id}:{model_id}"
+        settings.setdefault("model_roles", {}).update({role: reference for role in ("reasoning", "writing", "slides")})
+        return self._json(HTTPStatus.OK, {"settings": save_settings(self.workspace, settings), "probe": probe})
 
     def _requested_notebook(self, payload: dict[str, Any]) -> dict[str, Any]:
         notebook_id = str(payload.get("notebook_id", "")).strip()
@@ -2665,10 +3033,15 @@ class NotebookWebApp:
                 f'<span>{html_escape(str(row["evidence_id"] or ""))}</span>'
                 f'<p>{html_escape(str(row["text"] or ""))}</p></article>'
             )
-        title = html_escape(str(source.get("title") or doc_id))
-        evidence = "".join(blocks) or '<p class="empty">这份来源尚未生成可定位证据块。</p>'
+        source_title = str(source.get("title") or doc_id)
+        if re.fullmatch(r"第\s*\d+\s*页", source_title):
+            original_name = Path(str(source.get("source_url") or "")).stem
+            if original_name:
+                source_title = f"{original_name} · {source_title}"
+        title = html_escape(source_title)
+        evidence = "".join(blocks) or '<p class="empty">当前没有可定位的证据块；可查看下方转换文本。</p>'
         return f'''<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{title}</title><style>
-:root{{font-family:"Segoe UI","Microsoft YaHei",sans-serif;color:#2d3035;background:#fff}}body{{margin:0}}header{{position:sticky;top:0;z-index:3;padding:18px 28px 15px;border-bottom:1px solid #e7e8eb;background:rgba(255,255,255,.96);backdrop-filter:blur(14px)}}header span{{color:#96989f;font-size:11px;letter-spacing:.08em}}header h1{{margin:4px 0 0;font-size:20px;line-height:1.4}}main{{max-width:920px;margin:auto;padding:24px 30px 70px}}h2{{margin:28px 0 10px;color:#565960;font-size:14px}}.evidence-block{{scroll-margin-top:94px;margin:0 0 8px;padding:13px 16px;border:1px solid transparent;border-radius:10px;transition:background .18s,border-color .18s,box-shadow .18s}}.evidence-block>span{{display:block;margin-bottom:4px;color:#a0a2a8;font:10px ui-monospace,SFMono-Regular,Consolas,monospace}}.evidence-block p{{margin:0;font-size:15px;line-height:1.85}}.evidence-block:target{{border-color:#e7cb68;background:#fff8cf;box-shadow:0 0 0 4px rgba(225,190,66,.14)}}details{{margin-top:34px;border-top:1px solid #e7e8eb;padding-top:18px}}summary{{color:#707279;font-size:13px;cursor:pointer}}pre{{padding:18px;overflow:auto;border-radius:10px;background:#f7f7f8;white-space:pre-wrap;font:13px/1.75 ui-monospace,SFMono-Regular,Consolas,monospace}}.empty{{color:#92949a}}</style></head><body><header><span>SCANSCI · EVIDENCE READER</span><h1>{title}</h1></header><main>{evidence}<details><summary>查看完整转换文本</summary><pre>{html_escape(full_text)}</pre></details></main></body></html>'''
+:root{{font-family:"Segoe UI","Microsoft YaHei",sans-serif;color:#2d3035;background:#fff}}body{{margin:0}}header{{position:sticky;top:0;z-index:3;padding:18px 28px 15px;border-bottom:1px solid #e7e8eb;background:rgba(255,255,255,.96);backdrop-filter:blur(14px)}}header span{{color:#96989f;font-size:11px;letter-spacing:.08em}}header h1{{margin:4px 0 0;font-size:20px;line-height:1.4}}main{{max-width:920px;margin:auto;padding:24px 30px 70px}}h2{{margin:28px 0 10px;color:#565960;font-size:14px}}.evidence-block{{scroll-margin-top:94px;margin:0 0 8px;padding:13px 16px;border:1px solid transparent;border-radius:10px;transition:background .18s,border-color .18s,box-shadow .18s}}.evidence-block>span{{display:block;margin-bottom:4px;color:#a0a2a8;font:10px ui-monospace,SFMono-Regular,Consolas,monospace}}.evidence-block p{{margin:0;font-size:15px;line-height:1.85}}.evidence-block:target{{border-color:#e7cb68;background:#fff8cf;box-shadow:0 0 0 4px rgba(225,190,66,.14)}}details{{margin-top:34px;border-top:1px solid #e7e8eb;padding-top:18px}}summary{{color:#707279;font-size:13px;cursor:pointer}}pre{{padding:18px;overflow:auto;border-radius:10px;background:#f7f7f8;white-space:pre-wrap;font:13px/1.75 ui-monospace,SFMono-Regular,Consolas,monospace}}.empty{{color:#92949a}}</style></head><body class="scansci-markdown-reader"><header><span>SCANSCI · EVIDENCE READER</span><h1>{title}</h1></header><main>{evidence}<details><summary>查看完整转换文本</summary><pre data-scansci-source-text="true">{html_escape(full_text)}</pre></details></main></body></html>'''
 
     def _source_asset(self, doc_id: str, asset_parts: list[str]) -> WebResponse:
         source = self._source(doc_id)
@@ -2962,6 +3335,7 @@ def create_notebook_server(
     host: str = "127.0.0.1",
     port: int = 0,
     update_service: AppUpdateService | None = None,
+    allowed_origin: str = "",
 ) -> ThreadingHTTPServer:
     """Create a loopback-only HTTP server for the Notebook UI.
 
@@ -3020,6 +3394,8 @@ def create_notebook_server(
                 # Native desktop and local automation clients do not always
                 # send Origin. A browser cross-site request does.
                 return None
+            if allowed_origin and origin == allowed_origin:
+                return None
             try:
                 parsed = urlparse(origin)
                 origin_port = parsed.port or (443 if parsed.scheme == "https" else 80)
@@ -3055,6 +3431,8 @@ def create_notebook_server(
         def _stream_chat(self, body: bytes) -> None:
             try:
                 payload = NotebookWebApp._json_body(body)
+                payload["idempotency_key"] = app.direct_chat_submissions.request_key(payload)
+                payload["conversation_id"] = app.direct_chat_submissions.conversation_id(payload.get("conversation_id"))
             except ValueError as error:
                 self._write_response(NotebookWebApp._json_error(HTTPStatus.BAD_REQUEST, "invalid_request", str(error)))
                 return
@@ -3080,11 +3458,16 @@ def create_notebook_server(
                 try:
                     self._write_sse("ready", {})
                     last_event = "ready"
-                    for event in app.stream_chat(payload):
-                        event_type = str(event.get("type", "message"))
-                        event_payload = {str(key): value for key, value in event.items() if key != "type"}
-                        self._write_sse(event_type, event_payload)
-                        last_event = event_type
+                    stream = app.stream_chat(payload)
+                    try:
+                        for event in stream:
+                            event_type = str(event.get("type", "message"))
+                            event_payload = {str(key): value for key, value in event.items() if key != "type"}
+                            self._write_sse(event_type, event_payload)
+                            last_event = event_type
+                    finally:
+                        if hasattr(stream, "close"):
+                            stream.close()
                     span.set_attribute("chat.terminal_event", last_event)
                 except (BrokenPipeError, ConnectionResetError):
                     span.set_attribute("chat.client_disconnected", True)

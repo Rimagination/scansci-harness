@@ -71,6 +71,19 @@ def test_image_generation_gets_one_reversible_host_tool() -> None:
     assert contract["required_tool_groups"] == [["generate_image"]]
 
 
+def test_required_artifacts_stay_deferred_until_tool_discovery() -> None:
+    contract = compile_task_contract(
+        task_mode="slides",
+        user_text="Create a document and presentation from the evidence",
+        required_tool_groups=[{"create_document"}, {"create_presentation"}],
+    )
+
+    assert contract["required_tool_groups"] == [["create_document"], ["create_presentation"]]
+    assert "build_presentation_outline" in contract["initial_tools"]
+    assert "create_document" not in contract["initial_tools"]
+    assert "create_presentation" not in contract["initial_tools"]
+
+
 def test_external_or_destructive_request_requires_plan() -> None:
     contract = compile_task_contract(
         task_mode="general",

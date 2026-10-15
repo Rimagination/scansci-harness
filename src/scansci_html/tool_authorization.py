@@ -16,6 +16,10 @@ from uuid import uuid4
 class ToolAuthorizationError(PermissionError):
     """Raised before dispatch when a Pi tool call lacks current authority."""
 
+    def __init__(self, message: str, *, code: str = "authorization_denied") -> None:
+        super().__init__(message)
+        self.code = code
+
 
 @dataclass(frozen=True)
 class ApprovalToken:
@@ -32,6 +36,7 @@ class ToolAuthorizationDecision:
     request_id: str
     risk_level: str
     idempotent: bool
+    approval_required: bool = False
 
 
 _RISK_RANK = {
@@ -93,55 +98,57 @@ def authorize_tool_call(
     event_request_id = str(request_id or "").strip()
     current_request_id = str(active_request_id or "").strip()
     if not event_request_id or event_request_id != current_request_id:
-        raise ToolAuthorizationError("Tool call belongs to another request")
+        raise ToolAuthorizationError("Tool call belongs to another request", code="request_mismatch")
     if not normalized_name:
-        raise ToolAuthorizationError("Tool call has no capability id")
+        raise ToolAuthorizationError("Tool call has no capability id", code="missing_capability_id")
 
     raw_contract = dict(contract or {})
     if "allowed_tools" not in raw_contract:
-        raise ToolAuthorizationError("Task contract has a missing tool capability lease")
+        raise ToolAuthorizationError("Task contract has a missing tool capability lease", code="missing_lease")
     raw_allowed = raw_contract.get("allowed_tools")
     if not isinstance(raw_allowed, (list, tuple, set, frozenset)):
-        raise ToolAuthorizationError("Task contract tool capability lease is malformed")
+        raise ToolAuthorizationError("Task contract tool capability lease is malformed", code="malformed_lease")
     allowed = {str(value).strip() for value in raw_allowed if str(value).strip()}
     if not allowed:
-        raise ToolAuthorizationError("Task contract has an explicit empty tool capability lease")
+        raise ToolAuthorizationError("Task contract has an explicit empty tool capability lease", code="empty_lease")
     if normalized_name not in allowed:
         raise ToolAuthorizationError(
-            f"Capability lease denied tool {normalized_name}; it is outside the current task contract"
+            f"Capability lease denied tool {normalized_name}; it is outside the current task contract",
+            code="outside_lease",
         )
 
     raw_descriptor = dict(descriptor or {})
     if not raw_descriptor or str(raw_descriptor.get("id", "")).strip() != normalized_name:
-        raise ToolAuthorizationError(f"Host capability descriptor is unavailable for {normalized_name}")
+        raise ToolAuthorizationError(f"Host capability descriptor is unavailable for {normalized_name}", code="descriptor_unavailable")
     descriptor_status = str(raw_descriptor.get("status", "ready"))
     if descriptor_status != "ready" and not (
         descriptor_status == "legacy" and normalized_name in _LEGACY_COMPAT_TOOL_IDS
     ):
-        raise ToolAuthorizationError(f"Host capability {normalized_name} is not ready")
+        raise ToolAuthorizationError(f"Host capability {normalized_name} is not ready", code="capability_unready")
     risk_level = str(raw_descriptor.get("risk_level", "")).strip()
     if risk_level not in _RISK_RANK:
-        raise ToolAuthorizationError(f"Host capability {normalized_name} has an unknown risk effect")
+        raise ToolAuthorizationError(f"Host capability {normalized_name} has an unknown risk effect", code="unknown_risk")
     risk_ceiling = str(raw_contract.get("risk_level", "none") or "none").strip()
     if _RISK_RANK[risk_level] > _RISK_RANK.get(risk_ceiling, -1):
         raise ToolAuthorizationError(
-            f"Capability lease denied {risk_level} tool {normalized_name}; risk ceiling is {risk_ceiling}"
+            f"Capability lease denied {risk_level} tool {normalized_name}; risk ceiling is {risk_ceiling}",
+            code="risk_ceiling",
         )
 
     max_calls = raw_contract.get("max_tool_budget", 32)
     try:
         normalized_max_calls = max(0, min(32, int(max_calls)))
     except (TypeError, ValueError) as error:
-        raise ToolAuthorizationError("Task contract tool-call budget is malformed") from error
+        raise ToolAuthorizationError("Task contract tool-call budget is malformed", code="malformed_budget") from error
     if int(call_count) >= normalized_max_calls:
-        raise ToolAuthorizationError("Task contract tool-call budget is exhausted")
+        raise ToolAuthorizationError("Task contract tool-call budget is exhausted", code="budget_exhausted")
 
     approval_required = bool(raw_contract.get("requires_plan", False)) and risk_level != "read_only"
     approval_required = approval_required or risk_level == "high"
     if approval_required and (
         approval_token is None or approval_token.request_id != current_request_id
     ):
-        raise ToolAuthorizationError(f"Tool {normalized_name} requires an approved plan for this request")
+        raise ToolAuthorizationError(f"Tool {normalized_name} requires an approved plan for this request", code="approval_required")
 
     return ToolAuthorizationDecision(
         allowed=True,
@@ -149,6 +156,7 @@ def authorize_tool_call(
         request_id=current_request_id,
         risk_level=risk_level,
         idempotent=bool(raw_descriptor.get("idempotent", False)),
+        approval_required=approval_required,
     )
 
 

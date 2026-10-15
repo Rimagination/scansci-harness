@@ -14,6 +14,12 @@ ScanSci 主程序和本地模型推理栈具有不同的更新频率。界面、
 
 轻量包的硬约束是：**先有可用运行时，再允许下载依赖该运行时的模型；下载完成后校验并启用。** 资料接入只建立文档与基础关键词索引，绝不偷偷下载大模型。这样用户不会出现“已经下载模型但程序无法运行”的状态。
 
+## Electron 迁移候选
+
+Electron 主进程负责桌面窗口、受限原生桥接和独立网页视图；Python `electron_backend.py` 继续提供现有科研 API。源码预览运行 `npm run desktop:electron`，Electron 二进制为开发依赖。候选 Windows 目录包运行 `.\scripts\build_electron.ps1 -ReleasePublicKey <官方 Ed25519 公钥>`：先构建不带 pywebview/Node executable 的 `ScanSciBackend.exe`，再把它和 Electron 壳打入 `dist-electron\win-unpacked`。未配置正式公钥时只运行源码预览，不制作可分发包。用户工作区仍在 `%LOCALAPPDATA%\ScanSciPi`，Electron 浏览器资料放在其 `electron` 子目录，不进入公开包或更新 ZIP。
+
+这一路线会把 Chromium 随桌面包一起分发，包体和主程序更新量需要重新测量；Electron 内置 Node 目前只用于桌面主进程，Pi sidecar 仍按现有独立 Node 组件契约运行。完整 ZIP、64 KiB blockmap、签名和全包回退继续沿用现有协议。现阶段 Electron 候选仅供源码/内部预览；自动安装更新、签名、安装/卸载和正式包视觉证据通过发布门禁后，才能替代 pywebview 公开包。
+
 ## 日常开发
 
 日常修改直接运行源码和针对性测试，不打包：
@@ -89,7 +95,7 @@ python -m pip install -e ".[desktop,local-gpu,rerank]"
 
 ```powershell
 python .\scripts\verify_update_channel.py `
-  --manifest-url https://github.com/Rimagination/scansci-pi/releases/latest/download/stable.json `
+  --manifest-url https://github.com/Rimagination/scansci-harness/releases/latest/download/stable.json `
   --expected-version 0.4.0
 ```
 
@@ -145,6 +151,20 @@ python .\scripts\verify_update_channel.py `
 模型存在于磁盘不等于可用。只有隔离环境真实完成“加载指定模型并产生非空回复”的兼容性探测后，才能标记 `ready=true` 与 `runtime_compatible=true`。探测必须离线复用已经安装的组件、用户模型目录和 Hugging Face 缓存；不得为了重新检测而下载模型。待验证、加载失败或生成失败的模型仍可显示“文件已存在”，但必须明确显示为未就绪，不能进入正常模型选择列表或被自动路由使用。
 
 流式生成过程中如果模型子进程异常退出，守护进程应保留已经发送的 token，随后发送明确的错误事件和结束事件，并把运行时降级状态写入健康检查。下一次请求可以重启新的模型子进程，不需要重启主程序或重新安装组件。
+
+### 本机主力模型推荐
+
+“设置 → 本地模型”在模型市场之前只展示一个本机助手推荐。Host 离线读取系统内存、NVIDIA 显存和已明确配置的 Ollama 模型目录剩余空间；未知显卡按保守档处理。当前首批目录为 `qwen3.5:9b`、`qwen3.5:4b` 和 `qwen3.5:2b` 的 Ollama 四位量化版本：显存至少 12 GB 且内存至少 16 GB 时推荐 9B，显存至少 5 GB 或内存至少 24 GB 时推荐 4B，其余内存至少 8 GB 时推荐 2B。4B 在 8 GB 显存设备上以 32K 上下文完成 Pi 检索、Word 和 PPT 连续任务，Ollama 显示 100% GPU、约 4.2 GB 占用；9B 与 2B 仍从 16K 开始。模型标称的 256K 窗口不作为本机可用窗口承诺。空间不足时停止推荐下载。
+
+上述 Ollama 目录只针对已经运行本机 Ollama 的用户。新用户的默认路径是 ScanSci 独立的 `local-transformers` 组件；设置页不得为了获得“主力模型”引导其另装 Ollama。当前内置对话接口只返回文本，没有完整的 Pi 工具调用响应，因此不能把它宣传为已可承担主力模型。内置主力模型进入自动推荐前，必须同时验证量化权重在目标 Windows 内存/页面文件条件下加载、16K Pi 任务、工具调用、证据引用和故障隔离；已有 Ollama 模型继续作为可选连接复用。
+
+Host 与 Pi 的 `model-runtime` 元数据接受明确声明的 16K 及以上窗口，并对 16K–32K 采用较小的输入、输出和压缩预算；无法识别的窗口仍保守回退到 32K。Ollama 原生适配中的 `num_ctx` 必须使用同一声明值；4B 预设明确声明 32K。
+
+普通对话沿用 Ollama 的 OpenAI 兼容接口，其上下文取运行时当前默认值；该接口目前不接受请求级 `num_ctx`，所以界面只把预设窗口标为 Pi 任务上下文，不能承诺普通对话也已获得同样窗口。
+
+推荐只对已有 Ollama 用户提供显式安装入口。未连接 Ollama 时显示内置主力能力的真实状态，不请求安装第三方运行时，也不改变 `local-transformers` 服务 ASR、视觉、检索和重排的默认路线。推荐安装只连接本机回环 Ollama，支持用户设置的端口；下载器与状态检测必须指向同一实例，地址在当前进程中变更时要求重启应用后再安装。模型下载完成仅表示文件存在。用户点击“验证并设为主力”后，Host 必须经实际使用的 OpenAI 兼容对话接口完成加载、简短证据引用和一次工具调用，再以 Ollama 原生接口按 `num_ctx=16384` 完成生成探测；任一步失败均保留原来的 `active_model` 和角色映射。Ollama Qwen3.5 的普通请求通过 `reasoning_effort: none` 关闭隐式长思考，显式思考请求才开启；Pi 的 Ollama 原生适配遵守同一选择。通过后一次性把对话、任务、写作、演示映射到该模型，原有模型仍保留。
+
+社区微调、蒸馏和量化版本可以进入实验候选。它们的来源、基础模型、量化格式、许可与版本必须可追溯；作者自报指标只作为候选发现依据。要进入自动主力推荐，还需在 ScanSci 的中文科研问答、证据引用、工具调用和速度用例中与同尺寸官方基线比较，记录失败样例。已安装模型页同时展示 Hugging Face 快照和 Ollama 清单，所以用户已有的 `qwen3.8-4b-distill` 可见且保持可手选；清单中的“已安装”不代表已通过主力模型探测。
 
 ## 正式发行
 

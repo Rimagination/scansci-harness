@@ -5,7 +5,7 @@ import importlib
 import math
 import os
 import re
-from typing import Any
+from typing import Any, Callable
 from typing import Protocol
 
 import requests
@@ -76,6 +76,7 @@ class OpenAICompatibleEmbeddingProvider:
         session: Any | None = None,
         dimensions: int = 0,
         cache_namespace: str = "openai-compatible",
+        authorization_check: Callable[[], None] | None = None,
     ) -> None:
         if not base_url:
             raise ValueError("base_url is required for openai-compatible embeddings")
@@ -88,6 +89,7 @@ class OpenAICompatibleEmbeddingProvider:
         self.model = model
         self.timeout = float(timeout)
         self.session = session or requests.Session()
+        self.authorization_check = authorization_check
         self.dimensions = max(0, int(dimensions or 0))
         self.device = "remote"
         # The key deliberately excludes the credential.  A dimension suffix
@@ -140,6 +142,8 @@ class OpenAICompatibleEmbeddingProvider:
         return vectors
 
     def _embed_batch(self, texts: list[str]) -> list[list[float]]:
+        if self.authorization_check:
+            self.authorization_check()
         payload = {"model": self.model, "input": texts}
         if self.dimensions > 0:
             payload["dimensions"] = self.dimensions
@@ -151,7 +155,10 @@ class OpenAICompatibleEmbeddingProvider:
             },
             json=payload,
             timeout=self.timeout,
+            allow_redirects=False,
         )
+        if 300 <= getattr(response, "status_code", 200) < 400:
+            raise RuntimeError("Embedding provider redirected the request")
         response.raise_for_status()
         payload = response.json()
         rows = list(payload.get("data", []) or [])
@@ -183,6 +190,7 @@ class SiliconFlowEmbeddingProvider(OpenAICompatibleEmbeddingProvider):
         dimensions: int = 0,
         timeout: float = 30.0,
         session: Any | None = None,
+        authorization_check: Callable[[], None] | None = None,
     ) -> None:
         requested_dimensions = int(dimensions or 0)
         resolved_dimensions = requested_dimensions or _default_siliconflow_embedding_dimensions(model)
@@ -194,6 +202,7 @@ class SiliconFlowEmbeddingProvider(OpenAICompatibleEmbeddingProvider):
             session=session,
             dimensions=resolved_dimensions,
             cache_namespace="siliconflow",
+            authorization_check=authorization_check,
         )
 
 
@@ -277,6 +286,7 @@ def build_embedding_provider(
     batch_size: int = 32,
     max_seq_length: int = 0,
     device: str | None = None,
+    authorization_check: Callable[[], None] | None = None,
 ) -> EmbeddingProvider:
     name = (provider or "local").strip().lower()
     if name in {"local", "hashing", "hash"}:
@@ -290,6 +300,7 @@ def build_embedding_provider(
             api_key=resolved_api_key,
             model=resolved_model,
             dimensions=0,
+            authorization_check=authorization_check,
         )
     if name in {"siliconflow", "silicon-flow"}:
         resolved_base_url = base_url or "https://api.siliconflow.cn/v1"
@@ -308,6 +319,7 @@ def build_embedding_provider(
             api_key=resolved_api_key,
             model=resolved_model,
             dimensions=resolved_dimensions,
+            authorization_check=authorization_check,
         )
     if name in {"sentence-transformers", "sentence_transformers", "sbert"}:
         resolved_model = (

@@ -86,7 +86,7 @@ def test_write_evidence_html_injects_sentence_anchors_without_overwriting_source
     assert style is not None
     style_text = style.get_text()
     assert "[data-evidence-id]:target" in style_text
-    assert "#caff4d" in style_text
+    assert "#79f2a6" in style_text
     assert "outline: none" in style_text
     assert "box-shadow: none" in style_text
     assert "#2457a6" not in style_text

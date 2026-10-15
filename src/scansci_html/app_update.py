@@ -28,7 +28,7 @@ from .release_transport import open_release_url, validate_release_url
 APP_VERSION = "0.4.2"
 UPDATE_MANIFEST_ENV = "SCANSCI_UPDATE_MANIFEST_URL"
 RELEASE_PUBLIC_KEY_ENV = "SCANSCI_RELEASE_PUBLIC_KEY"
-DEFAULT_UPDATE_MANIFEST_URL = "https://github.com/Rimagination/scansci-pi/releases/latest/download/stable.json"
+DEFAULT_UPDATE_MANIFEST_URL = "https://github.com/Rimagination/scansci-harness/releases/latest/download/stable.json"
 _USER_AGENT = f"ScanSci/{APP_VERSION} Windows"
 _MAX_MANIFEST_BYTES = 1_000_000
 _MAX_UPDATE_DOWNLOAD_BYTES = 2 * 1024**3

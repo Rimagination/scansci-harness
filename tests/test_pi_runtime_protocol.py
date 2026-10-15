@@ -514,7 +514,7 @@ def test_sidecar_starts_bootstrap_only_then_additively_activates_an_authorized_t
                 "risk_level": "read_only",
                 "allowed_tools": ["inspect_workspace", "search_web"],
                 "initial_tools": [],
-                "required_tool_groups": [],
+                "required_tool_groups": [["inspect_workspace"]],
                 "initial_tool_budget": 3,
                 "max_tool_budget": 6,
             },

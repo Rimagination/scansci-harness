@@ -274,19 +274,21 @@ def test_presentation_follow_up_route_targets_the_existing_run(tmp_path: Path, m
     )
     captured: dict[str, object] = {}
 
-    def continue_run(run_id: str, payload: dict[str, object]) -> dict[str, object]:
-        captured.update({"run_id": run_id, "payload": payload})
+    def continue_run(run_id: str, payload: dict[str, object], *, effect_scope: str) -> dict[str, object]:
+        captured.update({"run_id": run_id, "payload": payload, "effect_scope": effect_scope})
         return {"run": app.research_agent.store.get_run(run_id), "message": {"role": "assistant", "content": "Kept together."}}
 
     monkeypatch.setattr(app.research_agent, "continue_run_conversation", continue_run)
     response = app.dispatch(
         "POST",
         f"/api/runs/{run['run_id']}/messages",
-        json.dumps({"content": "What does slide 3 mean?"}).encode("utf-8"),
+        json.dumps({"content": "What does slide 3 mean?", "idempotency_key": "deck-followup-1"}).encode("utf-8"),
     )
 
-    assert response.status == 200
-    assert captured == {"run_id": run["run_id"], "payload": {"content": "What does slide 3 mean?"}}
+    assert response.status == 200, response.body.decode("utf-8")
+    assert captured["run_id"] == run["run_id"]
+    assert captured["payload"] == {"content": "What does slide 3 mean?", "idempotency_key": "deck-followup-1"}
+    assert len(str(captured["effect_scope"])) == 64
     assert "data-action=\"save-presentation\"" in app_js
     assert "重新排版导出" in app_js
 

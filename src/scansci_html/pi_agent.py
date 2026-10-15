@@ -24,6 +24,7 @@ import requests
 import select
 import shutil
 import socket
+import sqlite3
 import subprocess
 import sys
 from tempfile import NamedTemporaryFile
@@ -92,9 +93,12 @@ from .run_manifest import RunManifest
 from .task_contract import TaskContract
 from .tool_authorization import (
     ApprovalToken,
+    ToolAuthorizationError,
     approval_token_from_response,
     authorize_tool_call,
 )
+from .ollama_runtime import is_local_ollama_url, warm_ollama_chat_model
+from .tool_effect_ledger import ToolEffectLedger
 
 
 class PiRuntimeUnavailable(RuntimeError):
@@ -221,6 +225,7 @@ class _PendingToolCall:
     name: str
     arguments: dict[str, Any]
     parallel_safe: bool
+    effectful: bool = False
 
 
 @dataclass(frozen=True)
@@ -236,6 +241,7 @@ class _RunContext:
     request_id: str
     session_id: str
     generation: int
+    effect_scope: str = ""
     supports_images: bool = False
     semantic_tool_aliases: dict[str, str] = field(default_factory=dict)
     cancel_event: threading.Event = field(default_factory=threading.Event)
@@ -249,6 +255,8 @@ class _RunContext:
     parallel_in_flight: int = 0
     sequential_in_flight: bool = False
     authorized_call_count: int = 0
+    tool_call_attempt_count: int = 0
+    seen_tool_call_ids: set[str] = field(default_factory=set)
     active: bool = True
     pending_terminal: dict[str, Any] | None = None
     terminal_tool_completed: str = ""
@@ -261,6 +269,14 @@ class _RunContext:
     def has_pending_tools(self) -> bool:
         with self.lock:
             return bool(self.in_flight or self.deferred)
+
+
+def _tool_call_audit_ref(request_id: str, generation: int, call_id: str) -> str:
+    """Correlate tool events without persisting a sidecar-supplied call id."""
+
+    if not call_id:
+        return ""
+    return hashlib.sha256(f"{request_id}\0{generation}\0{call_id}".encode("utf-8")).hexdigest()[:16]
 
 
 class _ProtocolDispatcher:
@@ -1538,6 +1554,7 @@ class PiAgentClient:
         embedding_provider: Any | None = None,
         reranker: Any | None = None,
         active_run_id: str = "",
+        effect_scope: str = "",
         scientific_agent_control: Callable[[str, str, dict[str, Any]], dict[str, Any]] | None = None,
     ) -> None:
         self.workspace = Path(workspace).resolve()
@@ -1557,9 +1574,11 @@ class PiAgentClient:
         self.embedding_provider = embedding_provider
         self.reranker = reranker
         self.active_run_id = str(active_run_id or "").strip()
+        self.effect_scope = str(effect_scope or "").strip()
         self._scientific_agent_control = scientific_agent_control
         self.agent_dir = self.workspace.parent / ".scansci-pi-agent"
         self.agent_dir.mkdir(parents=True, exist_ok=True)
+        self._effect_ledger = ToolEffectLedger(self.agent_dir)
         self._process: subprocess.Popen[str] | None = None
         self._output: Queue[str | None] = Queue()
         self._process_generation = 0
@@ -2224,19 +2243,11 @@ class PiAgentClient:
             "submit_plan",
             *[str(name) for name in list(effective_contract.get("allowed_tools", []) or []) if str(name)],
         })
-        required_initial = {
-            str(name)
-            for group in list(effective_contract.get("required_tool_groups", []) or [])
-            if isinstance(group, (list, tuple, set, frozenset))
-            for name in group
-            if str(name)
-        }
         active_tools = sorted({
             "ask_user",
             "search_tools",
             "submit_plan",
             *[str(name) for name in list(effective_contract.get("initial_tools", []) or []) if str(name)],
-            *required_initial,
         } & set(registered_tools))
         tool_set = {
             "mcp_servers": [str(item.get("id", "")) for item in enabled_mcp_servers if isinstance(item, dict)],
@@ -2318,6 +2329,18 @@ class PiAgentClient:
         tool_calls = 0
         tool_failures = 0
         try:
+            if (
+                is_local_ollama_url(effective_base_url)
+                and (
+                    str(provider_kind).strip().lower() == "ollama"
+                    or str(provider_id) == "local-runtime-ollama"
+                    or str(provider_id).startswith("local-runtime-ollama-")
+                )
+            ):
+                for event in warm_ollama_chat_model(effective_base_url, model_id):
+                    if manifest is not None:
+                        manifest.record("agent.status", name=event.get("name", ""), status=event.get("status", ""))
+                    yield event
             for event in self._run_request(start_message, api_key=api_key, timeout_seconds=timeout_seconds):
                 event_type = str(event.get("type", ""))
                 if event_type == "delta" and str(event.get("content", "")) and first_visible_at is None:
@@ -2330,11 +2353,17 @@ class PiAgentClient:
                     tool_calls += 1
                     tool_failures += 1
                 if manifest is not None:
-                    manifest.record(
-                        f"agent.{event_type or 'event'}",
-                        name=event.get("name", ""),
-                        status=event.get("status", ""),
-                    )
+                    audit = {"name": event.get("name", ""), "status": event.get("status", "")}
+                    if event_type in {"tool.authorization", "tool.completed", "tool.failed"}:
+                        audit.update({
+                            key: event[key]
+                            for key in (
+                                "request_id", "call_ref", "contract_id", "lease_schema_version",
+                                "risk_level", "idempotent", "decision", "rule", "approval",
+                            )
+                            if key in event
+                        })
+                    manifest.record(f"agent.{event_type or 'event'}", **audit)
                     if event_type in {"done", "session_stats"}:
                         stats = event.get("stats") or event.get("value")
                         if isinstance(stats, dict):
@@ -2544,17 +2573,29 @@ class PiAgentClient:
         pending: _PendingToolCall,
     ) -> _ToolCompletion:
         self._worker_context.run_context = context
+        arguments = dict(pending.arguments)
+        if pending.effectful:
+            arguments.pop("_scansci_idempotency_key", None)
+        effect_key = ""
         try:
             if context.cancel_event.is_set():
                 raise InterruptedError("Pi tool execution was cancelled before it started")
-            result = self._execute_tool(pending.name, dict(pending.arguments))
+            if pending.effectful:
+                effect_key, admitted = self._effect_ledger.claim(
+                    context.effect_scope or context.request_id, context.request_id, pending.name, arguments,
+                )
+                if not admitted:
+                    effect_key = ""
+                    raise RuntimeError("Pi effect already started for this request; inspect the existing result before retrying")
+                if context.cancel_event.is_set():
+                    raise InterruptedError("Pi tool execution was cancelled before effect dispatch")
+            result = self._execute_tool(pending.name, arguments)
+            if effect_key:
+                self._effect_ledger.complete(effect_key)
             if context.cancel_event.is_set():
                 raise InterruptedError("Pi tool execution was cancelled")
-            retried = _retry_empty_search(
-                pending.name,
-                pending.arguments,
-                result,
-                executor=self._execute_tool,
+            retried = None if pending.effectful else _retry_empty_search(
+                pending.name, arguments, result, executor=self._execute_tool,
             )
             if retried is not None:
                 result = retried
@@ -2563,17 +2604,23 @@ class PiAgentClient:
                 generation=context.generation,
                 call_id=pending.call_id,
                 name=pending.name,
-                arguments=dict(pending.arguments),
+                arguments=arguments,
                 parallel_safe=pending.parallel_safe,
                 result=result,
             )
         except Exception as error:  # noqa: BLE001 - serialized on the owning event thread
+            if effect_key:
+                try:
+                    self._effect_ledger.uncertain(effect_key)
+                except sqlite3.Error:
+                    # The durable running claim still blocks another execution.
+                    pass
             return _ToolCompletion(
                 request_id=context.request_id,
                 generation=context.generation,
                 call_id=pending.call_id,
                 name=pending.name,
-                arguments=dict(pending.arguments),
+                arguments=arguments,
                 parallel_safe=pending.parallel_safe,
                 error_type=type(error).__name__,
                 error=str(error),
@@ -2734,6 +2781,8 @@ class PiAgentClient:
                 self._tool_result_commit_checkpoint("after_error_wire", context, completion)
             return {
                 "type": "tool.failed",
+                "request_id": context.request_id,
+                "call_ref": _tool_call_audit_ref(context.request_id, context.generation, completion.call_id),
                 "name": completion.name,
                 "error": public_error,
                 **({"capability_id": semantic_capability} if semantic_capability else {}),
@@ -2837,11 +2886,14 @@ class PiAgentClient:
                 })
                 wire_committed = True
                 with context.history_lock:
-                    context.history.append({
+                    history_entry = {
                         "name": completion.name,
                         "status": "ok",
                         "result_summary": _summarize_tool_result(completion.name, model_result),
-                    })
+                    }
+                    if completion.name == "search_local_evidence" and isinstance(completion.result, dict):
+                        history_entry["evidence_hit_count"] = len(completion.result.get("hits", []) or [])
+                    context.history.append(history_entry)
                 self._tool_result_commit_checkpoint("after_wire", context, completion)
         finally:
             if prepared is not None and not wire_committed:
@@ -2856,6 +2908,8 @@ class PiAgentClient:
             })
         return {
             "type": "tool.completed",
+            "request_id": context.request_id,
+            "call_ref": _tool_call_audit_ref(context.request_id, context.generation, completion.call_id),
             "name": completion.name,
             **({"capability_id": semantic_capability} if semantic_capability else {}),
             "result": model_result,
@@ -2966,6 +3020,7 @@ class PiAgentClient:
                 request_id=request_id,
                 session_id=session_id,
                 generation=self._request_generation,
+                effect_scope=self.effect_scope or request_id,
                 supports_images="image" in set(
                     dict(start_message.get("model_runtime", {}) or {}).get("input_modalities", [])
                 ),
@@ -3103,24 +3158,54 @@ class PiAgentClient:
                     call_id = str(event.get("call_id", ""))
                     name = str(event.get("name", ""))
                     arguments = dict(event.get("arguments", {}) or {})
+                    descriptor = builtin_capability_descriptor(name)
+                    lease = task_contract.get("capability_lease")
+                    approval_token = self._approval_tokens.get(request_id)
+                    context.tool_call_attempt_count += 1
+                    audit_call_id = (
+                        call_id if call_id and call_id not in context.seen_tool_call_ids
+                        else f"rejected\0{context.tool_call_attempt_count}\0{call_id}"
+                    )
+                    authorization_audit = {
+                        "type": "tool.authorization",
+                        "request_id": request_id,
+                        "call_ref": _tool_call_audit_ref(request_id, context.generation, audit_call_id),
+                        "name": name[:120],
+                        "contract_id": str(task_contract.get("contract_id", ""))[:120],
+                        "lease_schema_version": str(lease.get("schema_version", ""))[:80] if isinstance(lease, dict) else "",
+                        "risk_level": str((descriptor or {}).get("risk_level", ""))[:32],
+                        "idempotent": (descriptor or {}).get("idempotent"),
+                    }
                     try:
+                        if not call_id:
+                            raise ToolAuthorizationError("Pi tool call has no call id", code="missing_call_id")
+                        if call_id in context.seen_tool_call_ids:
+                            raise ToolAuthorizationError("Pi tool call id was reused in this request", code="duplicate_call_id")
+                        context.seen_tool_call_ids.add(call_id)
                         # Tool calls are executable protocol messages, so an
                         # omitted request id is not accepted as a legacy event.
                         # The Python host independently rechecks every bridge
                         # call before entering the dispatcher.
-                        authorize_tool_call(
+                        decision = authorize_tool_call(
                             tool_name=name,
                             contract=task_contract,
-                            descriptor=builtin_capability_descriptor(name),
+                            descriptor=descriptor,
                             request_id=event_request_id,
                             active_request_id=request_id,
-                            approval_token=self._approval_tokens.get(request_id),
+                            approval_token=approval_token,
                             call_count=context.authorized_call_count,
                         )
+                        yield {
+                            **authorization_audit,
+                            "risk_level": decision.risk_level,
+                            "idempotent": decision.idempotent,
+                            "decision": "allow",
+                            "rule": "authorized",
+                            "approval": "approved" if decision.approval_required else "not_required",
+                        }
                         context.authorized_call_count += 1
                         if context.cancel_event.is_set():
                             raise InterruptedError("Pi tool execution was cancelled before it started")
-                        descriptor = builtin_capability_descriptor(name)
                         parallel_safe = (
                             name in _PARALLEL_SAFE_TOOL_NAMES
                             and isinstance(descriptor, dict)
@@ -3132,9 +3217,21 @@ class PiAgentClient:
                             name=name,
                             arguments=arguments,
                             parallel_safe=parallel_safe,
+                            effectful=decision.risk_level != "read_only",
                         ))
                         continue
                     except Exception as error:  # noqa: BLE001 - error is returned to the model as tool output
+                        if isinstance(error, ToolAuthorizationError):
+                            yield {
+                                **authorization_audit,
+                                "decision": "deny",
+                                "rule": error.code,
+                                "approval": (
+                                    "required" if error.code == "approval_required"
+                                    else "approved" if approval_token and approval_token.request_id == request_id
+                                    else "not_checked"
+                                ),
+                            }
                         public_error = str(_redact_tool_value(str(error)))[:500]
                         with context.history_lock:
                             context.history.append({
@@ -3149,7 +3246,11 @@ class PiAgentClient:
                             "ok": False,
                             "error": f"{type(error).__name__}: {public_error}",
                         }
-                        yield {"type": "tool.failed", "name": name, "error": public_error}
+                        yield {
+                            "type": "tool.failed", "request_id": request_id,
+                            "call_ref": authorization_audit["call_ref"],
+                            "name": name, "error": public_error,
+                        }
                     self._write(response)
                     continue
                 if event_type == "session.ready":
@@ -3167,6 +3268,8 @@ class PiAgentClient:
                     }
                 elif event_type == "message.delta":
                     yield {"type": "delta", "content": str(event.get("delta", ""))}
+                elif event_type == "message.reasoning_delta":
+                    yield {"type": "reasoning", "content": str(event.get("delta", ""))}
                 elif event_type == "status.update":
                     yield {
                         "type": "status",
@@ -4786,6 +4889,83 @@ class PiAgentClient:
             **({"knowledge_scope": scope_summary} if scope_summary is not None else {}),
         }
 
+    def _check_cited_artifact_years(self, name: str, arguments: dict[str, Any]) -> None:
+        """Reject source-date years absent from cited local documents before writing."""
+
+        blocks = ["\n".join([str(arguments.get("title", "")), str(arguments.get("content", ""))])]
+        if name == "create_presentation":
+            blocks = [str(arguments.get("title", "")), str(arguments.get("subtitle", ""))] + [
+                "\n".join([
+                    str(slide.get("title", "")),
+                    *([str(bullet) for bullet in slide.get("bullets", []) or []]
+                      or [str(slide.get("content", ""))]),
+                ])
+                for slide in arguments.get("slides", []) or []
+                if isinstance(slide, dict)
+            ]
+        evidence_id_pattern = re.compile(r"(?<![\w./])[\w./-]{1,160}\.s\d{4,8}(?!\w)")
+        cited_ids = set(evidence_id_pattern.findall("\n".join(blocks)))
+        context = getattr(self._worker_context, "run_context", None)
+        used_local_evidence = False
+        if context is not None:
+            with context.history_lock:
+                used_local_evidence = any(
+                    item.get("name") == "search_local_evidence"
+                    and item.get("status") == "ok"
+                    and int(item.get("evidence_hit_count", 0) or 0) > 0
+                    for item in context.history
+                )
+        if used_local_evidence and not cited_ids:
+            raise ValueError("已检索本地证据；请在产物中加入检索结果的完整 evidence_id 后重试。")
+        if not cited_ids:
+            return
+
+        # ponytail: This catches unsupported source years, not every possible factual claim;
+        # use claim-level verification if artifact tools later promise complete fact checking.
+        source_date = re.compile(
+            r"\b(?:measur\w*|sampl\w*|collect\w*|survey\w*|observ\w*|conduct\w*|"
+            r"study date|experiment\w*|fieldwork)\b|"
+            r"测量|采样|采集|调查|观测|实验|研究时间|研究日期",
+            re.IGNORECASE,
+        )
+        year_pattern = re.compile(r"(?<!\d)(?:18|19|20)\d{2}(?!\d)")
+        cited_sources: dict[str, list[str]] = {}
+        for database in self.evidence_dbs:
+            if not database.is_file():
+                continue
+            connection = None
+            try:
+                connection = sqlite3.connect(f"{database.as_uri()}?mode=ro", uri=True)
+                for evidence_id in cited_ids:
+                    row = connection.execute(
+                        "select text from evidence_spans where evidence_id = ?", (evidence_id,)
+                    ).fetchone()
+                    if row:
+                        cited_sources.setdefault(evidence_id, []).append(str(row[0]))
+            except sqlite3.Error:
+                continue
+            finally:
+                if connection is not None:
+                    connection.close()
+        if used_local_evidence and cited_ids - cited_sources.keys():
+            raise ValueError("产物引用的 evidence_id 不在当前本地证据库中；请使用检索结果中的完整编号。")
+        if not cited_sources:
+            return
+
+        for block in blocks:
+            block_ids = set(evidence_id_pattern.findall(block)) & cited_sources.keys()
+            sources = [source for evidence_id in (block_ids or cited_sources.keys()) for source in cited_sources[evidence_id]]
+            for line in block.splitlines():
+                if not source_date.search(line):
+                    continue
+                cleaned = evidence_id_pattern.sub("", line)
+                for year in set(year_pattern.findall(cleaned)):
+                    if not any(year in year_pattern.findall(source) for source in sources):
+                        raise ValueError(
+                            f"引用的本地证据中没有 {year} 年的测量或采集记录；"
+                            "请删除该年份或引用明确记载它的来源。"
+                        )
+
     def _execute_tool(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         if name in {"subagent", "list_subagents", "collect_subagents", "cancel_subagents"}:
             raise PermissionError("Generic subagents require the native Pi runtime")
@@ -4816,6 +4996,8 @@ class PiAgentClient:
             plugin = next((item for item in plugins if str(item.get("id", "")) == plugin_id), None)
             if not plugin or not plugin.get("enabled") or plugin.get("uninstalled"):
                 raise PermissionError(f"Built-in plugin is disabled: {plugin_id}")
+            if name in {"create_document", "create_pdf", "create_presentation"}:
+                self._check_cited_artifact_years(name, arguments)
             return execute_artifact_tool(name, arguments, workspace=self.workspace)
         if name == "generate_image":
             return generate_image_artifact(arguments, workspace=self.workspace)

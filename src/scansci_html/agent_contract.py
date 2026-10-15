@@ -280,6 +280,8 @@ def _mode_parts(task_mode: str) -> set[str]:
 def _budgets(parts: set[str], *, risk_level: str) -> tuple[int, int, int]:
     if parts & {"research", "slides"}:
         initial, maximum = 6, 12
+    elif "agent" in parts:
+        initial, maximum = 6, 16
     elif parts & {"knowledge", "task-documents"}:
         initial, maximum = 5, 10
     elif parts & {"web", "web-auto"}:
@@ -303,6 +305,8 @@ def _model_token_budgets(parts: set[str]) -> tuple[int, int]:
 
     if parts & {"research", "slides"}:
         return 192_000, 768_000
+    if "agent" in parts:
+        return 128_000, 512_000
     if parts & {"knowledge", "task-documents"}:
         return 128_000, 512_000
     if parts & {"web", "web-auto"}:
@@ -339,7 +343,7 @@ def classify_task_profile(
         if group
     ]
 
-    social_turn = bool(_GREETING_PATTERN.fullmatch(normalized_text))
+    social_turn = "agent" not in parts and bool(_GREETING_PATTERN.fullmatch(normalized_text))
     high_risk = bool(_HIGH_RISK_PATTERN.search(normalized_text))
     reversible = bool(
         parts & {"research", "slides", "image"}
@@ -353,6 +357,7 @@ def classify_task_profile(
     elif reversible:
         risk_level = "reversible"
     elif required or parts & {
+        "agent",
         "knowledge",
         "task-documents",
         "web",
@@ -379,6 +384,7 @@ def classify_task_profile(
     requires_tools = not social_turn and bool(
         required
         or parts & {
+            "agent",
             "knowledge",
             "task-documents",
             "web",
@@ -552,8 +558,6 @@ def compile_task_contract(
     initial: set[str] = set()
     for part in parts:
         initial.update(_MODE_INITIAL_TOOLS.get(part, set()))
-    for group in required:
-        initial.update(group)
     initial.intersection_update(allowed)
     success = ["Return a direct answer to the user's final request"]
     if required:

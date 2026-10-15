@@ -35,7 +35,7 @@ from .academic_search import (
     search_openalex_author_works,
 )
 from .agent_capabilities import capability_catalog
-from .app_settings import get_provider_api_key, load_settings
+from .app_settings import _is_strata_loopback_url, get_provider_api_key, load_settings
 from .jev_client import DEFAULT_ENDPOINT as JEV_DEFAULT_ENDPOINT, DEFAULT_MODEL as JEV_DEFAULT_MODEL, JEVError, ask_jev
 from .retrieval_intent import compile_retrieval_intent
 from .slides_templates import get_slide_template, resolve_slide_template_dir
@@ -634,17 +634,141 @@ def fetch_provider_models(
 
 
 def test_local_model_connection(local_model: dict[str, Any], *, timeout: float = 4.0) -> dict[str, Any]:
-    runtime = str(local_model.get("runtime", ""))
+    runtime = str(local_model.get("runtime", "")).strip().lower()
     if runtime == "builtin":
         return {"ok": True, "status": "ready", "latency_ms": 0, "models": [str(local_model.get("model_id", ""))]}
     base_url = str(local_model.get("base_url", "")).strip().rstrip("/")
     if not base_url:
         raise ValueError("本地服务地址尚未配置")
+    if runtime == "strata":
+        base_url = _strata_api_base(base_url)
     started = time.perf_counter()
-    payload = _request_json(f"{base_url}/models", timeout=timeout)
+    try:
+        if runtime == "strata":
+            health = _request_json(f"{base_url[:-3]}/health", timeout=timeout)
+            if not isinstance(health, dict) or "loaded" not in health:
+                return {"ok": False, "status": "unavailable", "models": [], "error": "该地址没有返回 Strata 健康信息；请确认端口。"}
+            if health.get("loaded") is not True:
+                return {"ok": False, "status": "loading", "models": [], "error": "Strata 已响应，但模型尚未加载完成。"}
+        payload = _request_json(f"{base_url}/models", timeout=timeout)
+    except RuntimeError as exc:
+        if runtime != "strata":
+            raise
+        reason = str(exc).casefold()
+        if "timed out" in reason or "timeout" in reason:
+            message = "Strata 本机连接超时；请确认服务已启动、模型已加载且端口正确。"
+        elif "refused" in reason or "拒绝" in reason:
+            message = "Strata 本机端口拒绝连接；请先启动 Strata。"
+        elif "http 401" in reason or "http 403" in reason:
+            message = "Strata 要求 API Key；当前本机连接尚未配置该密钥。"
+        else:
+            message = f"Strata 本机连接失败：{str(exc).replace('远程服务', '本机服务')[:300]}"
+        return {"ok": False, "status": "unavailable", "models": [], "error": message}
     rows = payload.get("data", []) if isinstance(payload, dict) else []
-    model_ids = [str(item.get("id", "")) for item in rows[:20] if isinstance(item, dict)] if isinstance(rows, list) else []
-    return {"ok": True, "status": "connected", "latency_ms": round((time.perf_counter() - started) * 1000), "models": model_ids}
+    model_ids = [str(item.get("id", "")).strip() for item in rows[:20] if isinstance(item, dict) and str(item.get("id", "")).strip()] if isinstance(rows, list) else []
+    if runtime == "strata" and not model_ids:
+        return {"ok": False, "status": "unavailable", "models": [], "error": "Strata 已加载，但没有返回可用模型。"}
+    return {
+        "ok": True, "status": "connected", "latency_ms": round((time.perf_counter() - started) * 1000),
+        "models": model_ids, **({"max_context": health.get("max_context")} if runtime == "strata" else {}),
+    }
+
+
+def _strata_api_base(value: str) -> str:
+    """Strata is a keyless local route; never send its probes to a remote host."""
+
+    if not _is_strata_loopback_url(value):
+        raise ValueError("Strata 地址须为本机 HTTP 地址，例如 http://127.0.0.1:8080/v1")
+    return str(value).strip().rstrip("/")
+
+
+def probe_strata_agent_model(base_url: str, model_id: str, *, timeout: float = 180.0) -> dict[str, Any]:
+    """Exercise the streaming evidence and tool contracts before routing Pi."""
+
+    base_url = _strata_api_base(base_url)
+    model_id = str(model_id or "").strip()
+    if not model_id:
+        raise ValueError("请选择 Strata 返回的模型")
+    evidence_request = {
+        "model": model_id, "stream": True, "reasoning_effort": "none", "temperature": 0, "max_tokens": 128,
+        "messages": [
+            {"role": "system", "content": "只根据给定证据作答，并保留证据编号。"},
+            {"role": "user", "content": "证据 [E1]：样地 A 有 12 株乔木。样地 A 有多少株乔木？请简短回答并引用 [E1]。"},
+        ],
+    }
+    req = request.Request(
+        f"{base_url}/chat/completions",
+        data=json.dumps(evidence_request, ensure_ascii=False).encode("utf-8"),
+        headers={"Accept": "text/event-stream", "Content-Type": "application/json"},
+        method="POST",
+    )
+    chunks: list[str] = []
+    complete = False
+    try:
+        with request.urlopen(req, timeout=timeout) as response:
+            for raw_line in response:
+                line = raw_line.decode("utf-8").strip()
+                if not line.startswith("data:"):
+                    continue
+                data = line[5:].strip()
+                if data == "[DONE]":
+                    complete = True
+                    break
+                try:
+                    event = json.loads(data)
+                except json.JSONDecodeError as exc:
+                    raise RuntimeError("Strata 流式响应格式无效") from exc
+                if isinstance(event, dict) and event.get("error"):
+                    raise RuntimeError("Strata 流式回答返回错误")
+                choices = event.get("choices") if isinstance(event, dict) else None
+                delta = choices[0].get("delta") if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+                delta = delta if isinstance(delta, dict) else {}
+                chunks.append(str(delta.get("content") or ""))
+                if len(chunks) > 2048:
+                    raise RuntimeError("Strata 流式回答超过预检上限")
+    except error.HTTPError as exc:
+        raise RuntimeError(f"Strata 流式接口返回 HTTP {exc.code}") from exc
+    except error.URLError as exc:
+        raise RuntimeError(f"无法连接 Strata 流式接口：{exc.reason}") from exc
+    if not complete:
+        raise RuntimeError("Strata 流式回答未正常结束")
+    answer = "".join(chunks)
+    if not re.search(r"(?<!\d)12(?!\d)", answer) or "[E1]" not in answer:
+        raise RuntimeError("Strata 已响应，但证据引用预检未通过")
+    tool = _request_json(
+        f"{base_url}/chat/completions",
+        method="POST",
+        data={
+            "model": model_id, "stream": False, "reasoning_effort": "none", "max_tokens": 128,
+            "messages": [
+                {"role": "system", "content": "回答前必须先调用 lookup_evidence 工具。"},
+                {"role": "user", "content": "请调用 lookup_evidence 查询编号 E1。"},
+            ],
+            "tools": [{"type": "function", "function": {
+                "name": "lookup_evidence", "description": "按编号读取证据。",
+                "parameters": {"type": "object", "properties": {"id": {"type": "string"}}, "required": ["id"]},
+            }}],
+        },
+        timeout=timeout,
+    )
+    choices = tool.get("choices") if isinstance(tool, dict) else None
+    message = choices[0].get("message") if isinstance(choices, list) and choices and isinstance(choices[0], dict) else {}
+    calls = message.get("tool_calls") or [] if isinstance(message, dict) else []
+    valid_call = False
+    for call in calls:
+        function = call.get("function") if isinstance(call, dict) else None
+        if not isinstance(function, dict) or function.get("name") != "lookup_evidence":
+            continue
+        try:
+            arguments = json.loads(function.get("arguments") or "")
+        except (TypeError, ValueError):
+            continue
+        if isinstance(arguments, dict) and arguments.get("id") == "E1":
+            valid_call = True
+            break
+    if not valid_call:
+        raise RuntimeError("Strata 已响应，但工具调用预检未通过")
+    return {"model_id": model_id, "stream_verified": True, "citation_verified": True, "tool_call_verified": True}
 
 
 def search_journals(query: str, *, limit: int = 8, timeout: float = 15.0) -> dict[str, Any]:

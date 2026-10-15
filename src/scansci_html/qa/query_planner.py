@@ -290,8 +290,14 @@ def _required_facets(question: str, *, question_type: str) -> list[dict[str, obj
     )
     value = re.sub(r"^(?:effects?|impact|influence)\s+(?:of|on)\s+", "", value, flags=re.IGNORECASE)
     has_cjk = bool(re.search(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff]", value))
+    impact_facets = re.search(
+        r"对(?!比)(?P<facets>[^?？。]{2,100}?)(?:的)?(?:分别)?(?:有(?:什么|哪些))?影响",
+        value,
+    ) if has_cjk else None
     cue_matches = list(_FACET_CUES.finditer(value))
-    if cue_matches:
+    if impact_facets and _FACET_SPLIT.search(impact_facets.group("facets")):
+        value = impact_facets.group("facets")
+    elif cue_matches:
         value = value[cue_matches[-1].end() :]
     elif has_cjk:
         # A Chinese question without a dimension cue (“影响”“对比”“对”…) is a

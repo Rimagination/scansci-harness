@@ -1,6 +1,15 @@
 import pytest
 
-from scansci_html.research_agent import ResearchAgentRuntime, _required_pi_tool_groups
+from scansci_html.agent_contract import compile_task_contract
+from scansci_html.research_agent import ResearchAgentRuntime, _required_pi_tool_groups, _structured_recovery
+
+
+def test_ollama_load_failure_keeps_its_specific_reason_in_chat_error() -> None:
+    failure = _structured_recovery(RuntimeError("Ollama 加载 qwen3.5:4b 失败（HTTP 500）：模型目录不可用"))
+
+    assert failure["code"] == "local_model_unavailable"
+    assert "模型目录不可用" in failure["message"]
+    assert failure["actions"][0]["id"] == "open_settings"
 
 
 def test_selected_library_routes_evidence_request_to_local_knowledge() -> None:
@@ -45,3 +54,17 @@ def test_image_request_routes_to_the_provider_neutral_image_tool(prompt: str) ->
 
     assert mode == "image"
     assert _required_pi_tool_groups(mode, prompt) == [{"generate_image"}]
+
+
+def test_explicit_agent_artifact_intent_uses_existing_reversible_lease() -> None:
+    prompt = "生成一份 docx 文档，总结两种方法"
+    routed = ResearchAgentRuntime._direct_pi_task_mode(
+        "general", "off", messages=[{"role": "user", "content": prompt}],
+    )
+    mode = ResearchAgentRuntime._agent_task_mode(routed, requested=True)
+    contract = compile_task_contract(task_mode=mode, user_text=prompt)
+
+    assert mode == "slides+agent"
+    assert contract["risk_level"] == "reversible"
+    assert "create_document" in contract["allowed_tools"]
+    assert contract["allow_external_write"] is False

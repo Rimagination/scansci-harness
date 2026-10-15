@@ -138,9 +138,19 @@ def test_substantive_filter_keeps_concise_research_predicates():
         "The result supports a cortical activity interpretation.",
         "The analysis links drought with lower biomass.",
         "A second enabling characteristic involves tumor-promoting inflammation.",
+        "Mean soil temperature under panels fell by 2 degrees Celsius.",
+        "Plant cover rose by 8 percent in the shaded plots.",
     ]
 
     assert all(is_substantive_evidence_hit({"section": "Results", "text": text}) for text in statements)
+
+
+def test_substantive_filter_rejects_rose_author_fragments():
+    for text in (
+        "Rose, Smith, Brown, Solar park vegetation diversity, 2024.",
+        "Rose et al. Solar park vegetation diversity, 2024.",
+    ):
+        assert not is_substantive_evidence_hit({"section": "Results", "text": text})
 
 
 def test_substantive_filter_rejects_reference_section_metadata_even_with_factual_words():

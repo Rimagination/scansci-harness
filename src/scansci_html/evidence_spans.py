@@ -150,8 +150,8 @@ def _ensure_evidence_styles(soup: BeautifulSoup) -> None:
     style.string = """
     [data-evidence-id] { scroll-margin-top: 6rem; }
     [data-evidence-id]:target {
-      background: #caff4d;
-      color: #17210b;
+      background: #79f2a6;
+      color: #14351f;
       outline: none;
       box-shadow: none;
       border-radius: 0;

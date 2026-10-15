@@ -676,11 +676,15 @@ def test_explicit_image_cancel_during_paid_call_saves_result_without_replay(expl
             saved.set()
     monkeypatch.setattr(image_generation.requests, "post", slow_post)
     monkeypatch.setattr(runtime, "_explicit_image_result", generate)
-    reader = threading.Thread(target=lambda: events.extend(runtime.chat_stream(payload)))
+    def read_stream():
+        for event in runtime.chat_stream(payload):
+            events.append(event)
+    reader = threading.Thread(target=read_stream)
     reader.start()
     try:
         assert submitted.wait(3)
-        assert getattr(runtime, control)()
+        run_id = next(event["runId"] for event in events if event["type"] == "RUN_STARTED")
+        assert getattr(runtime, control)({"run_id": run_id})
         reader.join(2)
         assert not reader.is_alive()
         assert events[-1]["code"] == "image_cancelled"

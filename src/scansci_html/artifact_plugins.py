@@ -345,10 +345,17 @@ def create_presentation_artifact(arguments: dict[str, Any], *, workspace: str | 
         bullets = list(record.get("bullets") or [])
         if not bullets:
             bullets = [_text(record.get("content"), "")]
-        for index, bullet in enumerate(value for value in bullets if str(value).strip()):
+        lines = [line for bullet in bullets for line in str(bullet).splitlines() if line.strip()]
+        for index, line in enumerate(lines):
             paragraph = body.paragraphs[0] if index == 0 else body.add_paragraph()
-            paragraph.text = str(bullet)
+            paragraph.level = 1 if re.match(r"^\s+[-*]\s+", line) else 0
             paragraph.font.size = Pt(22)
+            plain = re.sub(r"^\s*[-*]\s+", "", line.strip())
+            for part in re.split(r"(\*\*[^*]+\*\*)", plain):
+                if part:
+                    run = paragraph.add_run()
+                    run.font.bold = part.startswith("**") and part.endswith("**")
+                    run.text = part[2:-2] if run.font.bold else part
     presentation.save(path)
     with ZipFile(path) as archive:
         if "ppt/presentation.xml" not in archive.namelist():

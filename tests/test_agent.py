@@ -216,6 +216,61 @@ def test_plan_query_extracts_required_facets_for_multi_part_research_question():
     ]
 
 
+@pytest.mark.parametrize("temperature_missing", [False, True])
+def test_cross_language_qwen_evidence_covers_each_chinese_facet(monkeypatch, temperature_missing):
+    question = "光伏板对土壤水分和温度分别有什么影响？请引用原文。"
+    texts = [
+        "Soil moisture beneath solar panels increased by 12 percent compared with open plots.",
+        *([] if temperature_missing else ["Mean soil temperature beneath solar panels fell by 2 degrees Celsius compared with open plots."]),
+        "Bird abundance increased in restored wetlands after five years.",
+    ]
+
+    def search(_db, _query, **_kwargs):
+        return [
+            {
+                "evidence_id": f"paper.s{index:04d}", "doc_id": "paper", "title": "Solar panel soil study",
+                "section": "Results", "section_kind": "results", "html_path": "paper.html",
+                "html_anchor": f"p{index}", "text": text, "score": 1.0,
+                "matched_terms": [],
+            }
+            for index, text in enumerate(texts, start=1)
+        ]
+
+    class QwenReranker:
+        def rerank(self, query, candidates):
+            rows = []
+            for candidate in candidates:
+                text = str(candidate.get("text", ""))
+                if query.startswith("光伏板对土壤水分的影响"):
+                    score = 0.99 if "moisture" in text else 0.01
+                    raw_score = score
+                elif query.startswith("光伏板对温度的影响"):
+                    score = 0.2 if "temperature" in text else 0.2 if "moisture" in text else 0.01
+                    raw_score = 0.99 if "temperature" in text else score
+                else:
+                    score = 0.99 if "moisture" in text else 0.75 if "temperature" in text else 0.8 if temperature_missing else 0.01
+                    raw_score = score
+                rows.append({**candidate, "qwen3_raw_score": raw_score, "qwen3_score": score, "score": score, "matched_terms": []})
+            return sorted(rows, key=lambda row: -row["score"])
+
+    monkeypatch.setattr(agent, "search_evidence_store", search)
+    result = answer_question(
+        "unused.sqlite", question, reranker=QwenReranker(),
+        min_quotes=2, min_documents=1, query_variants=2, max_followup_queries=0,
+    )
+
+    assert [facet["id"] for facet in result["query_plan"]["required_facets"]] == ["土壤水分", "温度"]
+    if temperature_missing:
+        assert result["citation_verification"]["passed"] is False
+        assert "温度" in result["citation_verification"]["missing_facets"]
+        assert "Bird abundance" not in result["reader_answer"]["text"]
+        assert result["reader_answer"]["citation_count"] == 1
+    else:
+        assert result["citation_verification"]["passed"] is True
+        assert result["citation_verification"]["covered_facets"] == ["土壤水分", "温度"]
+        assert result["reader_answer"]["citation_count"] == 2
+
+
 def test_plan_query_extracts_facets_from_chinese_consensus_and_conflict_question():
     plan = plan_query("光伏电站对植被覆盖、土壤水分和微气候有哪些一致结论与争议？")
 
@@ -552,6 +607,27 @@ def test_answer_question_runs_local_evidence_first_pipeline(tmp_path: Path):
     assert result["reader_answer"]["text"].endswith("[1]")
     assert result["reader_answer"]["citations"][0]["quote_id"] == "q0001"
     assert result["reader_answer"]["citations"][0]["source_href"].endswith("#results-p1-s0001")
+
+
+def test_count_question_keeps_the_named_plot_and_its_count_evidence(tmp_path: Path):
+    library = tmp_path / "library"
+    library.mkdir()
+    (library / "paper.html").write_text(
+        '<article class="paper" data-doi="10.1234/local-count">'
+        '<h1>Forest Plot Study</h1><h2>Results</h2><p id="results-p1">'
+        'Plot A contained twelve trees. Plot B contained nine trees. '
+        'The plots were measured in spring.</p></article>',
+        encoding="utf-8",
+    )
+    db_path = tmp_path / "evidence.sqlite"
+    index_evidence_library(library, db_path=db_path, min_sentence_length=8)
+
+    result = answer_question(db_path, "How many trees did Plot A contain?", max_followup_queries=1)
+
+    assert "twelve trees" in result["reader_answer"]["text"].lower()
+    assert "nine trees" not in result["reader_answer"]["text"].lower()
+    assert result["reader_answer"]["citations"][0]["evidence_id"].endswith(".s0001")
+    assert result["citation_verification"]["passed"] is True
 
 
 def test_answer_question_abstains_when_adequacy_gate_fails(tmp_path: Path):

@@ -59,6 +59,28 @@ def test_office_plugins_create_verified_editable_artifacts(tmp_path: Path) -> No
     assert presentation["slides"] == 2
 
 
+def test_presentation_renders_model_bullets_without_markdown_markers(tmp_path: Path) -> None:
+    from pptx import Presentation
+
+    artifact = create_presentation_artifact(
+        {
+            "title": "Plot A",
+            "slides": [{
+                "title": "Results",
+                "bullets": ["**Tree Count:** 12 trees\n  * **Evidence ID:** paper.s0001"],
+            }],
+        },
+        workspace=_workspace(tmp_path),
+    )
+
+    paragraphs = Presentation(artifact["file_path"]).slides[1].placeholders[1].text_frame.paragraphs
+    assert [paragraph.text for paragraph in paragraphs] == [
+        "Tree Count: 12 trees", "Evidence ID: paper.s0001",
+    ]
+    assert paragraphs[1].level == 1
+    assert paragraphs[0].runs[0].font.bold is True
+
+
 def test_latex_plugin_compiles_with_detected_runtime(tmp_path: Path) -> None:
     if find_tectonic() is None:
         pytest.skip("Tectonic is not installed on this test machine")

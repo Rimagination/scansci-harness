@@ -7,7 +7,7 @@
       "id": "pi-routing",
       "report_axis": "routing",
       "threshold": 40,
-      "requirement": "至少 40 个中英双语路由用例完成可复核决策：凡需要知识库、Skill、附件、联网、工具或工作流能力的轮次 100% 可达 Pi；无能力依赖的 direct_chat 进入 Host 精简快速通道。ScanSci Harness 只做 turn/contract/lease 绑定和事件透传，模型规划与工具循环唯一归 Pi；Host 确定性事实、direct_chat 快速通道、direct fallback 与静默降级必须分别标记，后两者不计 Pi 成功。"
+      "requirement": "至少 40 个中英双语路由用例完成可复核决策：凡需要知识库、Skill、附件、联网、工具或工作流能力的轮次 100% 可达 Pi；用户显式开启 Agent 编排时，开放任务进入 Pi 工具循环，保持原有 Host 租约并禁止无工具 direct fallback；无能力依赖且未开启 Agent 的 direct_chat 进入 Host 精简快速通道。ScanSci Harness 只做 turn/contract/lease 绑定和事件透传，模型规划与工具循环唯一归 Pi；Host 确定性事实、direct_chat 快速通道、direct fallback 与静默降级必须分别标记，后两者不计 Pi 成功。"
     },
     {
       "id": "pi-dynamic-tools",

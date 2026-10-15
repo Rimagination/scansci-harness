@@ -488,6 +488,77 @@ def test_pi_search_local_evidence_runs_real_sentence_context_recall(tmp_path: Pa
     assert hit["html_anchor"] == "results-p1-s0002"
 
 
+def test_pi_rejects_an_unsupported_source_year_before_creating_presentation(tmp_path: Path) -> None:
+    library = tmp_path / "library"
+    library.mkdir()
+    (library / "paper.html").write_text(
+        '<article data-doi="10.1234/forest-year"><h1>Forest Study</h1>'
+        '<p>Plot A contained twelve trees. Both plots were measured in spring.</p>'
+        '<p>Published 2026.</p></article>',
+        encoding="utf-8",
+    )
+    evidence_db = tmp_path / "evidence.sqlite"
+    index_evidence_library(library, db_path=evidence_db, min_sentence_length=8)
+    client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=evidence_db)
+    evidence_id = client._execute_tool(
+        "search_local_evidence", {"query": "Plot A contained twelve trees", "result_limit": 1}
+    )["hits"][0]["evidence_id"]
+    context = pi_agent._RunContext(request_id="artifact-evidence", session_id="local", generation=1)
+    context.history.append({"name": "search_local_evidence", "status": "ok", "evidence_hit_count": 1})
+    client._worker_context.run_context = context
+    arguments = {
+        "title": "Forest results",
+        "slides": [{
+            "title": "Plot A",
+            "bullets": [f"Plot A contained twelve trees. Evidence ID: {evidence_id}", "Measurement Date: Spring 2026"],
+        }],
+    }
+
+    arguments["slides"][0]["bullets"][0] = "Plot A contained twelve trees."
+    with pytest.raises(ValueError, match="加入检索结果的完整 evidence_id"):
+        client._execute_tool("create_presentation", arguments)
+    arguments["slides"][0]["content"] = f"Evidence ID: {evidence_id}"
+    with pytest.raises(ValueError, match="加入检索结果的完整 evidence_id"):
+        client._execute_tool("create_presentation", arguments)
+    del arguments["slides"][0]["content"]
+    arguments["slides"][0]["bullets"][0] += " Evidence ID: made-up.s0001"
+    with pytest.raises(ValueError, match="不在当前本地证据库"):
+        client._execute_tool("create_presentation", arguments)
+    arguments["slides"][0]["bullets"][0] = f"Plot A contained twelve trees. Evidence ID: {evidence_id}"
+    with pytest.raises(ValueError, match="没有 2026 年的测量或采集记录"):
+        client._execute_tool("create_presentation", arguments)
+    for tool in ("create_document", "create_pdf"):
+        with pytest.raises(ValueError, match="加入检索结果的完整 evidence_id"):
+            client._execute_tool(tool, {"title": "Forest results", "content": "Measurement Date: Spring 2026"})
+    assert not list((tmp_path / "artifacts").rglob("*.pptx"))
+
+    arguments["slides"][0]["bullets"][1] = "Measurement season: Spring"
+    created = client._execute_tool("create_presentation", arguments)
+    assert created["ok"] is True
+    assert Path(created["file_path"]).is_file()
+
+    (library / "paper.html").write_text(
+        '<article data-doi="10.1234/forest-year"><h1>Forest Study</h1>'
+        '<p>Plot A contained twelve trees. Both plots were measured in spring 2025.</p></article>',
+        encoding="utf-8",
+    )
+    index_evidence_library(library, db_path=evidence_db, min_sentence_length=8)
+    date_id = next(
+        hit["evidence_id"]
+        for hit in client._execute_tool(
+            "search_local_evidence", {"query": "measured in spring 2025", "result_limit": 3}
+        )["hits"]
+        if "2025" in hit["text"]
+    )
+    arguments["slides"][0]["bullets"][1] = "Measurement Date: Spring 2025"
+    arguments["slides"][0]["bullets"].append(f"Date evidence: {date_id}")
+    arguments["output_name"] = "source-supported-year.pptx"
+    assert client._execute_tool("create_presentation", arguments)["ok"] is True
+
+    context.history[0]["evidence_hit_count"] = 0
+    client._check_cited_artifact_years("create_document", {"content": "A blank template"})
+
+
 def test_pi_build_verified_answer_federates_all_selected_evidence_stores(tmp_path: Path, monkeypatch) -> None:
     first = tmp_path / "first.sqlite"
     second = tmp_path / "second.sqlite"
@@ -1041,6 +1112,141 @@ class _OpenAIStreamHandler(BaseHTTPRequestHandler):
 
     def log_message(self, _format: str, *_args: object) -> None:
         return
+
+
+class _OpenAIOutputLimitHandler(BaseHTTPRequestHandler):
+    request_payloads: list[dict[str, object]] = []
+    always_truncate = False
+    early_stop_html = False
+    never_close_html = False
+    truncate_tool_call = False
+    empty_continuation = False
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+        length = int(self.headers.get("Content-Length", "0"))
+        type(self).request_payloads.append(json.loads(self.rfile.read(length)))
+        attempt = len(type(self).request_payloads)
+        fragment = "<html><script>function play(){" if attempt == 1 else "}</script></html>"
+        if attempt > 1 and type(self).never_close_html:
+            fragment = "}</script><p>still open"
+        if attempt > 1 and type(self).empty_continuation:
+            fragment = ""
+        finish_reason = "length" if type(self).always_truncate or (attempt == 1 and not type(self).early_stop_html) else "stop"
+        delta = {"role": "assistant", "content": fragment}
+        if attempt == 1 and type(self).truncate_tool_call:
+            delta = {"role": "assistant", "tool_calls": [{
+                "index": 0,
+                "id": "call_partial",
+                "type": "function",
+                "function": {"name": "inspect_available_tools", "arguments": "{}"},
+            }]}
+        chunks = [
+            {
+                "id": f"chatcmpl-output-{attempt}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": delta, "finish_reason": None}],
+            },
+            {
+                "id": f"chatcmpl-output-{attempt}",
+                "object": "chat.completion.chunk",
+                "created": 1,
+                "model": "fixture-model",
+                "choices": [{"index": 0, "delta": {}, "finish_reason": finish_reason}],
+            },
+        ]
+        body = "".join(f"data: {json.dumps(chunk)}\n\n" for chunk in chunks) + "data: [DONE]\n\n"
+        encoded = body.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/event-stream")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
+class _OllamaNativeCaptureHandler(BaseHTTPRequestHandler):
+    request_payload: dict[str, object] = {}
+    request_path = ""
+
+    def do_GET(self) -> None:  # noqa: N802 - stdlib handler contract
+        body = json.dumps({"models": [{"name": "qwen3.5:9b"}]}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+        length = int(self.headers.get("Content-Length", "0"))
+        type(self).request_payload = json.loads(self.rfile.read(length))
+        type(self).request_path = self.path
+        chunks = [
+            {"model": "qwen3.5:9b", "message": {"role": "assistant", "content": "Pi adapter works."}, "done": False},
+            {"model": "qwen3.5:9b", "message": {"role": "assistant", "content": ""}, "done": True,
+             "done_reason": "stop", "prompt_eval_count": 100, "eval_count": 4},
+        ]
+        body = ("\n".join(json.dumps(chunk) for chunk in chunks) + "\n").encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
+class _OllamaNativeFinalToolHandler(BaseHTTPRequestHandler):
+    request_payloads: list[dict[str, object]] = []
+
+    def do_GET(self) -> None:  # noqa: N802 - stdlib handler contract
+        body = json.dumps({"models": [{"name": "qwen3.8-4b-distill:latest"}]}).encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+        length = int(self.headers.get("Content-Length", "0"))
+        type(self).request_payloads.append(json.loads(self.rfile.read(length)))
+        if len(type(self).request_payloads) == 1:
+            chunks = [
+                {"model": "qwen3.8-4b-distill:latest", "message": {"role": "assistant", "thinking": "Call the tool."}, "done": False},
+                {"model": "qwen3.8-4b-distill:latest", "message": {"role": "assistant", "content": "", "tool_calls": [
+                    {"id": "call_workspace", "function": {"index": 0, "name": "inspect_workspace", "arguments": {}}},
+                ]}, "done": True, "done_reason": "stop", "prompt_eval_count": 100, "eval_count": 20},
+            ]
+        else:
+            chunks = [
+                {"model": "qwen3.8-4b-distill:latest", "message": {"role": "assistant", "content": "The workspace has 0 notebooks."}, "done": False},
+                {"model": "qwen3.8-4b-distill:latest", "message": {"role": "assistant", "content": ""},
+                 "done": True, "done_reason": "stop", "prompt_eval_count": 120, "eval_count": 10},
+            ]
+        body = ("\n".join(json.dumps(chunk) for chunk in chunks) + "\n").encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
+
+    def log_message(self, _format: str, *_args: object) -> None:
+        return
+
+
+class _OllamaNativeErrorHandler(_OllamaNativeCaptureHandler):
+    def do_POST(self) -> None:  # noqa: N802 - stdlib handler contract
+        self.rfile.read(int(self.headers.get("Content-Length", "0")))
+        body = b'{"error":"model runner out of memory"}\n'
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ndjson")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
 
 class _OpenAIToolLoopHandler(BaseHTTPRequestHandler):
@@ -1924,6 +2130,7 @@ def test_pi_direct_stream_infers_runtime_metadata_from_matching_saved_route(
         yield {"type": "done", "stats": {}, "truncated": False}
 
     monkeypatch.setattr(client, "_run_request", fake_run_request)
+    monkeypatch.setattr(pi_agent, "warm_ollama_chat_model", lambda _base, _model: iter(()))
     events = list(client.stream_chat(
         provider_kind="ollama",
         base_url="http://127.0.0.1:11434/v1",
@@ -1948,6 +2155,145 @@ def test_pi_direct_stream_infers_runtime_metadata_from_matching_saved_route(
     assert runtime["context_window_tokens"] == 32 * 1024
     assert runtime["capabilities"] == ["reasoning", "tool", "coding"]
     assert runtime["degraded"] is False
+
+
+def test_pi_qwen_thinking_reaches_native_ollama_on_custom_loopback_port(tmp_path: Path) -> None:
+    _OllamaNativeCaptureHandler.request_payload = {}
+    _OllamaNativeCaptureHandler.request_path = ""
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OllamaNativeCaptureHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        descriptor = pi_agent.ModelRuntimeDescriptor.for_testing(context_window_tokens=16 * 1024).to_dict()
+        descriptor.update({
+            "provider_id": "local-runtime-ollama",
+            "provider_kind": "ollama",
+            "model_id": "qwen3.5:9b",
+        })
+        client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+        events = list(client.stream_chat(
+            provider_kind="ollama",
+            provider_id="local-runtime-ollama",
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            api_key="ollama",
+            model_id="qwen3.5:9b",
+            model_runtime=descriptor,
+            messages=[{"role": "user", "content": "Say hello."}],
+            thinking_level="high",
+            task_contract={
+                **_TASK_CONTRACT_V2,
+                "contract_id": "ollama-custom-port-thinking",
+                "risk_level": "read_only",
+                "allowed_tools": [],
+                "initial_tools": [],
+            },
+            timeout_seconds=30,
+        ))
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert events[-1]["type"] == "done"
+    assert _OllamaNativeCaptureHandler.request_path == "/api/chat"
+    assert _OllamaNativeCaptureHandler.request_payload["think"] is True
+    assert _OllamaNativeCaptureHandler.request_payload["options"]["num_ctx"] == 16 * 1024
+
+
+def test_pi_ollama_cold_load_status_precedes_native_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    warmed = []
+
+    def fake_warm(base_url, model_id):
+        warmed.append((base_url, model_id))
+        yield {"type": "status", "status": "local_model_loading", "name": model_id}
+        yield {"type": "status", "status": "local_model_ready", "name": model_id}
+
+    monkeypatch.setattr(pi_agent, "warm_ollama_chat_model", fake_warm)
+    client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    monkeypatch.setattr(client, "_run_request", lambda *_args, **_kwargs: iter([{"type": "done", "stats": {}}]))
+    descriptor = pi_agent.ModelRuntimeDescriptor.for_testing().to_dict()
+    descriptor.update({"provider_id": "local-runtime-ollama", "provider_kind": "ollama", "model_id": "qwen3.5:4b"})
+
+    events = list(client.stream_chat(
+        provider_kind="ollama",
+        provider_id="local-runtime-ollama",
+        base_url="http://127.0.0.1:11555/v1",
+        api_key="ollama",
+        model_id="qwen3.5:4b",
+        model_runtime=descriptor,
+        messages=[{"role": "user", "content": "你好"}],
+        timeout_seconds=5,
+    ))
+
+    assert warmed == [("http://127.0.0.1:11555/v1", "qwen3.5:4b")]
+    assert [event.get("status") for event in events[:2]] == ["local_model_loading", "local_model_ready"]
+    assert events[-1]["type"] == "done"
+
+
+def test_pi_ollama_native_stream_surfaces_error_line(tmp_path: Path) -> None:
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OllamaNativeErrorHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        descriptor = pi_agent.ModelRuntimeDescriptor.for_testing().to_dict()
+        descriptor.update({"provider_id": "local-runtime-ollama", "provider_kind": "ollama", "model_id": "qwen3.5:9b"})
+        client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+        with pytest.raises(pi_agent.PiAgentRunError, match="model runner out of memory"):
+            list(client.stream_chat(
+                provider_kind="ollama",
+                provider_id="local-runtime-ollama",
+                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                api_key="ollama",
+                model_id="qwen3.5:9b",
+                model_runtime=descriptor,
+                messages=[{"role": "user", "content": "你好"}],
+                timeout_seconds=20,
+            ))
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+
+def test_pi_ollama_tool_call_in_final_native_event_executes(tmp_path: Path) -> None:
+    _OllamaNativeFinalToolHandler.request_payloads = []
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OllamaNativeFinalToolHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        descriptor = pi_agent.ModelRuntimeDescriptor.for_testing(context_window_tokens=32 * 1024).to_dict()
+        descriptor.update({
+            "provider_id": "local-runtime-ollama-qwen3.8-4b-distill",
+            "provider_kind": "ollama",
+            "model_id": "qwen3.8-4b-distill:latest",
+        })
+        client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+        events = list(client.stream_chat(
+            provider_kind="ollama",
+            provider_id="local-runtime-ollama-qwen3.8-4b-distill",
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            api_key="ollama",
+            model_id="qwen3.8-4b-distill:latest",
+            model_runtime=descriptor,
+            messages=[{"role": "user", "content": "Call inspect_workspace, then report the notebook count."}],
+            thinking_level="off",
+            task_contract={
+                **_TASK_CONTRACT_V2,
+                "contract_id": "ollama-final-tool-call",
+                "risk_level": "read_only",
+                "allowed_tools": ["inspect_workspace"],
+                "initial_tools": ["inspect_workspace"],
+            },
+            timeout_seconds=30,
+        ))
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert events[-1]["type"] == "done"
+    assert any(event.get("type") == "tool.completed" and event.get("name") == "inspect_workspace" for event in events)
+    assert len(_OllamaNativeFinalToolHandler.request_payloads) == 2
 
 
 def test_pi_stream_forwards_compact_skill_catalog_without_expanding_domain_lease(
@@ -2000,6 +2346,46 @@ def test_pi_stream_forwards_compact_skill_catalog_without_expanding_domain_lease
     assert 0 < len(captured["skill_catalog"]) <= 64
     assert "search_skills" not in captured["tool_set"]["registered_tools"]
     assert "load_skill" not in captured["tool_set"]["active_tools"]
+
+
+def test_required_artifacts_do_not_expand_initial_tool_schemas(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    captured: dict[str, object] = {}
+
+    def fake_run_request(start_message, *, api_key, timeout_seconds):
+        captured.update(start_message)
+        yield {"type": "done", "stats": {}, "truncated": False}
+
+    monkeypatch.setattr(client, "_run_request", fake_run_request)
+    list(client.stream_chat(
+        provider_kind="openai-compatible",
+        base_url="https://example.test/v1",
+        api_key="secret",
+        model_id="fixture",
+        messages=[{"role": "user", "content": "Use evidence to create a document and slides."}],
+        task_mode="slides",
+        task_contract={
+            **_TASK_CONTRACT_V2,
+            "contract_id": "deferred-required-artifacts",
+            "risk_level": "reversible",
+            "allowed_tools": ["search_local_evidence", "create_document", "create_presentation"],
+            "initial_tools": ["search_local_evidence"],
+            "required_tool_groups": [
+                ["search_local_evidence"], ["create_document"], ["create_presentation"],
+            ],
+        },
+        timeout_seconds=30,
+    ))
+
+    assert set(captured["tool_set"]["registered_tools"]) >= {
+        "search_local_evidence", "create_document", "create_presentation",
+    }
+    assert "search_local_evidence" in captured["tool_set"]["active_tools"]
+    assert "create_document" not in captured["tool_set"]["active_tools"]
+    assert "create_presentation" not in captured["tool_set"]["active_tools"]
 
 
 def test_skill_control_plane_accepts_empty_domain_lease_and_rejects_spoofed_domain_call(
@@ -2074,6 +2460,35 @@ def test_skill_control_plane_accepts_empty_domain_lease_and_rejects_spoofed_doma
     assert rejected["ok"] is False
     assert contract["allowed_tools"] == []
     assert any(event.get("type") == "skill.loaded" for event in events)
+
+
+def test_pi_bridge_forwards_live_reasoning_for_the_active_request(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+    monkeypatch.setattr(client, "_ensure_process", lambda **_kwargs: SimpleNamespace(poll=lambda: None))
+    monkeypatch.setattr(client, "_write", lambda _message: None)
+    for event_type, delta in (("message.reasoning_delta", "Check evidence"), ("message.delta", "Answer")):
+        client._output.put(json.dumps({"type": event_type, "request_id": "reasoning-request", "delta": delta}))
+    client._output.put(json.dumps({"type": "run.completed", "request_id": "reasoning-request", "stats": {}}))
+
+    events = list(client._run_request(
+        {
+            "type": "run.start",
+            "request_id": "reasoning-request",
+            "session_id": "reasoning-session",
+            "task_mode": "general",
+            "task_contract": {**_TASK_CONTRACT_V2, "allowed_tools": [], "initial_tools": [], "risk_level": "read_only"},
+        },
+        api_key="fixture",
+        timeout_seconds=5,
+    ))
+
+    assert [(event["type"], event.get("content")) for event in events if event["type"] in {"reasoning", "delta"}] == [
+        ("reasoning", "Check evidence"),
+        ("delta", "Answer"),
+    ]
 
 
 def test_skill_control_plane_rejects_missing_request_identity_before_dispatch(
@@ -2779,7 +3194,64 @@ def test_python_bridge_reauthorizes_spoofed_tool_call_before_dispatch(tmp_path: 
     rejected = next(message for message in written if message.get("call_id") == "spoofed-call")
     assert rejected["ok"] is False
     assert "authorization" in str(rejected["error"]).lower() or "lease" in str(rejected["error"]).lower()
-    assert any(event.get("type") == "tool.failed" for event in events)
+    authorization = next(event for event in events if event.get("type") == "tool.authorization")
+    failure = next(event for event in events if event.get("type") == "tool.failed")
+    assert authorization["decision"] == "deny"
+    assert authorization["rule"] == "outside_lease"
+    assert authorization["request_id"] == "request-current"
+    assert authorization["call_ref"] == failure["call_ref"]
+    assert "arguments" not in authorization
+
+
+def test_python_bridge_rejects_reused_tool_call_id_before_dispatch(tmp_path: Path, monkeypatch) -> None:
+    client = PiAgentClient(
+        workspace=tmp_path / "workspace.sqlite",
+        evidence_db=tmp_path / "evidence.sqlite",
+    )
+    dispatched: list[str] = []
+    written: list[dict[str, object]] = []
+    monkeypatch.setattr(client, "_ensure_process", lambda **_kwargs: SimpleNamespace(poll=lambda: None))
+    monkeypatch.setattr(client, "_write", lambda message: written.append(dict(message)))
+    monkeypatch.setattr(
+        client, "_execute_tool",
+        lambda name, _arguments: dispatched.append(name) or {"ok": True},
+    )
+    for _ in range(2):
+        client._output.put(json.dumps({
+            "type": "tool.call", "request_id": "request-current", "call_id": "reused-call",
+            "name": "inspect_workspace", "arguments": {},
+        }))
+    client._output.put(json.dumps({
+        "type": "tool.call", "request_id": "request-current", "call_id": "",
+        "name": "inspect_workspace", "arguments": {},
+    }))
+    client._output.put(json.dumps({
+        "type": "run.completed", "request_id": "request-current", "stats": {},
+    }))
+
+    events = list(client._run_request(
+        {
+            "type": "run.start", "request_id": "request-current", "session_id": "session-current",
+            "task_mode": "knowledge",
+            "task_contract": {
+                "schema_version": "scansci.task-contract.v2", "allowed_tools": ["inspect_workspace"],
+                "risk_level": "read_only", "max_tool_budget": 2,
+            },
+        },
+        api_key="fixture", timeout_seconds=5,
+    ))
+
+    assert dispatched == ["inspect_workspace"]
+    decisions = [event for event in events if event.get("type") == "tool.authorization"]
+    assert [(event["decision"], event["rule"]) for event in decisions] == [
+        ("allow", "authorized"), ("deny", "duplicate_call_id"),
+        ("deny", "missing_call_id"),
+    ]
+    assert len({event["call_ref"] for event in decisions}) == 3
+    failures = [event for event in events if event.get("type") == "tool.failed"]
+    assert {event["call_ref"] for event in failures} == {event["call_ref"] for event in decisions[1:]}
+    assert len([message for message in written if message.get("call_id") == "reused-call" and message.get("ok") is False]) == 1
+    assert len([message for message in written if message.get("call_id") == "" and message.get("ok") is False]) == 1
 
 
 def test_explicit_empty_tool_lease_advertises_no_domain_tools(tmp_path: Path) -> None:
@@ -3270,7 +3742,8 @@ def test_compact_verified_answer_preserves_reader_location_fields() -> None:
     assert _parse_text_tool_intents('The tool has a field named "name": "inspect_workspace".') == []
 
 
-def test_pi_sdk_streams_through_the_python_bridge(tmp_path: Path) -> None:
+@pytest.mark.parametrize("task_mode", ["knowledge", "agent"])
+def test_pi_sdk_streams_through_the_python_bridge(tmp_path: Path, task_mode: str) -> None:
     _OpenAIStreamHandler.request_headers = {}
     server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIStreamHandler)
     thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -3289,7 +3762,7 @@ def test_pi_sdk_streams_through_the_python_bridge(tmp_path: Path) -> None:
                     {"role": "user", "content": "Confirm the bridge."},
                 ],
                 thinking_level="off",
-                task_mode="knowledge",
+                task_mode=task_mode,
                 timeout_seconds=30,
                 session_id="pi-opencode-session",
             )
@@ -3327,6 +3800,244 @@ def test_pi_sdk_streams_through_the_python_bridge(tmp_path: Path) -> None:
     }.issubset(lifecycle)
 
 
+def test_pi_continues_output_limit_and_keeps_the_complete_answer(tmp_path: Path) -> None:
+    _OpenAIOutputLimitHandler.request_payloads = []
+    _OpenAIOutputLimitHandler.always_truncate = False
+    _OpenAIOutputLimitHandler.early_stop_html = False
+    _OpenAIOutputLimitHandler.never_close_html = False
+    _OpenAIOutputLimitHandler.truncate_tool_call = False
+    _OpenAIOutputLimitHandler.empty_continuation = False
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIOutputLimitHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+        events = list(client.stream_chat(
+            provider_kind="openai-compatible",
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            api_key="fixture-key",
+            model_id="fixture-model",
+            messages=[{"role": "user", "content": "Create a complete HTML game."}],
+            thinking_level="off",
+            task_mode="agent",
+            timeout_seconds=30,
+        ))
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert "".join(str(event.get("content", "")) for event in events if event["type"] == "delta") == (
+        "<html><script>function play(){}</script></html>"
+    )
+    assert events[-1]["type"] == "done"
+    assert any(event.get("type") == "status" and event.get("name") == "output_limit" for event in events)
+    assert len(_OpenAIOutputLimitHandler.request_payloads) == 2
+    followup_messages = _OpenAIOutputLimitHandler.request_payloads[1]["messages"]
+    assert any(message.get("role") == "user" and "function play(){" in str(message.get("content", ""))
+               for message in followup_messages)
+    assert any(message.get("role") == "user" and "output limit" in str(message.get("content", "")).lower()
+               for message in followup_messages)
+
+
+def test_pi_continues_html_game_when_provider_stops_before_closing_page(tmp_path: Path) -> None:
+    _OpenAIOutputLimitHandler.request_payloads = []
+    _OpenAIOutputLimitHandler.always_truncate = False
+    _OpenAIOutputLimitHandler.early_stop_html = True
+    _OpenAIOutputLimitHandler.never_close_html = False
+    _OpenAIOutputLimitHandler.truncate_tool_call = False
+    _OpenAIOutputLimitHandler.empty_continuation = False
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIOutputLimitHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+        events = list(client.stream_chat(
+            provider_kind="openai-compatible",
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            api_key="fixture-key",
+            model_id="fixture-model",
+            messages=[{"role": "user", "content": "做一个完整的 HTML 坦克大战游戏"}],
+            thinking_level="off",
+            task_mode="agent",
+            timeout_seconds=30,
+        ))
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert events[-1]["type"] == "done"
+    assert len(_OpenAIOutputLimitHandler.request_payloads) == 2
+    assert any(event.get("type") == "status" and event.get("name") == "incomplete_html" for event in events)
+    assert "".join(str(event.get("content", "")) for event in events if event["type"] == "delta").endswith("</html>")
+
+
+def test_pi_html_completion_guard_uses_current_turn_not_history(tmp_path: Path) -> None:
+    _OpenAIOutputLimitHandler.request_payloads = []
+    _OpenAIOutputLimitHandler.always_truncate = False
+    _OpenAIOutputLimitHandler.early_stop_html = True
+    _OpenAIOutputLimitHandler.never_close_html = False
+    _OpenAIOutputLimitHandler.truncate_tool_call = False
+    _OpenAIOutputLimitHandler.empty_continuation = False
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIOutputLimitHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+        events = list(client.stream_chat(
+            provider_kind="openai-compatible",
+            base_url=f"http://127.0.0.1:{server.server_port}/v1",
+            api_key="fixture-key",
+            model_id="fixture-model",
+            messages=[
+                {"role": "user", "content": "Create a complete HTML game."},
+                {"role": "assistant", "content": "Done."},
+                {"role": "user", "content": "Explain the HTML tag."},
+            ],
+            thinking_level="off",
+            task_mode="agent",
+            timeout_seconds=30,
+        ))
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert events[-1]["type"] == "done"
+    assert len(_OpenAIOutputLimitHandler.request_payloads) == 1
+
+
+def test_pi_reports_html_game_that_never_closes_as_incomplete(tmp_path: Path) -> None:
+    _OpenAIOutputLimitHandler.request_payloads = []
+    _OpenAIOutputLimitHandler.always_truncate = False
+    _OpenAIOutputLimitHandler.early_stop_html = True
+    _OpenAIOutputLimitHandler.never_close_html = True
+    _OpenAIOutputLimitHandler.truncate_tool_call = False
+    _OpenAIOutputLimitHandler.empty_continuation = False
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIOutputLimitHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+        with pytest.raises(pi_agent.PiAgentRunError) as captured:
+            list(client.stream_chat(
+                provider_kind="openai-compatible",
+                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                api_key="fixture-key",
+                model_id="fixture-model",
+                messages=[{"role": "user", "content": "做一个完整的 HTML 坦克大战游戏"}],
+                thinking_level="off",
+                task_mode="agent",
+                timeout_seconds=30,
+            ))
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert captured.value.failure["code"] == "incomplete_model_response"
+    assert len(_OpenAIOutputLimitHandler.request_payloads) == 4
+
+
+def test_pi_reports_repeated_output_limit_as_incomplete(tmp_path: Path) -> None:
+    _OpenAIOutputLimitHandler.request_payloads = []
+    _OpenAIOutputLimitHandler.always_truncate = True
+    _OpenAIOutputLimitHandler.early_stop_html = False
+    _OpenAIOutputLimitHandler.never_close_html = False
+    _OpenAIOutputLimitHandler.truncate_tool_call = False
+    _OpenAIOutputLimitHandler.empty_continuation = False
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIOutputLimitHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+        with pytest.raises(pi_agent.PiAgentRunError) as captured:
+            list(client.stream_chat(
+                provider_kind="openai-compatible",
+                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                api_key="fixture-key",
+                model_id="fixture-model",
+                messages=[{"role": "user", "content": "Create a complete HTML game."}],
+                thinking_level="off",
+                task_mode="agent",
+                timeout_seconds=30,
+            ))
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert captured.value.failure["code"] == "model_output_limit"
+    assert len(_OpenAIOutputLimitHandler.request_payloads) == 4
+
+
+def test_pi_keeps_sdk_recovery_for_a_truncated_tool_call(tmp_path: Path) -> None:
+    _OpenAIOutputLimitHandler.request_payloads = []
+    _OpenAIOutputLimitHandler.always_truncate = False
+    _OpenAIOutputLimitHandler.early_stop_html = False
+    _OpenAIOutputLimitHandler.never_close_html = False
+    _OpenAIOutputLimitHandler.truncate_tool_call = True
+    _OpenAIOutputLimitHandler.empty_continuation = False
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIOutputLimitHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+        events = list(client.stream_chat(
+                provider_kind="openai-compatible",
+                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                api_key="fixture-key",
+                model_id="fixture-model",
+                messages=[{"role": "user", "content": "Inspect available tools."}],
+                thinking_level="off",
+                task_mode="agent",
+                timeout_seconds=30,
+            ))
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert len(_OpenAIOutputLimitHandler.request_payloads) == 2
+    followup_messages = _OpenAIOutputLimitHandler.request_payloads[1]["messages"]
+    assert any(message.get("role") == "tool" and "arguments may be truncated" in str(message.get("content", ""))
+               for message in followup_messages)
+    assert not any(event.get("type") == "tool.completed" for event in events)
+
+
+def test_pi_does_not_mark_an_empty_continuation_complete(tmp_path: Path) -> None:
+    _OpenAIOutputLimitHandler.request_payloads = []
+    _OpenAIOutputLimitHandler.always_truncate = False
+    _OpenAIOutputLimitHandler.early_stop_html = False
+    _OpenAIOutputLimitHandler.never_close_html = False
+    _OpenAIOutputLimitHandler.truncate_tool_call = False
+    _OpenAIOutputLimitHandler.empty_continuation = True
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIOutputLimitHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = PiAgentClient(workspace=tmp_path / "workspace.sqlite", evidence_db=tmp_path / "evidence.sqlite")
+        with pytest.raises(pi_agent.PiAgentRunError) as captured:
+            list(client.stream_chat(
+                provider_kind="openai-compatible",
+                base_url=f"http://127.0.0.1:{server.server_port}/v1",
+                api_key="fixture-key",
+                model_id="fixture-model",
+                messages=[{"role": "user", "content": "Create a complete HTML game."}],
+                thinking_level="off",
+                task_mode="agent",
+                timeout_seconds=30,
+            ))
+    finally:
+        server.shutdown()
+        thread.join(timeout=2)
+        server.server_close()
+
+    assert captured.value.failure["code"] == "model_output_limit"
+    assert len(_OpenAIOutputLimitHandler.request_payloads) == 2
+
+
 def test_pi_tool_call_round_trips_through_scansci_dispatcher(tmp_path: Path) -> None:
     _OpenAIToolLoopHandler.request_payloads = []
     server = ThreadingHTTPServer(("127.0.0.1", 0), _OpenAIToolLoopHandler)
@@ -3349,6 +4060,7 @@ def test_pi_tool_call_round_trips_through_scansci_dispatcher(tmp_path: Path) -> 
                     "autonomy": "read_only",
                     "risk_level": "read_only",
                     "allowed_tools": ["inspect_available_tools"],
+                    "initial_tools": ["inspect_available_tools"],
                     "required_tool_groups": [["inspect_available_tools"]],
                     "task_profile": {
                         "route": "tool_agent",
@@ -3368,6 +4080,21 @@ def test_pi_tool_call_round_trips_through_scansci_dispatcher(tmp_path: Path) -> 
         server.server_close()
 
     completed = [item for item in events if item["type"] == "tool.completed"]
+    authorization = next(item for item in events if item["type"] == "tool.authorization")
+    assert authorization["decision"] == "allow"
+    assert authorization["rule"] == "authorized"
+    assert authorization["approval"] == "not_required"
+    assert authorization["contract_id"] == "contract-tool-loop"
+    assert authorization["call_ref"] == completed[0]["call_ref"]
+    assert authorization["request_id"] == completed[0]["request_id"]
+    assert "arguments" not in authorization
+    manifests = [json.loads(path.read_text(encoding="utf-8")) for path in (tmp_path / ".scansci-diagnostics" / "runs").glob("*.json")]
+    assert any(
+        record.get("type") == "agent.tool.authorization"
+        and record.get("call_ref") == authorization["call_ref"]
+        and record.get("decision") == "allow"
+        for manifest in manifests for record in manifest["events"]
+    )
     assert completed[0]["name"] == "inspect_available_tools"
     assert completed[0]["result"]["workspace"] == str((tmp_path / "workspace.sqlite").resolve())
     assert "".join(str(item.get("content", "")) for item in events if item["type"] == "delta") == "Tool result received"
@@ -3387,6 +4114,9 @@ def test_pi_tool_call_round_trips_through_scansci_dispatcher(tmp_path: Path) -> 
     assert "HOST-OWNED TASK CONTRACT" in system_text
     assert "risk ceiling=read_only" in system_text
     assert "Required tool groups (host authoritative): inspect_available_tools." in system_text
+    assert "activate its exact name with search_tools" in system_text
+    assert "take study, measurement, and collection dates from cited source material" in system_text
+    assert "place the exact evidence_id in its visible content" in system_text
     second_messages = _OpenAIToolLoopHandler.request_payloads[1]["messages"]
     assert any(message.get("role") == "tool" for message in second_messages)
 

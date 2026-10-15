@@ -91,6 +91,10 @@ def _local_model_health(
         returned_models = {str(value).strip() for value in list(check.get("models", []) or []) if str(value).strip()}
         if model_id and returned_models and model_id not in returned_models:
             return _entry("not_installed", detail=f"本地服务已连接，但没有返回模型 {model_id}。", capabilities=capabilities, runtime=runtime)
+        if runtime == "strata":
+            verified_for = f"{str(local_model.get('base_url', '')).strip().rstrip('/')}\n{model_id}"
+            if not model_id or str(local_model.get("agent_verified_for", "")) != verified_for:
+                return _entry("unverified", detail="Strata 已连接；请先验证流式回答、证据引用和工具调用。", capabilities=capabilities, runtime=runtime)
         return _entry("ready", detail="本地模型服务已连接。", capabilities=capabilities, runtime=runtime)
     return _entry(
         "unavailable",

@@ -911,7 +911,7 @@ def test_pi_runtime_allows_loopback_sse_to_finish_without_terminal_reason() -> N
         Path(__file__).parents[1] / "pi-runtime" / "src" / "main.ts"
     ).read_text(encoding="utf-8")
 
-    assert '["127.0.0.1", "localhost", "::1"].includes(baseHostname)' in runtime_source
+    assert '["127.0.0.1", "localhost", "::1", "[::1]"].includes(baseHostname)' in runtime_source
     assert "supportsFinishReason: false" in runtime_source
 
 
@@ -1289,6 +1289,7 @@ def test_scientific_child_always_uses_pi_and_only_authorizes_owned_evidence_rows
     result = runtime.answer_sync({
         "question": "Inspect owned evidence",
         "task_mode": "research",
+        "retrieval_quality": "balanced",
         "_research_run_id": child["run_id"],
         "force_local_evidence": force_local_evidence,
     })

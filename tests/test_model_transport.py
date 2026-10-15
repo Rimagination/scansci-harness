@@ -146,6 +146,20 @@ def test_opencode_go_anthropic_model_posts_messages_payload():
     assert session.calls[0]["url"] == "https://opencode.example/v1/messages"
     assert session.calls[0]["headers"]["x-api-key"] == "go-secret"
     assert "Authorization" not in session.calls[0]["headers"]
+    assert complete_model(
+        ModelRequest(
+            provider_kind="openai-compatible",
+            provider_id="opencode-go",
+            base_url="https://opencode.example/v1",
+            api_key="go-secret",
+            model="minimax-m3",
+            messages=[{"role": "user", "content": "hello"}],
+            api_surface="auto",
+            max_tokens=None,
+            session=session,
+        )
+    ).text == "ready"
+    assert session.calls[1]["json"]["max_tokens"] == 8192
 
 
 def test_complete_model_posts_openai_responses_payload():
@@ -166,6 +180,8 @@ def test_complete_model_posts_openai_responses_payload():
     assert session.calls[0]["url"] == "https://example.test/v1/responses"
     assert session.calls[0]["json"]["previous_response_id"] == "resp_prev"
     assert session.calls[0]["json"]["reasoning"] == {"effort": "low"}
+    assert complete_model(_request(session, max_tokens=None)).text == "ready"
+    assert "max_output_tokens" not in session.calls[1]["json"]
 
 
 def test_opencode_go_responses_carries_the_same_provider_session_header():
@@ -201,6 +217,7 @@ def test_opencode_go_responses_carries_the_same_provider_session_header():
 def test_stream_model_events_normalizes_responses_sse():
     lines = [
         b'data: {"type":"response.created","response":{"id":"resp_stream"}}',
+        b'data: {"type":"response.reasoning_summary_text.delta","delta":"Checking sources"}',
         b'data: {"type":"response.output_text.delta","delta":"Hel"}',
         b'data: {"type":"response.output_text.delta","delta":"lo"}',
         b'data: {"type":"response.completed","response":{"id":"resp_stream","usage":{"input_tokens":4,"output_tokens":2}}}',
@@ -210,8 +227,9 @@ def test_stream_model_events_normalizes_responses_sse():
     session = FakeSession(response)
     events = list(stream_model_events(_request(session)))
 
-    assert [event["type"] for event in events] == ["text_delta", "text_delta", "usage", "completed"]
-    assert "".join(event.get("content", "") for event in events) == "Hello"
+    assert [event["type"] for event in events] == ["reasoning_delta", "text_delta", "text_delta", "usage", "completed"]
+    assert events[0]["content"] == "Checking sources"
+    assert "".join(event.get("content", "") for event in events if event["type"] == "text_delta") == "Hello"
     assert events[-2]["usage"] == {"input_tokens": 4, "output_tokens": 2, "total_tokens": 6}
     assert response.closed is True
 
@@ -242,6 +260,75 @@ def test_legacy_llm_stream_can_select_responses_without_changing_chat_default():
     assert events[0] == {"type": "delta", "content": "ok"}
     assert events[-1]["type"] == "done"
     assert session.calls[0]["url"].endswith("/responses")
+
+
+def test_responses_incomplete_output_continues_without_a_prompt_budget():
+    session = SequenceSession([
+        FakeResponse({}, [
+            b'data: {"type":"response.output_text.delta","delta":"first "}',
+            b'data: {"type":"response.incomplete","response":{"id":"resp_1","incomplete_details":{"reason":"max_output_tokens"},"usage":{"input_tokens":2,"output_tokens":3}}}',
+        ]),
+        FakeResponse({}, [
+            b'data: {"type":"response.output_text.delta","delta":"second"}',
+            b'data: {"type":"response.completed","response":{"id":"resp_2","usage":{"input_tokens":6,"output_tokens":2}}}',
+        ]),
+    ])
+    events = list(stream_chat_text(
+        "openai-compatible",
+        provider_id="gateway",
+        responses_enabled=True,
+        api_surface=RESPONSES,
+        base_url="https://example.test/v1",
+        api_key="secret",
+        model="responses-model",
+        messages=[{"role": "user", "content": "long answer"}],
+        max_tokens=None,
+        max_continuations=1,
+        max_requests=1,
+        session=session,
+    ))
+    assert "".join(event.get("content", "") for event in events if event["type"] == "delta") == "first second"
+    assert events[-1]["finish_reason"] == "stop"
+    assert events[-1]["truncated"] is False
+    assert events[-1]["usage"]["total_tokens"] == 13
+    assert all("max_output_tokens" not in call["json"] for call in session.calls)
+    assert session.calls[1]["json"]["input"][-2]["content"] == "first "
+
+
+def test_anthropic_length_stop_continues_and_marks_exhaustion():
+    limited = FakeResponse({}, [
+        b'data: {"type":"content_block_delta","delta":{"type":"thinking_delta","thinking":"Planning"}}',
+        b'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"first "}}',
+        b'data: {"type":"message_delta","delta":{"stop_reason":"max_tokens"},"usage":{"output_tokens":3}}',
+        b'data: {"type":"message_stop"}',
+    ])
+    finished = FakeResponse({}, [
+        b'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"second"}}',
+        b'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}}',
+        b'data: {"type":"message_stop"}',
+    ])
+    args = dict(
+        provider_id="opencode-go",
+        base_url="https://opencode.example/v1",
+        api_key="secret",
+        model="minimax-m3",
+        messages=[{"role": "user", "content": "long answer"}],
+        max_tokens=None,
+        max_requests=1,
+    )
+    truncated = list(stream_chat_text("openai-compatible", max_continuations=0, session=FakeSession(limited), **args))
+    assert truncated[0] == {"type": "reasoning", "content": "Planning"}
+    assert truncated[-1]["finish_reason"] == "length"
+    assert truncated[-1]["truncated"] is True
+
+    session = SequenceSession([limited, finished])
+    events = list(stream_chat_text("openai-compatible", max_continuations=1, session=session, **args))
+    assert "".join(event.get("content", "") for event in events if event["type"] == "delta") == "first second"
+    assert events[-1]["truncated"] is False
+    assert len(session.calls) == 2
+    assert session.calls[0]["json"]["max_tokens"] == 8192
+    assert session.calls[0]["json"]["stream"] is True
+    assert session.calls[1]["json"]["messages"][-2]["content"] == "first "
 
 
 def test_responses_json_client_reuses_structured_output_contract():
@@ -290,3 +377,22 @@ def test_responses_stream_retries_before_first_delta_after_broken_sse(monkeypatc
     assert events[0]["reason"] == "temporary_upstream_error"
     assert any(event.get("content") == "recovered" for event in events)
     assert len(session.calls) == 2
+
+
+def test_responses_stream_does_not_retry_after_visible_reasoning():
+    broken = FakeResponse({}, [])
+
+    def broken_lines(*, decode_unicode):
+        del decode_unicode
+        yield b'data: {"type":"response.reasoning_summary_text.delta","delta":"Checking"}'
+        raise requests.ConnectionError("stream closed after reasoning")
+
+    broken.iter_lines = broken_lines
+    session = SequenceSession([broken])
+    events = []
+    with pytest.raises(requests.ConnectionError):
+        for event in stream_model_events(_request(session, max_requests=2)):
+            events.append(event)
+
+    assert [event["type"] for event in events] == ["reasoning_delta"]
+    assert len(session.calls) == 1

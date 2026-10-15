@@ -635,40 +635,41 @@ class ResearchRunStore:
 
         with self._connect() as connection:
             self._initialize_schema(connection)
-            row = self._require_manageable_run(connection, run_id)
-            title = str(row["title"])
-            child_membership = connection.execute(
-                "select parent_run_id, batch_key from research_subagent_children where child_run_id = ?",
-                (run_id,),
-            ).fetchone()
-            if child_membership is not None:
-                connection.execute(
-                    "delete from research_subagent_batches where parent_run_id = ? and idempotency_key = ?",
-                    (str(child_membership["parent_run_id"]), str(child_membership["batch_key"])),
-                )
-                connection.execute(
-                    "delete from research_subagent_children where child_run_id = ?",
-                    (run_id,),
-                )
-            # Deleting one parent conversation preserves its independently
-            # auditable child runs, but removes the ownership/batch rows whose
-            # foreign keys point at that parent.
-            connection.execute(
-                "delete from research_subagent_batches where parent_run_id = ?",
-                (run_id,),
-            )
-            connection.execute(
-                "delete from research_subagent_children where parent_run_id = ?",
-                (run_id,),
-            )
-            connection.execute("delete from research_evidence_links where run_id = ?", (run_id,))
-            connection.execute("delete from research_tool_calls where run_id = ?", (run_id,))
-            connection.execute("delete from research_run_messages where run_id = ?", (run_id,))
-            connection.execute("delete from research_run_events where run_id = ?", (run_id,))
-            connection.execute("delete from research_artifacts where run_id = ?", (run_id,))
-            connection.execute("delete from research_stages where run_id = ?", (run_id,))
-            connection.execute("delete from research_runs where run_id = ?", (run_id,))
+            result = self.delete_run_in_transaction(connection, run_id)
             connection.commit()
+        return result
+
+    def delete_run_in_transaction(self, connection: sqlite3.Connection, run_id: str) -> dict[str, Any]:
+        """Delete on a caller-owned workspace connection without committing it."""
+        row = self._require_manageable_run(connection, run_id)
+        title = str(row["title"])
+        child_membership = connection.execute(
+            "select parent_run_id, batch_key from research_subagent_children where child_run_id = ?",
+            (run_id,),
+        ).fetchone()
+        if child_membership is not None:
+            connection.execute(
+                "delete from research_subagent_batches where parent_run_id = ? and idempotency_key = ?",
+                (str(child_membership["parent_run_id"]), str(child_membership["batch_key"])),
+            )
+            connection.execute(
+                "delete from research_subagent_children where child_run_id = ?",
+                (run_id,),
+            )
+        # Deleting one parent conversation preserves independently auditable
+        # child runs but removes ownership rows pointing to this parent.
+        connection.execute("delete from research_subagent_batches where parent_run_id = ?", (run_id,))
+        connection.execute("delete from research_subagent_children where parent_run_id = ?", (run_id,))
+        connection.execute("delete from research_evidence_links where run_id = ?", (run_id,))
+        connection.execute("delete from research_tool_calls where run_id = ?", (run_id,))
+        connection.execute("delete from research_run_messages where run_id = ?", (run_id,))
+        connection.execute("delete from research_run_events where run_id = ?", (run_id,))
+        connection.execute("delete from research_artifacts where run_id = ?", (run_id,))
+        connection.execute("delete from research_run_checkpoints where run_id = ?", (run_id,))
+        connection.execute("delete from research_worker_leases where run_id = ?", (run_id,))
+        connection.execute("delete from research_side_effect_receipts where run_id = ?", (run_id,))
+        connection.execute("delete from research_stages where run_id = ?", (run_id,))
+        connection.execute("delete from research_runs where run_id = ?", (run_id,))
         return {"ok": True, "run_id": run_id, "title": title, "deleted": True}
 
     def get_run(self, run_id: str) -> dict[str, Any]:
@@ -1324,6 +1325,8 @@ class ResearchRunStore:
             ).fetchone()
             if first_stage is None:
                 raise ValueError("Research run has no stage to restart")
+            metadata = _json_loads(row["metadata_json"])
+            metadata["effect_epoch"] = uuid4().hex
             connection.execute(
                 """
                 update research_stages
@@ -1338,10 +1341,11 @@ class ResearchRunStore:
                 update research_runs
                 set status = 'queued', current_stage = ?, progress = 0,
                     output_artifact_id = '', cancel_requested = 0,
-                    error_code = '', error_message = '', completed_at = '', updated_at = ?
+                    error_code = '', error_message = '', completed_at = '',
+                    metadata_json = ?, updated_at = ?
                 where run_id = ?
                 """,
-                (str(first_stage["stage_key"]), now, run_id),
+                (str(first_stage["stage_key"]), _json_dumps(metadata), now, run_id),
             )
             connection.commit()
         return self.get_run(run_id)

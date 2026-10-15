@@ -29,6 +29,8 @@ from .app_settings import (
     get_provider_api_key,
     load_settings,
     managed_fallback_model_ids,
+    provider_request_api_key,
+    remote_retrieval_granted,
 )
 from .deep_research import (
     discovery_only_result,
@@ -172,6 +174,35 @@ _CONVERSATION_TITLE_SYSTEM_PROMPT = (
     "标题用于历史记录，不能回答用户的问题，也不要编造询问中没有出现的细节。"
     "例如：‘这个人是谁？’概括为‘人物身份识别’，‘今天有什么科技新闻？’概括为‘今日科技新闻’，"
     "‘帮我把这段英文改成中文’概括为‘英文内容翻译’。"
+)
+_IMAGE_FOLLOW_UP_RE = re.compile(
+    r"(?:这|那|上|前|刚|之前|最近|我(?:发|传)).{0,8}(?:张|个|幅)?(?:图(?:片|像|表)?|照片|截图)"
+    r"|第[一二三四1-4]张(?:图|图片|照片|截图)"
+    r"|(?:图|图片|照片|截图)(?:里|中|上|有啥|有什么|显示|的内容|是什么)"
+    r"|(?:看|读|识别)(?:这|那|上|前)?(?:张|个|幅)?(?:图|图片|照片|截图)"
+    r"|(?:this|that|last|previous|earlier|above|my|first|second|third|fourth)\s+(?:image|picture|photo|screenshot|figure|plot|chart)"
+    r"|(?:image|picture|photo|screenshot|figure|plot|chart)\s+(?:i|we)\s+(?:sent|uploaded|attached)"
+    r"|(?:figure|plot|chart)\s*[1-4]",
+    re.IGNORECASE,
+)
+_IMAGE_IGNORE_RE = re.compile(
+    r"(?:不要|别|不用|无需|不必|不看|不分析|不参考|不使用|忽略|跳过).{0,18}(?:图|照片|截图)"
+    r"|(?:图|照片|截图).{0,10}(?:不用|不要|无需|别)(?:看|分析|参考|使用)?"
+    r"|(?:don't|do not|without|ignore|skip).{0,35}(?:image|picture|photo|screenshot|figure|plot|chart)",
+    re.IGNORECASE,
+)
+_IMAGE_ORDINAL_RE = re.compile(
+    r"第([一二三四1-4])张(?:图|图片|照片|截图)"
+    r"|(?:first|second|third|fourth)\s+(?:image|picture|photo|screenshot|figure|plot|chart)"
+    r"|(?:figure|plot|chart)\s*([1-4])",
+    re.IGNORECASE,
+)
+_VISION_IMAGE_INSTRUCTION = (
+    "An image is attached to this turn. Ground visual answers in what is actually visible. "
+    "If the user asks whether you can see it, mention a concrete visible detail instead of "
+    "listing image capabilities or asking for an upload. When analyzing, describe the image type, "
+    "visible objects or interface, and important readable text. If you cannot decode the image, "
+    "say that clearly and do not invent details."
 )
 
 
@@ -650,6 +681,25 @@ def _model_advisory_payload(event: dict[str, Any]) -> dict[str, Any] | None:
     return advisory
 
 
+def _tool_authorization_record(event: dict[str, Any]) -> dict[str, Any]:
+    """Project a Host tool decision without carrying arguments or result text."""
+
+    decision = str(event.get("decision", ""))
+    approval = str(event.get("approval", ""))
+    rule = str(event.get("rule", ""))
+    return {
+        **{
+            key: str(event.get(key, ""))[:120]
+            for key in ("request_id", "call_ref", "name", "contract_id", "lease_schema_version")
+        },
+        "risk_level": str(event.get("risk_level", ""))[:32],
+        "idempotent": event.get("idempotent") if isinstance(event.get("idempotent"), bool) else None,
+        "decision": decision if decision in {"allow", "deny"} else "unknown",
+        "rule": rule if re.fullmatch(r"[a-z_]{1,60}", rule) else "unknown",
+        "approval": approval if approval in {"approved", "required", "not_required", "not_checked"} else "not_checked",
+    }
+
+
 def _generated_image_from_tool_event(event: dict[str, Any]) -> dict[str, Any] | None:
     if str(event.get("name", "")) != "generate_image":
         return None
@@ -765,70 +815,6 @@ def _is_managed_service_fallback_error(error: BaseException) -> bool:
             normalized,
         )
     )
-
-
-def _direct_output_budget(user_text: str, selected_skills: list[dict[str, Any]] | None = None) -> int:
-    """Return an output budget that follows the user's requested scope.
-
-    Ordinary conversation stays compact, but an explicitly structured long-form
-    request must never be forced through the same small response window.  In
-    particular, a request for several sections with required checks and an end
-    marker is an instruction about completeness, not an invitation to truncate
-    it and ask the user to continue in another turn.
-    """
-
-    text = str(user_text or "")
-    skill_ids = {str(item.get("id", "")).strip().lower() for item in list(selected_skills or [])}
-    if re.fullmatch(r"(?:你好|您好|嗨|hello|hi|hey|谢谢|thanks)[!！。.!！\s]*", text, re.IGNORECASE):
-        return 256
-    if "good-question" in skill_ids:
-        return 1_600
-    if re.search(
-        r"(?:不超过|至多|限(?:制)?在?)\s*\d+\s*(?:字|词|tokens?)"
-        r"|(?:一句|两句|二句|一段|简短|简洁|精简)"
-        r"|(?:one|two|[12])\s+sentences?\b|\bbrief(?:ly)?\b|\bconcise(?:ly)?\b",
-        text,
-        re.IGNORECASE,
-    ):
-        return 384
-    if re.search(
-        r"(?:[四五六七八九十\d]+\s*个(?:编号)?(?:部分|章节)|第\s*[四五六七八九十\d]+\s*(?:部分|章))"
-        r"|(?:每(?:个|一)?(?:部分|章节).{0,24}(?:至少|不少于|包含).{0,16}\d+\s*条)"
-        r"|(?:不要省略|完整结尾|最后一行|末尾必须|end\s+with)"
-        r"|(?:\b(?:[4-9]|[1-9]\d+)\s+(?:numbered\s+)?(?:sections?|parts?|chapters?)\b)",
-        text,
-        re.IGNORECASE,
-    ):
-        return 4_096
-    if skill_ids & {"literature-review", "nature-writing", "nature-reviewer", "nature-response"}:
-        return 4_096
-    if re.search(
-        r"(?:详细|全面|系统|完整|深入|长文|综述|教程|报告)"
-        r"|(?:detailed|comprehensive|in[- ]depth|tutorial|report|review)",
-        text,
-        re.IGNORECASE,
-    ):
-        return 3_072
-    if skill_ids & {"academic-research-suite", "nature-polishing", "nature-paper2ppt"}:
-        return 3_072
-    if skill_ids & {
-        "scientific-brainstorming",
-        "nature-statistics",
-        "scientific-visualization",
-        "nature-figure",
-        "nature-data",
-    }:
-        return 2_048
-    return 512
-
-
-def _direct_max_continuations(
-    user_text: str,
-    selected_skills: list[dict[str, Any]] | None = None,
-) -> int:
-    """Allow one safe continuation only for a user-requested long response."""
-
-    return 1 if _direct_output_budget(user_text, selected_skills) >= 3_072 else 0
 
 
 def _requested_completion_marker_from_text(user_text: str) -> str:
@@ -1318,6 +1304,12 @@ def _required_pi_tool_groups(task_mode: str | None, user_text: str = "") -> list
     return groups
 
 
+_PUBLIC_WEB_TOOLS = {
+    "search_web", "agent_reach", "browser_access", "discover_papers",
+    "verify_doi", "search_journal", "audit_references", "download_and_index",
+}
+
+
 def _missing_pi_tool_groups(
     task_mode: str | None,
     completed_tool_names: set[str],
@@ -1411,7 +1403,17 @@ def _structured_recovery(error: BaseException, *, stage_key: str = "") -> dict[s
                 result["retry_after_seconds"] = retry_after
         return result
     text = raw.lower()
-    if "scansci-pdf" in text and "json" in text and ("检索" in raw or "search" in text):
+    if "ollama" in text:
+        code, message, retryable = (
+            "local_model_unavailable",
+            redact_sensitive_text(str(error)),
+            True,
+        )
+        actions = [
+            {"id": "open_settings", "label": "检查本地模型", "kind": "settings"},
+            {"id": "retry", "label": "重试", "kind": "resume"},
+        ]
+    elif "scansci-pdf" in text and "json" in text and ("检索" in raw or "search" in text):
         code, message, retryable = (
             "paper_search_response_invalid",
             "文献检索服务返回了无法读取的结果，下载尚未开始。",
@@ -1499,6 +1501,9 @@ def _structured_recovery(error: BaseException, *, stage_key: str = "") -> dict[s
             {"id": "compact_retry", "label": "压缩并继续", "kind": "compact_retry"},
             {"id": "branch", "label": "从此处分支", "kind": "branch"},
         ]
+    elif "高精度检索模型" in raw:
+        code, message, retryable = "retrieval_model_not_ready", str(error), True
+        actions = [{"id": "retry", "label": "模型就绪后重试", "kind": "resume"}]
     elif "not found" in text or "不存在" in text or "unavailable" in text:
         code, message, retryable = (
             "resource_unavailable",
@@ -1872,12 +1877,14 @@ class _DirectChatRequest:
     notebook_id: str
     notebook_ids: list[str]
     knowledge_scope: dict[str, Any]
+    web_search_mode: str = "auto"
     manifest: RunManifest | None = None
     vision_route: dict[str, Any] = field(default_factory=dict)
     image_attachments: list[dict[str, Any]] = field(default_factory=list)
     pi_images: list[dict[str, str]] = field(default_factory=list)
     model_runtime: dict[str, Any] = field(default_factory=dict)
     provider_session_id: str = ""
+    effect_scope: str = field(default_factory=lambda: uuid4().hex)
 
 
 class _DurableModelClient:
@@ -2180,13 +2187,8 @@ def _apply_direct_chat_profile(
     contextual_instruction = _contextual_follow_up_instruction(chat_request.messages)
     if contextual_instruction:
         compact_system += " " + contextual_instruction
-    if chat_request.image_attachments:
-        compact_system += (
-            " For image questions, identify the image type first, then describe the visible "
-            "interface or objects and transcribe the most important readable text. Do not answer "
-            "with only one isolated phrase unless the user asks for a single label, and never "
-            "guess details that are not visible."
-        )
+    if chat_request.image_attachments and chat_request.vision_route.get("mode") != "ocr-fallback":
+        compact_system += " " + _VISION_IMAGE_INSTRUCTION
     messages = [dict(item) for item in chat_request.messages]
     messages[0] = {"role": "system", "content": compact_system}
     return replace(chat_request, messages=messages)
@@ -2430,7 +2432,7 @@ class ResearchAgentRuntime:
         """
 
         try:
-            settings = load_settings(self.workspace)
+            settings = load_settings(self.workspace, include_secret_status=False)
             providers = list(settings.get("providers", []) or [])
             provider = next(
                 (item for item in providers if str(item.get("id", "")) == "siliconflow"),
@@ -2517,6 +2519,11 @@ class ResearchAgentRuntime:
                 quality_profile=profile,
                 notebook_id=notebook_id,
             )
+        if force:
+            with self._model_lock:
+                for stack_key, stack in list(self._local_evidence_models.items()):
+                    if stack_key.startswith(f"neural:{profile}:") and dict(stack.metadata).get("fallback"):
+                        del self._local_evidence_models[stack_key]
         if self._remote_evidence_models_configured():
             try:
                 stack = self._local_evidence_stack(
@@ -2796,6 +2803,7 @@ class ResearchAgentRuntime:
         user_text: str,
         workflow_type: str = "",
         mcp_scope: str = "default",
+        web_search_mode: str = "auto",
     ) -> dict[str, Any]:
         user_text = _intent_classification_text(user_text)
         required_groups = _required_pi_tool_groups(task_mode, user_text)
@@ -2822,6 +2830,7 @@ class ResearchAgentRuntime:
         allow_unrelated_mcp = (
             not social_turn
             and normalized_mcp_scope not in {"disabled", "local-only", "selected-library"}
+            and not ("agent" in _pi_mode_parts(task_mode) and self._web_search_mode(web_search_mode) == "off")
         )
 
         def read_capable_mcp(item: dict[str, Any]) -> bool:
@@ -2853,9 +2862,12 @@ class ResearchAgentRuntime:
                 and read_capable_mcp(item)
             )
         ]
+        allowed_tools = set(preliminary.get("allowed_tools", []))
+        if "agent" in _pi_mode_parts(task_mode) and self._web_search_mode(web_search_mode) == "off":
+            allowed_tools.difference_update(_PUBLIC_WEB_TOOLS)
         lease = compile_capability_lease(
             catalog,
-            preliminary.get("allowed_tools", []),
+            allowed_tools,
             requested_mcp_server_ids=requested_mcp_servers,
         )
         return compile_task_contract(
@@ -4057,16 +4069,51 @@ class ResearchAgentRuntime:
         except (TypeError, ValueError) as error:
             raise ValueError("evidence retrieval controls must be integers") from error
         settings = load_settings(self.workspace)
-        quality_profile = self._retrieval_quality(payload, default="balanced")
-        # Do not let the first evidence question synchronously load local
-        # embedding/reranker weights on the conversation worker. The existing
-        # preparation path keeps retrieval responsive with its lexical fallback
-        # while the neural stack warms in the background.
-        self.prepare_local_evidence(evidence_db, quality_profile=quality_profile)
+        quality_profile = self._retrieval_quality(payload, default="precision")
+        indexed_evidence_dbs: list[Path] = []
+        if quality_profile == "precision":
+            for candidate in evidence_dbs:
+                if not candidate.is_file():
+                    continue
+                try:
+                    with sqlite3.connect(candidate) as connection:
+                        if connection.execute("select 1 from evidence_spans limit 1").fetchone():
+                            indexed_evidence_dbs.append(candidate)
+                except sqlite3.DatabaseError:
+                    continue
+        indexed_evidence_db = indexed_evidence_dbs[0] if indexed_evidence_dbs else None
+        # Start model preparation without blocking the conversation worker.
+        # Precision questions with indexed evidence request a retry while
+        # models load instead of presenting the lexical fallback as precision.
+        if quality_profile != "precision" or indexed_evidence_db is not None:
+            self.prepare_local_evidence(indexed_evidence_db or evidence_db, quality_profile=quality_profile)
         local_evidence = self._local_evidence_stack(
-            evidence_db,
-            quality_profile=quality_profile,
+            indexed_evidence_db or evidence_db,
+            quality_profile=quality_profile if indexed_evidence_db is not None else "balanced",
         )
+        if indexed_evidence_db is not None:
+            metadata = local_evidence.metadata
+            if metadata.get("preparing"):
+                raise RuntimeError("高精度检索模型正在加载，请等知识库状态显示就绪后重试。")
+            if not (
+                metadata.get("effective_quality_profile") == "precision"
+                and (metadata.get("local_neural_embedding") or metadata.get("remote_embedding_active"))
+                and (metadata.get("local_neural_reranker") or metadata.get("remote_reranker_active"))
+            ):
+                reasons = "; ".join(str(item) for item in metadata.get("fallback_reasons", []) if item)
+                raise RuntimeError(f"高精度检索模型未就绪：{reasons or '嵌入或重排模型不可用'}。请检查知识库模型状态后重试。")
+            from .retrieval import _has_ready_document_cards
+
+            embedding = local_evidence.embedding_provider
+            cache_key = str(getattr(embedding, "cache_key", "") or "")
+            dimensions = int(getattr(embedding, "dimensions", 0) or 0)
+            for candidate in indexed_evidence_dbs:
+                if not _has_ready_document_cards(candidate):
+                    continue
+                cache = vector_cache_status(candidate, provider=cache_key, dimensions=dimensions)
+                if not cache.get("ready"):
+                    self._maybe_warm_cache_in_background(candidate, local_evidence)
+                    raise RuntimeError("高精度检索模型已就绪，知识库向量索引仍在构建；请等索引完成后重试。")
         active = dict(settings.get("active_model", {}) or {})
         provider = next(
             (item for item in settings.get("providers", []) if item.get("id") == active.get("provider_id")),
@@ -4083,12 +4130,15 @@ class ResearchAgentRuntime:
         # drafting) that can leave the direct-chat surface waiting for minutes.
         force_local_evidence = bool(payload.get("force_local_evidence", False))
         research_run_id = str(payload.get("_research_run_id", "") or "")
+        research_effect_scope = ""
         durable_task_contract: dict[str, Any] | None = None
         scientific_child_role = ""
         scientific_child_schema: dict[str, Any] = {}
         scientific_allowed_uris: set[str] = set()
         if research_run_id:
             durable_run = self.store.get_run(research_run_id)
+            effect_epoch = str(dict(durable_run.get("metadata", {}) or {}).get("effect_epoch", "initial"))
+            research_effect_scope = f"research-run:{research_run_id}:tool:{effect_epoch}"
             persisted_contract = dict(durable_run.get("task_contract", {}) or {})
             is_scientific_child = (
                 str(dict(durable_run.get("metadata", {}) or {}).get("runtime", ""))
@@ -4129,15 +4179,7 @@ class ResearchAgentRuntime:
             vision_model_id = active_model_id if active_has_vision else ""
             vision_api_key = ""
             if vision_provider is not None:
-                managed_vision = str(vision_provider.get("auth_mode", "")) == "managed"
-                vision_api_key = (
-                    "scansci-managed-gateway"
-                    if managed_vision
-                    else "local"
-                    if str(vision_provider.get("auth_mode", "")).strip().lower() == "local"
-                    or str(vision_provider.get("kind", "")).strip().lower() == "local"
-                    else get_provider_api_key(self.workspace, str(vision_provider.get("id", "")))
-                )
+                vision_api_key = provider_request_api_key(self.workspace, vision_provider, key_lookup=get_provider_api_key)
                 if not vision_api_key:
                     vision_provider = None
             if vision_provider is None:
@@ -4202,14 +4244,7 @@ class ResearchAgentRuntime:
         ):
             assert provider is not None
             managed = str(provider.get("auth_mode", "")) == "managed"
-            local_provider = str(provider.get("kind", "")).strip().lower() == "local"
-            api_key = (
-                "scansci-managed-gateway"
-                if managed
-                else "local"
-                if local_provider
-                else get_provider_api_key(self.workspace, str(provider.get("id", "")))
-            )
+            api_key = provider_request_api_key(self.workspace, provider, key_lookup=get_provider_api_key)
             pi_provider_kind = str(provider.get("kind", ""))
             pi_base_url = str(provider.get("base_url", ""))
             if str(provider.get("id", "")) == "local-huggingface":
@@ -4294,6 +4329,7 @@ class ResearchAgentRuntime:
                         notebook_ids=requested_notebook_ids,
                         knowledge_scope=self._scope_for_notebook(payload, notebook),
                         active_run_id=research_run_id,
+                        effect_scope=research_effect_scope,
                         scientific_agent_control=(
                             self._scientific_agent_control if research_run_id else None
                         ),
@@ -4581,6 +4617,14 @@ class ResearchAgentRuntime:
     @staticmethod
     def _pi_task_mode(chat_mode: str) -> str:
         return chat_mode if chat_mode in {"knowledge", "slides"} else "general"
+
+    @staticmethod
+    def _agent_task_mode(task_mode: str, *, requested: bool) -> str:
+        """An explicit Agent choice asks Pi to plan within the existing Host lease."""
+
+        if not requested or "agent" in _pi_mode_parts(task_mode):
+            return task_mode
+        return "agent" if task_mode == "general" else f"{task_mode}+agent"
 
     @staticmethod
     def _evidence_policy(task_mode: str) -> str:
@@ -5010,6 +5054,7 @@ class ResearchAgentRuntime:
             user_text=self._last_user_text(chat_request.messages),
             workflow_type=workflow_type,
             mcp_scope="selected-library" if requested_notebook_ids else "default",
+            web_search_mode=chat_request.web_search_mode,
         )
         turn_contract = self._contract_for_active_run(active_run_id, fallback=turn_contract)
         mode_parts = _pi_mode_parts(resolved_task_mode)
@@ -5028,6 +5073,7 @@ class ResearchAgentRuntime:
                 "embedding_provider": local_evidence.embedding_provider if local_evidence else None,
                 "reranker": local_evidence.reranker if local_evidence else None,
                 "active_run_id": active_run_id,
+                "effect_scope": chat_request.effect_scope,
                 "scientific_agent_control": self._scientific_agent_control,
             },
         )
@@ -5318,6 +5364,9 @@ class ResearchAgentRuntime:
         if user_index < 0:
             return None
         messages = [dict(item) for item in chat_request.messages]
+        if messages and messages[0].get("role") == "system" and isinstance(messages[0].get("content"), str):
+            messages[0]["content"] = messages[0]["content"].replace(_VISION_IMAGE_INSTRUCTION, "").strip()
+            messages[0]["content"] += "\n\nOnly OCR text is available for this turn; do not claim to see image pixels."
         original = messages[user_index].get("content")
         text = "\n".join(
             str(part.get("text", ""))
@@ -5331,7 +5380,7 @@ class ResearchAgentRuntime:
         )
         messages[user_index]["content"] = f"{text}\n\n{image_context}".strip()
         managed = str(provider.get("auth_mode", "")) == "managed"
-        api_key = "scansci-managed-gateway" if managed else get_provider_api_key(self.workspace, provider_id)
+        api_key = provider_request_api_key(self.workspace, provider, key_lookup=get_provider_api_key)
         if not api_key:
             return None
         responses_enabled = bool(provider.get("responses_enabled", False))
@@ -5463,7 +5512,6 @@ class ResearchAgentRuntime:
         duplicating partial prose in the transcript.
         """
 
-        user_text = self._last_user_text(chat_request.messages)
         visible_output_started = False
         try:
             for event in stream_chat_text(
@@ -5475,16 +5523,12 @@ class ResearchAgentRuntime:
                 thinking_mode=_direct_thinking_mode(chat_request),
                 session=chat_request.session,
                 timeout=45.0,
-                max_tokens=_direct_output_budget(user_text, chat_request.selected_skills),
-                max_continuations=_direct_max_continuations(
-                    user_text,
-                    chat_request.selected_skills,
-                ),
+                max_tokens=None,
                 max_requests=1,
                 temperature=0.2,
                 **_model_transport_kwargs(chat_request),
             ):
-                if event.get("type") == "delta" and str(event.get("content", "")):
+                if event.get("type") in {"delta", "reasoning"} and str(event.get("content", "")):
                     visible_output_started = True
                 yield event
         except Exception as error:
@@ -5602,6 +5646,8 @@ class ResearchAgentRuntime:
         text = "".join(fragments).strip()
         if not text:
             raise RuntimeError("模型返回了空回答")
+        if events["truncated"]:
+            text += "\n\n（回复尚未完整；请继续追问未完成的部分。）"
         return text, usage, events
 
     def _pi_events_with_compatibility_fallback(
@@ -5611,6 +5657,7 @@ class ResearchAgentRuntime:
         task_mode: str | None = None,
         session_id: str | None = None,
         active_run_id: str = "",
+        require_pi: bool = False,
         fallback_attempted: bool = False,
         precompleted_tool_calls: Iterable[dict[str, Any]] | None = None,
         fallback_timeout_seconds: float = 45.0,
@@ -5652,8 +5699,17 @@ class ResearchAgentRuntime:
                 model_events = self._pi_model_events(chat_request, **model_event_kwargs)
             for event in model_events:
                 event_type = str(event.get("type", ""))
-                if event_type == "delta" and str(event.get("content", "")):
+                if event_type in {"delta", "reasoning"} and str(event.get("content", "")):
                     effect_started = True
+                elif event_type == "tool.authorization" and event.get("decision") == "allow":
+                    # Authorization may already have queued a writer before a transport failure.
+                    effect_started = effect_started or event.get("idempotent") is False
+                elif event_type == "status" and event.get("status") == "mcp_effect_start":
+                    details = event.get("details")
+                    policy = details if isinstance(details, dict) else {}
+                    effect_started = effect_started or (
+                        policy.get("effect") != "read" and policy.get("idempotent") is not True
+                    )
                 elif event_type in {"tool.completed", "tool.failed"}:
                     capability_ledger.record_event(event)
                     if event_type == "tool.completed":
@@ -5675,8 +5731,10 @@ class ResearchAgentRuntime:
         except _RunCancelled:
             raise
         except Exception as error:
+            if effect_started:
+                raise
             task_parts = _pi_mode_parts(task_mode)
-            if completed_web_search is not None and task_parts & {"web", "web-auto"}:
+            if not require_pi and completed_web_search is not None and task_parts & {"web", "web-auto"}:
                 yield {
                     "type": "search.delivery",
                     "reason": f"{type(error).__name__}: {error}"[:500],
@@ -5685,7 +5743,8 @@ class ResearchAgentRuntime:
                 yield {"type": "done", "usage": {}, "truncated": False}
                 return
             if (
-                completed_document_summary is not None
+                not require_pi
+                and completed_document_summary is not None
                 and task_parts & {"task-documents", "research"}
                 and "slides" not in task_parts
             ):
@@ -5699,8 +5758,6 @@ class ResearchAgentRuntime:
                 }
                 yield {"type": "done", "usage": {}, "truncated": False}
                 return
-            if effect_started:
-                raise
             fallback = self._managed_fallback_chat_request(chat_request)
             if (
                 isinstance(error, PiAgentRunError)
@@ -5736,6 +5793,7 @@ class ResearchAgentRuntime:
                     # the backup model cleanly rather than resuming a GLM turn.
                     session_id=None,
                     active_run_id=active_run_id,
+                    require_pi=require_pi,
                     fallback_attempted=True,
                     precompleted_tool_calls=precompleted_tool_calls,
                     fallback_timeout_seconds=fallback_timeout_seconds,
@@ -5745,7 +5803,7 @@ class ResearchAgentRuntime:
                 )
                 return
             if (
-                _pi_requires_tools(task_mode, self._last_user_text(chat_request.messages))
+                (require_pi or _pi_requires_tools(task_mode, self._last_user_text(chat_request.messages)))
                 and capability_ledger.safe_retry_allowed()
             ):
                 # No text, tool start, or persisted effect escaped the failed
@@ -5792,6 +5850,8 @@ class ResearchAgentRuntime:
                 and not capability_ledger.ready
             ):
                 raise capability_ledger.delivery_error(cause=error)
+            if require_pi:
+                raise
             if chat_request.vision_route:
                 # Images never cross the legacy direct-provider compatibility
                 # path. A declared alternate vision descriptor, OCR text-only
@@ -5820,13 +5880,7 @@ class ResearchAgentRuntime:
                 thinking_mode=_direct_thinking_mode(chat_request),
                 session=chat_request.session,
                 timeout=fallback_timeout_seconds,
-                max_tokens=fallback_max_tokens or _direct_output_budget(
-                    self._last_user_text(chat_request.messages), chat_request.selected_skills
-                ),
-                max_continuations=_direct_max_continuations(
-                    self._last_user_text(chat_request.messages),
-                    chat_request.selected_skills,
-                ),
+                max_tokens=fallback_max_tokens,
                 temperature=fallback_temperature,
                 # Compatibility is a single clean fallback attempt.  The
                 # provider transport owns its one bounded retry; this layer
@@ -5846,6 +5900,7 @@ class ResearchAgentRuntime:
         fragments: list[str] = []
         usage: dict[str, int] = {}
         tool_calls: list[dict[str, str]] = []
+        tool_authorizations: list[dict[str, Any]] = []
         resolved_task_mode = str(task_mode or self._pi_task_mode(chat_request.chat_mode))
         capability_ledger = CapabilityLedger(
             _required_pi_tool_groups(
@@ -5891,6 +5946,7 @@ class ResearchAgentRuntime:
                     "name": str(event.get("name", "")),
                     "status": "completed",
                 }
+                call_record.update({key: str(event[key])[:120] for key in ("request_id", "call_ref") if event.get(key)})
                 if str(event.get("capability_id", "")):
                     call_record["capability_id"] = str(event.get("capability_id", ""))
                 tool_calls.append(call_record)
@@ -5904,9 +5960,12 @@ class ResearchAgentRuntime:
                     "status": "failed",
                     "error": str(event.get("error", ""))[:500],
                 }
+                call_record.update({key: str(event[key])[:120] for key in ("request_id", "call_ref") if event.get(key)})
                 if str(event.get("capability_id", "")):
                     call_record["capability_id"] = str(event.get("capability_id", ""))
                 tool_calls.append(call_record)
+            elif event_type == "tool.authorization":
+                tool_authorizations.append(_tool_authorization_record(event))
             elif event_type == "notice":
                 advisory = _model_advisory_payload(event)
                 if advisory and not any(
@@ -5966,6 +6025,7 @@ class ResearchAgentRuntime:
                 "task_profile": dict(task_contract.get("task_profile", {}) or {}),
                 "task_contract": task_contract,
                 "tool_calls": tool_calls,
+                "tool_authorizations": tool_authorizations[-64:],
                 "capability_ledger": capability_ledger.to_dict(),
                 "session": session,
                 "control": control,
@@ -6026,33 +6086,27 @@ class ResearchAgentRuntime:
     def cancel_chat(self, payload: dict[str, Any] | None = None) -> bool:
         """Cancel the active direct-chat stream if one is running."""
         control_id = str(dict(payload or {}).get("run_id", "") or "").strip()
+        if not control_id:
+            return False
         with self._active_pi_lock:
-            image_cancel = self._explicit_image_cancellations.get(control_id) if control_id else next(
-                iter(self._explicit_image_cancellations.values()), None,
-            )
+            image_cancel = self._explicit_image_cancellations.get(control_id)
             if image_cancel is not None:
                 image_cancel.set()
                 return True
-            client = self._active_pi_clients.get(control_id) if control_id else next(
-                iter(self._active_pi_clients.values()),
-                None,
-            )
+            client = self._active_pi_clients.get(control_id)
         return bool(client is not None and client.active_request_id and client.cancel(client.active_request_id))
 
     def pause_chat(self, payload: dict[str, Any] | None = None) -> bool:
         """Interrupt a direct-chat request without discarding its persisted session."""
         control_id = str(dict(payload or {}).get("run_id", "") or "").strip()
+        if not control_id:
+            return False
         with self._active_pi_lock:
-            image_cancel = self._explicit_image_cancellations.get(control_id) if control_id else next(
-                iter(self._explicit_image_cancellations.values()), None,
-            )
+            image_cancel = self._explicit_image_cancellations.get(control_id)
             if image_cancel is not None:
                 image_cancel.set()
                 return True
-            client = self._active_pi_clients.get(control_id) if control_id else next(
-                iter(self._active_pi_clients.values()),
-                None,
-            )
+            client = self._active_pi_clients.get(control_id)
         return bool(client is not None and client.active_request_id and client.pause(client.active_request_id))
 
     def pi_status(self) -> dict[str, Any]:
@@ -6148,10 +6202,7 @@ class ResearchAgentRuntime:
         """Inject mid-conversation steering to the active chat."""
         control_id = str(payload.get("run_id", "") or "").strip()
         with self._active_pi_lock:
-            client = self._active_pi_clients.get(control_id) if control_id else next(
-                iter(self._active_pi_clients.values()),
-                None,
-            )
+            client = self._active_pi_clients.get(control_id) if control_id else None
         if client is None or not client.active_request_id:
             return {"ok": False, "error": "无活跃对话"}
         attachments = persist_image_attachments(self.workspace, payload.get("images", []))
@@ -6168,10 +6219,7 @@ class ResearchAgentRuntime:
 
         control_id = str(payload.get("run_id", "") or "").strip()
         with self._active_pi_lock:
-            client = self._active_pi_clients.get(control_id) if control_id else next(
-                iter(self._active_pi_clients.values()),
-                None,
-            )
+            client = self._active_pi_clients.get(control_id) if control_id else None
         if client is None or not client.active_request_id:
             return {"ok": False, "error": "目标任务当前没有活跃的 Pi 会话"}
         attachments = persist_image_attachments(self.workspace, payload.get("images", []))
@@ -6194,10 +6242,7 @@ class ResearchAgentRuntime:
         control_id = str(payload.get("run_id", "") or "").strip()
         interaction_id = str(payload.get("interaction_id", "") or "").strip()
         with self._active_pi_lock:
-            client = self._active_pi_clients.get(control_id) if control_id else next(
-                iter(self._active_pi_clients.values()),
-                None,
-            )
+            client = self._active_pi_clients.get(control_id) if control_id else None
         if client is None or not client.active_request_id:
             return {"ok": False, "error": "目标任务当前没有活跃的 Pi 会话"}
         response = dict(payload.get("response", {}) or {})
@@ -6229,6 +6274,7 @@ class ResearchAgentRuntime:
             chat_request = self._direct_chat_request(
                 {
                     "conversation_id": str(payload.get("conversation_id", "")).strip(),
+                    "model": payload.get("model"),
                     "messages": [{"role": "user", "content": question}],
                     "chat_mode": "general",
                     "thinking_level": "off",
@@ -6386,6 +6432,13 @@ class ResearchAgentRuntime:
     def chat(self, payload: dict[str, Any]) -> dict[str, Any]:
         """Run a normal model conversation without requiring imported evidence."""
 
+        if payload.get("agent_mode") is True and (payload.get("notebook_id") or payload.get("notebook_ids")):
+            for event in self.chat_stream(payload):
+                if event["type"] == RUN_ERROR:
+                    raise RuntimeError(str(event.get("message", "Agent 知识库问答未完成")))
+                if event["type"] == RUN_FINISHED:
+                    return dict(event["result"])
+            raise RuntimeError("Agent 知识库问答未完成")
         if "image_model" in payload:
             for event in self._explicit_image_stream(payload):
                 if event["type"] == RUN_ERROR:
@@ -6397,6 +6450,7 @@ class ResearchAgentRuntime:
         ingestion = self._ingest_direct_attachments(payload)
         attachment_context = ingestion_context(self.workspace, str(ingestion["job_id"])) if ingestion else ""
         chat_request = self._direct_chat_request(payload, attachment_context=attachment_context)
+        agent_requested = payload.get("agent_mode") is True
         web_search_mode = self._web_search_mode(payload.get("web_search"))
         local_facts = self._runtime_fact_answer(payload, chat_request)
         pi_task_mode = (
@@ -6413,10 +6467,13 @@ class ResearchAgentRuntime:
                 ),
             )
         )
+        if not local_facts:
+            pi_task_mode = self._agent_task_mode(pi_task_mode, requested=agent_requested)
         user_text = self._last_user_text(chat_request.messages)
         task_contract = self._compile_contract(
             task_mode=pi_task_mode,
             user_text=user_text,
+            web_search_mode=web_search_mode,
             mcp_scope=(
                 "selected-library"
                 if chat_request.notebook_id or chat_request.notebook_ids
@@ -6491,6 +6548,7 @@ class ResearchAgentRuntime:
             "task_profile": task_profile,
             "task_contract": task_contract,
             "web_search": web_search_mode,
+            "agent_mode_requested": agent_requested,
             "compatibility_fallback": False,
             "compatibility_error": "",
         }
@@ -6506,6 +6564,7 @@ class ResearchAgentRuntime:
                     session_id=str(payload.get("pi_session_id") or payload.get("session_id") or "").strip() or None,
                 )
                 agent_runtime["web_search"] = web_search_mode
+                agent_runtime["agent_mode_requested"] = agent_requested
                 agent_runtime.setdefault("task_profile", task_profile)
                 if not text:
                     raise RuntimeError("Pi Agent returned an empty response")
@@ -6516,8 +6575,10 @@ class ResearchAgentRuntime:
                     raise PiMultimodalUnavailable(
                         "Pi could not complete the declared multimodal/OCR route"
                     ) from error
-                if _pi_requires_tools(pi_task_mode, user_text):
+                if agent_requested or _pi_requires_tools(pi_task_mode, user_text):
                     raise RuntimeError(
+                        "ScanSci Agent 未能完成本轮任务；请检查 Pi 运行组件或当前模型的工具调用能力"
+                        if agent_requested else
                         "ScanSci 未能完成本轮必需的工具调用；为避免编造能力或结果，本轮不会退化为裸模型回答"
                     ) from error
                 if chat_request.vision_route:
@@ -6526,23 +6587,10 @@ class ResearchAgentRuntime:
                         user_text=user_text,
                     )
                 else:
-                    completion = complete_chat_text(
-                        chat_request.provider_kind,
-                        base_url=chat_request.base_url,
-                        api_key=chat_request.api_key,
-                        model=chat_request.model_id,
-                        messages=self._direct_fallback_messages_with_skills(chat_request),
-                        thinking_mode=_direct_thinking_mode(chat_request),
-                        session=chat_request.session,
-                        include_usage=True,
-                        timeout=45.0,
-                        max_requests=1,
-                        max_tokens=_direct_output_budget(user_text, chat_request.selected_skills),
-                        temperature=0.2,
-                        **_model_transport_kwargs(chat_request),
+                    text, usage, direct_events = self._complete_direct_with_managed_fallback(
+                        replace(chat_request, messages=self._direct_fallback_messages_with_skills(chat_request)),
+                        user_text=user_text,
                     )
-                    text, usage = completion if isinstance(completion, tuple) else (completion, {})
-                    direct_events = {}
                 agent_runtime = {
                     "harness": "direct-provider",
                     "compatibility_fallback": True,
@@ -6576,21 +6624,10 @@ class ResearchAgentRuntime:
                     agent_runtime["compatibility_fallback"] = True
                     agent_runtime["compatibility_error"] = str(direct_events.get("compatibility_error", ""))
             else:
-                completion = complete_chat_text(
-                    chat_request.provider_kind,
-                    base_url=chat_request.base_url,
-                    api_key=chat_request.api_key,
-                    model=chat_request.model_id,
-                    messages=chat_request.messages,
-                    thinking_mode=_direct_thinking_mode(chat_request),
-                    session=chat_request.session,
-                    include_usage=True,
-                    timeout=45.0,
-                    max_tokens=_direct_output_budget(user_text, chat_request.selected_skills),
-                    temperature=0.2,
-                    **_model_transport_kwargs(chat_request),
+                text, usage, direct_events = self._complete_direct_with_managed_fallback(
+                    chat_request,
+                    user_text=user_text,
                 )
-                text, usage = completion if isinstance(completion, tuple) else (completion, {})
         if chat_request.vision_route:
             effective_route = dict(chat_request.vision_route)
             vision_fallback = agent_runtime.get("vision_fallback")
@@ -6618,6 +6655,10 @@ class ResearchAgentRuntime:
         text, contextual_usage, contextual_repaired = self._repair_contextual_follow_up_if_needed(
             chat_request,
             text,
+            require_pi=agent_requested,
+            task_mode=pi_task_mode,
+            session_id=str(dict(agent_runtime.get("session", {}) or {}).get("session_id", "")).strip() or None,
+            agent_runtime=agent_runtime,
         )
         usage = _merge_usage(usage, contextual_usage)
         text = _repair_scientific_rewrite(user_text, text)
@@ -6669,14 +6710,16 @@ class ResearchAgentRuntime:
             "model": {"provider_id": chat_request.provider_id, "model_id": chat_request.model_id},
             "agent_runtime": agent_runtime,
         }
-        if chat_request.image_attachments:
+        if chat_request.image_attachments and chat_request.vision_route.get("context_source") != "conversation_history":
             result["user_images"] = list(chat_request.image_attachments)
         if ingestion:
             result["ingestion"] = ingestion
             message["sources"] = list(ingestion.get("sources", []) or [])
         return result
 
-    def continue_run_conversation(self, run_id: str, payload: dict[str, Any]) -> dict[str, Any]:
+    def continue_run_conversation(
+        self, run_id: str, payload: dict[str, Any], *, effect_scope: str = "",
+    ) -> dict[str, Any]:
         """Answer a follow-up without breaking it out into a new chat thread."""
 
         run = self.store.get_run(run_id)
@@ -6763,10 +6806,13 @@ class ResearchAgentRuntime:
                 ],
             }
         )
+        if effect_scope:
+            chat_request = replace(chat_request, effect_scope=effect_scope)
+        agent_requested = payload.get("agent_mode") is True
         catalog_request = self._knowledge_catalog_request(
             self._last_user_text(chat_request.messages)
         )
-        if self._uses_knowledge_catalog_answer(chat_request, ingestion=None):
+        if not agent_requested and self._uses_knowledge_catalog_answer(chat_request, ingestion=None):
             # A task that built an evidence index may not have any downloaded
             # task artifacts.  Its bound notebook is still immediately
             # queryable, so inventory follow-ups must not enter the
@@ -6810,11 +6856,13 @@ class ResearchAgentRuntime:
                 or chat_request.knowledge_scope
             ),
         )
+        pi_task_mode = self._agent_task_mode(pi_task_mode, requested=agent_requested)
         user_text = self._last_user_text(chat_request.messages)
         task_contract = self._compile_contract(
             task_mode=pi_task_mode,
             user_text=user_text,
             workflow_type=str(run.get("workflow_type", "")),
+            web_search_mode=self._web_search_mode(payload.get("web_search")),
             mcp_scope=(
                 "selected-library"
                 if chat_request.notebook_id or chat_request.notebook_ids
@@ -6829,6 +6877,7 @@ class ResearchAgentRuntime:
         )
         agent_runtime["task_profile"] = task_profile
         agent_runtime["task_contract"] = task_contract
+        agent_runtime["agent_mode_requested"] = agent_requested
         try:
             if self._pi_eligible(chat_request, payload) and pi_needed:
                 try:
@@ -6838,6 +6887,7 @@ class ResearchAgentRuntime:
                         session_id=f"research-run-{run_id}",
                         active_run_id=run_id,
                     )
+                    agent_runtime["agent_mode_requested"] = agent_requested
                 except _RunCancelled:
                     raise
                 except Exception as error:
@@ -6848,7 +6898,7 @@ class ResearchAgentRuntime:
                         or error.failure.get("code") in {"timeout", "upstream_timeout", "upstream_connection_failed", "model_transport_unavailable"}
                     )):
                         raise
-                    if _pi_requires_tools(
+                    if agent_requested or _pi_requires_tools(
                         pi_task_mode,
                         self._last_user_text(chat_request.messages),
                     ):
@@ -6871,6 +6921,7 @@ class ResearchAgentRuntime:
                                 agent_runtime = {
                                     **dict(agent_runtime or {}),
                                     "task_profile": task_profile,
+                                    "agent_mode_requested": agent_requested,
                                     "session_recovered": True,
                                     "session_recovery_error": f"{type(error).__name__}: {error}"[:500],
                                 }
@@ -6890,28 +6941,10 @@ class ResearchAgentRuntime:
                                 "ScanSci 未能完成本轮所需的受控工具调用；为避免编造结果，本轮不会退化为裸模型回答"
                             ) from error
                     else:
-                        completion = complete_chat_text(
-                            chat_request.provider_kind,
-                            base_url=chat_request.base_url,
-                            api_key=chat_request.api_key,
-                            model=chat_request.model_id,
-                            messages=chat_request.messages,
-                            thinking_mode=_direct_thinking_mode(chat_request),
-                            session=chat_request.session,
-                            include_usage=True,
-                            timeout=45.0,
-                            max_requests=_MAX_LOGICAL_REQUESTS,
-                            max_tokens=_direct_output_budget(
-                                self._last_user_text(chat_request.messages),
-                                chat_request.selected_skills,
-                            ),
-                            temperature=0.2,
-                            **_model_transport_kwargs(chat_request),
+                        text, usage, _ = self._complete_direct_with_managed_fallback(
+                            chat_request,
+                            user_text=user_text,
                         )
-                        if isinstance(completion, tuple):
-                            text, usage = completion
-                        else:
-                            text, usage = completion, {}
                         agent_runtime = {
                             "harness": "direct-provider",
                             "compatibility_fallback": True,
@@ -6928,27 +6961,10 @@ class ResearchAgentRuntime:
                         "这个追问需要读取当前任务登记的文档，但当前模型不支持 Pi 工具循环；"
                         "请选择支持工具调用的在线对话模型"
                     )
-                completion = complete_chat_text(
-                    chat_request.provider_kind,
-                    base_url=chat_request.base_url,
-                    api_key=chat_request.api_key,
-                    model=chat_request.model_id,
-                    messages=chat_request.messages,
-                    thinking_mode=_direct_thinking_mode(chat_request),
-                    session=chat_request.session,
-                    include_usage=True,
-                    timeout=45.0,
-                    max_tokens=_direct_output_budget(
-                        self._last_user_text(chat_request.messages),
-                        chat_request.selected_skills,
-                    ),
-                    temperature=0.2,
-                    **_model_transport_kwargs(chat_request),
+                text, usage, _ = self._complete_direct_with_managed_fallback(
+                    chat_request,
+                    user_text=user_text,
                 )
-                if isinstance(completion, tuple):
-                    text, usage = completion
-                else:
-                    text, usage = completion, {}
             text = str(text).strip()
             if not text:
                 raise RuntimeError("The model returned an empty response")
@@ -7312,12 +7328,18 @@ class ResearchAgentRuntime:
                 )
 
             chat_request = self._direct_chat_request(payload, attachment_context=attachment_context)
+            agent_requested = payload.get("agent_mode") is True
+            if agent_requested and chat_request.chat_mode in {"general", "writing"} and (
+                chat_request.notebook_id or chat_request.notebook_ids
+            ) and ingestion is None:
+                chat_request = replace(chat_request, chat_mode="knowledge")
             if self._uses_evidence_grounded_writing(chat_request, ingestion=ingestion):
                 yield from self._stream_evidence_grounded_writing(
                     run_id=run_id,
                     message_id=message_id,
                     chat_request=chat_request,
                     session_id=str(payload.get("pi_session_id") or payload.get("session_id") or "").strip() or None,
+                    agent_requested=agent_requested,
                 )
                 return
             if self._uses_knowledge_catalog_answer(chat_request, ingestion=ingestion):
@@ -7326,6 +7348,7 @@ class ResearchAgentRuntime:
                     message_id=message_id,
                     chat_request=chat_request,
                     request=self._knowledge_catalog_request(self._last_user_text(chat_request.messages)),
+                    agent_requested=agent_requested,
                 )
                 return
             if self._uses_verified_knowledge_answer(chat_request, ingestion=ingestion):
@@ -7334,6 +7357,7 @@ class ResearchAgentRuntime:
                     message_id=message_id,
                     chat_request=chat_request,
                     payload=payload,
+                    agent_requested=agent_requested,
                 )
                 return
             web_search_mode = self._web_search_mode(payload.get("web_search"))
@@ -7352,10 +7376,13 @@ class ResearchAgentRuntime:
                     ),
                 )
             )
+            if not local_facts:
+                pi_task_mode = self._agent_task_mode(pi_task_mode, requested=agent_requested)
             user_text = self._last_user_text(chat_request.messages)
             task_contract = self._compile_contract(
                 task_mode=pi_task_mode,
                 user_text=user_text,
+                web_search_mode=web_search_mode,
                 mcp_scope=(
                     "selected-library"
                     if chat_request.notebook_id or chat_request.notebook_ids
@@ -7437,7 +7464,9 @@ class ResearchAgentRuntime:
                 "task_profile": task_profile,
                 "task_contract": task_contract,
                 "web_search": web_search_mode,
+                "agent_mode_requested": agent_requested,
                 "tool_calls": [],
+                "tool_authorizations": [],
                 "skills": [dict(item) for item in chat_request.selected_skills],
                 "session": {},
                 "compactions": [],
@@ -7468,6 +7497,7 @@ class ResearchAgentRuntime:
                 yield run_event(CUSTOM, run_id=run_id, name="process_trace", value=trace)
             yield run_event(TEXT_MESSAGE_START, run_id=run_id, messageId=message_id, role="assistant")
             fragments: list[str] = []
+            reasoning_fragments: list[str] = []
             usage: dict[str, int] = (
                 {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
                 if local_facts
@@ -7506,6 +7536,7 @@ class ResearchAgentRuntime:
                     task_mode=pi_task_mode if pi_task_mode != "general" else None,
                     session_id=str(payload.get("pi_session_id") or payload.get("session_id") or "").strip() or None,
                     active_run_id=run_id,
+                    require_pi=agent_requested,
                 )
             else:
                 # Only deterministic local facts bypass Pi. Model-mediated
@@ -7536,6 +7567,11 @@ class ResearchAgentRuntime:
                                     messageId=message_id,
                                     delta=safe_prefix,
                                 )
+                elif model_event.get("type") == "reasoning":
+                    reasoning_delta = str(model_event.get("content", ""))
+                    if reasoning_delta:
+                        reasoning_fragments.append(reasoning_delta)
+                        yield run_event(CUSTOM, run_id=run_id, name="model_reasoning", value={"delta": reasoning_delta})
                 elif model_event.get("type") == "done":
                     raw_stats = model_event.get("stats")
                     if isinstance(raw_stats, dict):
@@ -7551,8 +7587,29 @@ class ResearchAgentRuntime:
                 elif model_event.get("type") == "status":
                     status = str(model_event.get("status", ""))
                     tool_name = str(model_event.get("name", ""))
-                    if status == "tool_started" and tool_name:
+                    if status in {"local_model_loading", "local_model_ready"}:
+                        trace.append({
+                            "title": "加载本地模型" if status == "local_model_loading" else "本地模型已加载",
+                            "detail": (
+                                f"Ollama 正在将 {tool_name} 加载到内存，完成后开始生成回复。"
+                                if status == "local_model_loading"
+                                else f"{tool_name} 已加载，正在处理这轮提问。"
+                            ),
+                            "status": status,
+                        })
+                        yield run_event(CUSTOM, run_id=run_id, name="process_trace", value=trace)
+                    elif status == "tool_started" and tool_name:
                         trace.append({"title": "Pi Agent 调用工具", "detail": f"正在执行 ScanSci 工具：{tool_name}", "tool_name": tool_name, "status": "started"})
+                        yield run_event(CUSTOM, run_id=run_id, name="process_trace", value=trace)
+                    elif status == "continuing" and tool_name in {"output_limit", "incomplete_html"}:
+                        trace.append({
+                            "title": "自动续写",
+                            "detail": (
+                                "模型达到单次输出上限，已保留已生成内容并从断点继续。"
+                                if tool_name == "output_limit"
+                                else "模型提前结束了完整 HTML 页面，已保留已生成内容并从断点继续。"
+                            ),
+                        })
                         yield run_event(CUSTOM, run_id=run_id, name="process_trace", value=trace)
                     elif status.startswith("mcp_"):
                         details = dict(model_event.get("details", {}) or {})
@@ -7624,9 +7681,27 @@ class ResearchAgentRuntime:
                         name="agent_control",
                         value=control_event,
                     )
+                elif model_event.get("type") == "tool.authorization":
+                    authorization = _tool_authorization_record(model_event)
+                    agent_runtime["tool_authorizations"].append(authorization)
+                    agent_runtime["tool_authorizations"] = agent_runtime["tool_authorizations"][-64:]
+                    trace.append({
+                        "title": "工具授权通过" if authorization["decision"] == "allow" else "工具授权拒绝",
+                        "detail": (
+                            f"{authorization['name']}；规则 {authorization['rule']}；"
+                            f"风险 {authorization['risk_level']}；批准 {authorization['approval']}；"
+                            f"调用 {authorization['call_ref']}。"
+                        ),
+                        "tool_name": authorization["name"],
+                        "call_ref": authorization["call_ref"],
+                        "status": authorization["decision"],
+                    })
+                    yield run_event(CUSTOM, run_id=run_id, name="process_trace", value=trace)
                 elif model_event.get("type") == "tool.completed":
                     tool_name = str(model_event.get("name", ""))
-                    agent_runtime["tool_calls"].append({"name": tool_name, "status": "completed"})
+                    tool_call = {"name": tool_name, "status": "completed"}
+                    tool_call.update({key: str(model_event[key])[:120] for key in ("request_id", "call_ref") if model_event.get(key)})
+                    agent_runtime["tool_calls"].append(tool_call)
                     artifact = _generated_image_from_tool_event(model_event)
                     if artifact:
                         agent_runtime["artifacts"].append(artifact)
@@ -7635,7 +7710,9 @@ class ResearchAgentRuntime:
                     yield run_event(CUSTOM, run_id=run_id, name="process_trace", value=trace)
                 elif model_event.get("type") == "tool.failed":
                     tool_name = str(model_event.get("name", ""))
-                    agent_runtime["tool_calls"].append({"name": tool_name, "status": "failed"})
+                    tool_call = {"name": tool_name, "status": "failed"}
+                    tool_call.update({key: str(model_event[key])[:120] for key in ("request_id", "call_ref") if model_event.get(key)})
+                    agent_runtime["tool_calls"].append(tool_call)
                     trace.append({"title": "ScanSci 工具未完成", "detail": f"{tool_name}：{model_event.get('error', '')}", "tool_name": tool_name, "status": "failed"})
                     yield run_event(CUSTOM, run_id=run_id, name="process_trace", value=trace)
                 elif model_event.get("type") == "notice":
@@ -7817,6 +7894,11 @@ class ResearchAgentRuntime:
             text, contextual_usage, contextual_repaired = self._repair_contextual_follow_up_if_needed(
                 chat_request,
                 text,
+                require_pi=agent_requested,
+                task_mode=pi_task_mode,
+                session_id=str(dict(agent_runtime.get("session", {}) or {}).get("session_id", "")).strip() or None,
+                active_run_id=run_id,
+                agent_runtime=agent_runtime,
             )
             usage = _merge_usage(usage, contextual_usage)
             if contextual_repaired:
@@ -7883,6 +7965,7 @@ class ResearchAgentRuntime:
                             task_mode=pi_task_mode if pi_task_mode != "general" else None,
                             session_id=repair_session_id,
                             active_run_id=run_id,
+                            require_pi=agent_requested,
                         )
                     else:
                         retry_events = stream_chat_text(
@@ -7894,11 +7977,7 @@ class ResearchAgentRuntime:
                             thinking_mode=_direct_thinking_mode(chat_request),
                             session=chat_request.session,
                             timeout=45.0,
-                            max_tokens=_direct_output_budget(user_text, chat_request.selected_skills),
-                            max_continuations=_direct_max_continuations(
-                                user_text,
-                                chat_request.selected_skills,
-                            ),
+                            max_tokens=None,
                             temperature=0.2,
                             max_requests=1,
                             **_model_transport_kwargs(chat_request),
@@ -8012,8 +8091,8 @@ class ResearchAgentRuntime:
                 yield run_event(CUSTOM, run_id=run_id, name="process_trace", value=trace)
             if truncated:
                 if pi_needed:
-                    raise RuntimeError("模型连续达到输出上限，ScanSci 没有把不完整内容标记为完成；请缩小问题范围后重试。")
-                text = text.rstrip() + "\n\n（模型输出达到本轮上限，内容尚未完整；请缩小范围后重试，或继续追问未完成部分。）"
+                    raise RuntimeError("模型多次续写后仍未完成；请继续追问未完成的部分。")
+                text = text.rstrip() + "\n\n（回复尚未完整；请继续追问未完成的部分。）"
             delivery_ledger = _validate_pi_delivery(
                 text,
                 task_mode=pi_task_mode,
@@ -8094,6 +8173,8 @@ class ResearchAgentRuntime:
                 "mode": chat_request.chat_mode,
                 "trace": trace,
             }
+            if reasoning_fragments:
+                message["reasoning"] = "".join(reasoning_fragments)
             if audio_info:
                 message["audio"] = list(audio_info.get("attachments", []) or [])
             if usage:
@@ -8122,7 +8203,7 @@ class ResearchAgentRuntime:
                         "model_id": str(agent_runtime.get("effective_model_id") or chat_request.model_id),
                     },
                     "agent_runtime": agent_runtime,
-                    **({"user_images": list(chat_request.image_attachments)} if chat_request.image_attachments else {}),
+                    **({"user_images": list(chat_request.image_attachments)} if chat_request.image_attachments and chat_request.vision_route.get("context_source") != "conversation_history" else {}),
                     **({"stats": session_stats} if session_stats else {}),
                     **({"ingestion": ingestion} if ingestion else {}),
                 },
@@ -8139,7 +8220,7 @@ class ResearchAgentRuntime:
                 failure=failure,
                 **(
                     {"user_images": list(chat_request.image_attachments)}
-                    if chat_request is not None and chat_request.image_attachments
+                    if chat_request is not None and chat_request.image_attachments and chat_request.vision_route.get("context_source") != "conversation_history"
                     else {}
                 ),
             )
@@ -8607,6 +8688,7 @@ class ResearchAgentRuntime:
         message_id: str,
         chat_request: _DirectChatRequest,
         session_id: str | None = None,
+        agent_requested: bool = False,
     ):
         """Retrieve verified local evidence first, then draft readable prose from it.
 
@@ -8648,6 +8730,7 @@ class ResearchAgentRuntime:
                 "min_documents": 3,
                 "per_document_limit": 2,
                 "query_variants": 2,
+                "retrieval_quality": "precision",
                 # Do not hide repeated full-library searches behind one chat
                 # request. The two planned routes already cover a broad
                 # review; an incomplete result remains transparent.
@@ -8680,6 +8763,7 @@ class ResearchAgentRuntime:
         writer_runtime: dict[str, Any] = {
             "harness": "verified-evidence-fallback",
             "task_mode": "knowledge",
+            "agent_mode_requested": agent_requested,
             "evidence_policy": "grounded-writing",
             "tool_calls": list(fixed_tool_calls),
             "session": {},
@@ -8695,9 +8779,10 @@ class ResearchAgentRuntime:
                 messages=self._evidence_writing_prompt(request=question, citations=citations),
             )
             writer_contract = self._compile_contract(
-                task_mode="knowledge",
+                task_mode="knowledge+agent" if agent_requested else "knowledge",
                 user_text=self._last_user_text(writer_request.messages),
                 mcp_scope="selected-library",
+                web_search_mode=chat_request.web_search_mode,
             )
             writer_runtime["task_contract"] = writer_contract
             writer_runtime["pi_attempted"] = True
@@ -8705,15 +8790,12 @@ class ResearchAgentRuntime:
                 fragments: list[str] = []
                 for writer_event in self._pi_events_with_compatibility_fallback(
                     writer_request,
-                    task_mode="knowledge",
+                    task_mode="knowledge+agent" if agent_requested else "knowledge",
                     session_id=session_id,
                     active_run_id=run_id,
+                    require_pi=agent_requested,
                     precompleted_tool_calls=fixed_tool_calls,
                     fallback_timeout_seconds=90.0,
-                    fallback_max_tokens=max(
-                        1_200,
-                        _direct_output_budget(question, chat_request.selected_skills),
-                    ),
                     fallback_temperature=0.35,
                     fallback_use_litellm=False,
                 ):
@@ -8767,6 +8849,8 @@ class ResearchAgentRuntime:
             except _RunCancelled:
                 raise
             except Exception as error:
+                if agent_requested:
+                    raise
                 # The verified retrieval result is still useful.  Do not turn a
                 # temporary writing-provider failure into a loss of the user's
                 # source-grounded answer.
@@ -8777,6 +8861,8 @@ class ResearchAgentRuntime:
                 )
 
         if not text:
+            if agent_requested and writer_runtime["pi_attempted"]:
+                raise RuntimeError("ScanSci Agent 未完成带原文脚标的文章草稿；请重试或检查当前模型。")
             text = (
                 self._verified_evidence_fallback(citations, question)
                 or fallback_text
@@ -9184,6 +9270,7 @@ class ResearchAgentRuntime:
         message_id: str,
         chat_request: _DirectChatRequest,
         request: dict[str, Any] | None = None,
+        agent_requested: bool = False,
     ):
         """Deliver a document-level library statistic, never a top-k RAG guess."""
 
@@ -9295,6 +9382,7 @@ class ResearchAgentRuntime:
                 "model": {"provider_id": chat_request.provider_id, "model_id": chat_request.model_id},
                 "agent_runtime": {
                     "harness": "knowledge-catalog",
+                    "agent_mode_requested": agent_requested,
                     "task_mode": "knowledge-catalog",
                     "evidence_policy": "catalog",
                     "tool_calls": [{"name": "catalog_library_documents", "status": "completed"}],
@@ -9309,6 +9397,7 @@ class ResearchAgentRuntime:
         message_id: str,
         chat_request: _DirectChatRequest,
         payload: dict[str, Any],
+        agent_requested: bool = False,
     ):
         """Retrieve locally, then let Pi synthesize the verified answer."""
 
@@ -9334,6 +9423,7 @@ class ResearchAgentRuntime:
                 "notebook_ids": notebook_ids,
                 "knowledge_scope": dict(chat_request.knowledge_scope or {}),
                 "thinking_level": chat_request.thinking_level,
+                "retrieval_quality": self._retrieval_quality(payload, default="precision"),
                 # The answer_sync fallback still uses the active writing model
                 # when it is configured, but always keeps the fixed retrieval,
                 # quote and citation-verification gates.
@@ -9370,6 +9460,7 @@ class ResearchAgentRuntime:
         writer_runtime: dict[str, Any] = {
             "harness": "verified-evidence-fallback",
             "task_mode": "knowledge",
+            "agent_mode_requested": agent_requested,
             "evidence_policy": "strict",
             "tool_calls": list(fixed_tool_calls),
             "session": {},
@@ -9380,6 +9471,7 @@ class ResearchAgentRuntime:
         }
         text = ""
         usage: dict[str, int] = {}
+        writer_reasoning: list[str] = []
         if citations and verification.get("passed"):
             writer_request = replace(
                 chat_request,
@@ -9389,9 +9481,10 @@ class ResearchAgentRuntime:
                 ),
             )
             writer_contract = self._compile_contract(
-                task_mode="knowledge",
+                task_mode="knowledge+agent" if agent_requested else "knowledge",
                 user_text=self._last_user_text(writer_request.messages),
                 mcp_scope="selected-library",
+                web_search_mode=chat_request.web_search_mode,
             )
             writer_runtime["task_contract"] = writer_contract
             writer_runtime["pi_attempted"] = True
@@ -9399,18 +9492,23 @@ class ResearchAgentRuntime:
                 fragments: list[str] = []
                 for writer_event in self._pi_events_with_compatibility_fallback(
                     writer_request,
-                    task_mode="knowledge",
+                    task_mode="knowledge+agent" if agent_requested else "knowledge",
                     session_id=str(payload.get("pi_session_id") or payload.get("session_id") or "").strip() or None,
                     active_run_id=run_id,
+                    require_pi=agent_requested,
                     precompleted_tool_calls=fixed_tool_calls,
                     fallback_timeout_seconds=60.0,
-                    fallback_max_tokens=max(700, _direct_output_budget(question, [])),
                     fallback_temperature=0.2,
                     fallback_use_litellm=False,
                 ):
                     event_type = str(writer_event.get("type", ""))
                     if event_type == "delta":
                         fragments.append(str(writer_event.get("content", "")))
+                    elif event_type == "reasoning":
+                        reasoning_delta = str(writer_event.get("content", ""))
+                        if reasoning_delta:
+                            writer_reasoning.append(reasoning_delta)
+                            yield run_event(CUSTOM, run_id=run_id, name="model_reasoning", value={"delta": reasoning_delta})
                     elif event_type == "done":
                         raw_stats = writer_event.get("stats")
                         received_usage = writer_event.get("usage")
@@ -9455,6 +9553,8 @@ class ResearchAgentRuntime:
             except _RunCancelled:
                 raise
             except Exception as error:
+                if agent_requested:
+                    raise
                 writer_runtime["compatibility_error"] = (
                     writer_runtime.get("compatibility_error")
                     or f"{type(error).__name__}: {error}"[:500]
@@ -9462,6 +9562,11 @@ class ResearchAgentRuntime:
                 text = ""
 
         if not text:
+            if agent_requested and writer_runtime["pi_attempted"]:
+                raise RuntimeError("ScanSci Agent 未完成带原文脚标的回答；请重试或检查当前模型。")
+            if writer_reasoning:
+                writer_reasoning.clear()
+                yield run_event(CUSTOM, run_id=run_id, name="model_reasoning", value={"reset": True})
             text = fallback_text
             writer_runtime["pi_success"] = False
             if writer_runtime.get("harness") == "pi-agent-sdk":
@@ -9513,6 +9618,8 @@ class ResearchAgentRuntime:
             "reader_answer": reader_answer,
             "citation_verification": verification,
         }
+        if writer_reasoning:
+            message["reasoning"] = "".join(writer_reasoning)
         if knowledge_scope.get("active") and str(knowledge_scope.get("type", "")) != "zotero-tag":
             message["knowledge_scope"] = knowledge_scope
         if usage:
@@ -9532,10 +9639,16 @@ class ResearchAgentRuntime:
             },
         )
 
-    @staticmethod
     def _repair_contextual_follow_up_if_needed(
+        self,
         chat_request: _DirectChatRequest,
         text: str,
+        *,
+        require_pi: bool = False,
+        task_mode: str | None = None,
+        session_id: str | None = None,
+        active_run_id: str = "",
+        agent_runtime: dict[str, Any] | None = None,
     ) -> tuple[str, dict[str, int], bool]:
         """Retry once when a model answers a contextual edit with an acknowledgement."""
 
@@ -9543,35 +9656,26 @@ class ResearchAgentRuntime:
         if not gap:
             return text, {}, False
         contract = _contextual_follow_up_contract(chat_request.messages) or {}
-        previous_length = len(str(contract.get("previous_text", "")))
-        completion = complete_chat_text(
-            chat_request.provider_kind,
-            base_url=chat_request.base_url,
-            api_key=chat_request.api_key,
-            model=chat_request.model_id,
-            messages=_contextual_retry_messages(
-                chat_request.messages,
-                previous_gap=gap,
-            ),
-            thinking_mode=_direct_thinking_mode(chat_request),
-            session=chat_request.session,
-            include_usage=True,
-            timeout=45.0,
-            max_requests=1,
-            max_tokens=min(
-                4_096,
-                max(
-                    _direct_output_budget(
-                        _latest_user_message_text(chat_request.messages),
-                        chat_request.selected_skills,
-                    ),
-                    previous_length,
-                ),
-            ),
-            temperature=0.1,
-            **_model_transport_kwargs(chat_request),
-        )
-        repaired_text, usage = completion if isinstance(completion, tuple) else (completion, {})
+        repair_messages = _contextual_retry_messages(chat_request.messages, previous_gap=gap)
+        if require_pi:
+            repaired_text, usage, repair_runtime = self._complete_with_pi(
+                replace(chat_request, messages=repair_messages),
+                task_mode=task_mode,
+                session_id=session_id,
+                active_run_id=active_run_id,
+            )
+            if agent_runtime is not None:
+                agent_runtime["tool_calls"] = [
+                    *list(agent_runtime.get("tool_calls", []) or []),
+                    *list(repair_runtime.get("tool_calls", []) or []),
+                ]
+                agent_runtime["session"] = dict(repair_runtime.get("session", {}) or {})
+                agent_runtime["contextual_repair_harness"] = "pi-agent-sdk"
+        else:
+            repaired_text, usage, _ = self._complete_direct_with_managed_fallback(
+                replace(chat_request, messages=repair_messages),
+                user_text=self._last_user_text(repair_messages),
+            )
         repaired_text = _normalize_direct_chat_output(repaired_text, chat_request.selected_skills)
         remaining_gap = _contextual_follow_up_gap(chat_request.messages, repaired_text)
         if remaining_gap:
@@ -9999,20 +10103,79 @@ class ResearchAgentRuntime:
             )
 
         settings = load_settings(self.workspace)
-        active = dict(settings.get("active_model", {}) or {})
+        selected_model = payload.get("model")
+        if selected_model is not None:
+            if not isinstance(selected_model, dict) or not all(
+                str(selected_model.get(key, "")).strip() for key in ("provider_id", "model_id")
+            ):
+                raise ValueError("所选对话模型无效，请重新选择")
+            active = selected_model
+        else:
+            active = dict(settings.get("active_model", {}) or {})
         provider = next(
             (item for item in settings.get("providers", []) if item.get("id") == active.get("provider_id")),
             None,
         )
         if provider is None or not provider.get("enabled", True):
+            if selected_model is not None:
+                raise ValueError("所选模型服务商已停用或不存在，请在模型设置中启用后重试")
             raise ValueError("当前没有可用的对话模型")
 
         provider_id = str(provider.get("id", ""))
         provider_kind = str(provider.get("kind", ""))
         requested_provider_id = provider_id
         requested_model_id = str(active.get("model_id", "")).strip()
+        if selected_model is not None:
+            model = next(
+                (item for item in list(provider.get("models", []) or [])
+                 if isinstance(item, dict) and str(item.get("id", "")) == requested_model_id),
+                None,
+            )
+            capabilities = set(model.get("capabilities", []) or []) if model else set()
+            if (
+                model is None
+                or model.get("available") is False
+                or str(model.get("readiness") or "production") != "production"
+                or capabilities & {"embedding", "reranking"}
+                or (capabilities & {"audio", "image"} and not capabilities & {"reasoning", "writing", "vision", "tool", "coding"})
+            ):
+                raise ValueError("所选对话模型已不可用，请重新选择")
         model_id = requested_model_id
         raw_images = list(payload.get("images", []) or [])
+        history_image_reused = False
+        question = str(messages[-1]["content"])
+        if not raw_images and _IMAGE_FOLLOW_UP_RE.search(question) and not _IMAGE_IGNORE_RE.search(question):
+            image_batches = [
+                prior["images"]
+                for prior in raw_messages[:-1]
+                if isinstance(prior, dict)
+                and str(prior.get("role", "")).lower() == "user"
+                and isinstance(prior.get("images"), list)
+                and prior["images"]
+            ]
+            if image_batches:
+                ordinal = _IMAGE_ORDINAL_RE.search(question)
+                if ordinal:
+                    marker = (ordinal.group(1) or ordinal.group(2) or ordinal.group(0).split()[0]).lower()
+                    position = int(marker) if marker.isdigit() else {
+                        "一": 1, "二": 2, "三": 3, "四": 4,
+                        "first": 1, "second": 2, "third": 3, "fourth": 4,
+                    }[marker]
+                    all_images = [image for batch in image_batches for image in batch]
+                    if position > len(all_images):
+                        raise ValueError(f"当前对话没有第 {position} 张图片，请重新指定或上传。")
+                    prior_images = [all_images[position - 1]]
+                else:
+                    prior_images = image_batches[-1]
+                # Historical metadata is a reference only: reopen the
+                # validated workspace asset, never trust prior data URLs.
+                if any(not isinstance(image, dict) or not image.get("id") for image in prior_images):
+                    raise ValueError("之前的图片尚未保存，请重新上传后再问。")
+                raw_images = [
+                    {"id": image["id"], "name": image.get("name", "用户图片")}
+                    for image in prior_images
+                ]
+                history_image_reused = True
         vision_route: dict[str, Any] = {}
         if raw_images:
             # Image input is a capability request, not a requirement that the
@@ -10025,6 +10188,7 @@ class ResearchAgentRuntime:
                     settings,
                     active_provider_id=requested_provider_id,
                     active_model_id=requested_model_id,
+                    allow_cloud=not history_image_reused,
                 )
             except Exception:
                 selected_vision = None
@@ -10066,20 +10230,17 @@ class ResearchAgentRuntime:
                     "text_provider_id": provider_id,
                     "text_model_id": model_id,
                 }
+            if history_image_reused:
+                vision_route["context_source"] = "conversation_history"
         managed = str(provider.get("auth_mode", "")) == "managed"
-        if managed:
-            api_key = "scansci-managed-gateway"
-        elif provider_kind == "local" or str(provider.get("auth_mode", "")) == "local":
-            api_key = str(provider.get("api_key", "")) or "local"
-        else:
-            api_key = get_provider_api_key(self.workspace, provider_id)
+        api_key = provider_request_api_key(self.workspace, provider, key_lookup=get_provider_api_key)
         if not api_key:
             raise ValueError("当前对话模型尚未配置 API Key")
 
         if provider_id.startswith("local-runtime-") and str(provider.get("logo", "")) == "ollama":
             status = ollama_status(str(provider.get("base_url", "")), model_id=model_id)
             if not status.get("reachable"):
-                raise ValueError("Ollama 尚未运行，请先在设置 → 本地模型中启动 Ollama")
+                raise ValueError(str(status.get("error") or "无法连接 Ollama，请检查服务状态和连接地址。"))
             if not status.get("model_ready"):
                 raise ValueError(f"Ollama 模型 {model_id} 尚未安装，请先在 Ollama 中下载该模型")
         responses_enabled = bool(provider.get("responses_enabled", False))
@@ -10127,10 +10288,8 @@ class ResearchAgentRuntime:
             ),
         )
         system_context += (
-            "\n\nConversation budget: answer the final user request directly. "
+            "\n\nAnswer the final user request directly. "
             "Honor every explicit length, sentence-count, and format constraint. "
-            "For an ordinary question, prefer a complete answer under 500 Chinese characters "
-            "or 350 English words unless the user explicitly asks for a detailed treatment. "
             "Do not add tutorials, alternative versions, capability descriptions, or background "
             "that the user did not request. Preserve scientific uncertainty and do not strengthen "
             "correlation into causation. In scientific rewriting, remove or explicitly qualify "
@@ -10189,11 +10348,7 @@ class ResearchAgentRuntime:
                     }
                 )
                 managed = str(provider.get("auth_mode", "")) == "managed"
-                api_key = (
-                    "scansci-managed-gateway"
-                    if managed
-                    else get_provider_api_key(self.workspace, provider_id)
-                )
+                api_key = provider_request_api_key(self.workspace, provider, key_lookup=get_provider_api_key)
                 if not api_key:
                     raise ValueError("本地视觉模型不可用，且文字模型尚未配置 API Key") from error
                 responses_enabled = bool(provider.get("responses_enabled", False))
@@ -10204,8 +10359,15 @@ class ResearchAgentRuntime:
                     model=model_id,
                     responses_enabled=responses_enabled,
                 )
+        if raw_images and vision_route.get("mode") != "ocr-fallback":
+            messages[0]["content"] += "\n\n" + _VISION_IMAGE_INSTRUCTION
         if raw_images:
-            image_attachments = persist_image_attachments(self.workspace, raw_images)
+            try:
+                image_attachments = persist_image_attachments(self.workspace, raw_images)
+            except FileNotFoundError as error:
+                if not history_image_reused:
+                    raise
+                raise ValueError("之前的图片文件已不可用，请重新上传后再问。") from error
             text = str(messages[-1].get("content", ""))
             if vision_route.get("mode") == "ocr-fallback":
                 blocks = vision_image_blocks(self.workspace, image_attachments)
@@ -10327,6 +10489,7 @@ class ResearchAgentRuntime:
                 if str(value).strip()
             ][:12],
             knowledge_scope=dict(payload.get("knowledge_scope", {}) or {}),
+            web_search_mode=self._web_search_mode(payload.get("web_search")),
             manifest=manifest,
             vision_route=vision_route,
             image_attachments=image_attachments,
@@ -12453,7 +12616,7 @@ class ResearchAgentRuntime:
                     "真正的文献综述需要生成模型。请在“设置 → 模型服务”添加云端模型服务或本地 Ollama/LM Studio，"
                     "并把“写作”分工指向该模型。"
                 )
-            api_key = "scansci-managed-gateway" if str(provider.get("auth_mode", "")) == "managed" else get_provider_api_key(self.workspace, provider_id)
+            api_key = provider_request_api_key(self.workspace, provider, key_lookup=get_provider_api_key)
             if not api_key:
                 raise ValueError(f"写作模型 {provider.get('name', provider_id)} 尚未配置 API Key")
             managed = str(provider.get("auth_mode", "")) == "managed"
@@ -12556,7 +12719,7 @@ class ResearchAgentRuntime:
                     dimensions=int(vector_identity["dimensions"]),
                     ).get("ready")
             )
-        settings = load_settings(self.workspace)
+        settings = load_settings(self.workspace, include_secret_status=False)
         roles = dict(settings.get("model_roles", {}) or {})
         installed_evidence_models = [
             item
@@ -12657,6 +12820,13 @@ class ResearchAgentRuntime:
                     return model_id.strip()
             return ""
 
+        def authorize_remote_retrieval(role: str, model_id: str, base_url: str, api_key: str) -> None:
+            if (
+                not remote_retrieval_granted(self.workspace, "siliconflow", role, model_id, base_url)
+                or get_provider_api_key(self.workspace, "siliconflow") != api_key
+            ):
+                raise PermissionError("云端知识库检索授权已关闭")
+
         def configured_remote_embedding() -> tuple[str, Any | None]:
             """Build the supported SiliconFlow embedding selected by the user.
 
@@ -12675,7 +12845,7 @@ class ResearchAgentRuntime:
                 (item for item in settings.get("providers", []) if str(item.get("id", "")) == provider_id),
                 None,
             )
-            if provider is None or not provider.get("enabled", True):
+            if provider is None or not provider.get("enabled", True) or provider.get("remote_rag_allowed") is not True:
                 return "", None
             model = next(
                 (
@@ -12700,6 +12870,9 @@ class ResearchAgentRuntime:
                     base_url=str(provider.get("base_url", "")).strip(),
                     api_key=api_key,
                     model=model_id.strip(),
+                    authorization_check=lambda: authorize_remote_retrieval(
+                        "embedding", model_id.strip(), str(provider.get("base_url", "")).strip(), api_key
+                    ),
                 )
             except Exception:
                 return "", None
@@ -12724,7 +12897,7 @@ class ResearchAgentRuntime:
                 (item for item in settings.get("providers", []) if str(item.get("id", "")) == provider_id),
                 None,
             )
-            if provider is None or not provider.get("enabled", True):
+            if provider is None or not provider.get("enabled", True) or provider.get("remote_rag_allowed") is not True:
                 return "", None
             model = next(
                 (
@@ -12749,6 +12922,9 @@ class ResearchAgentRuntime:
                     base_url=str(provider.get("base_url", "")).strip(),
                     api_key=api_key,
                     model_name=model_id.strip(),
+                    authorization_check=lambda: authorize_remote_retrieval(
+                        "reranking", model_id.strip(), str(provider.get("base_url", "")).strip(), api_key
+                    ),
                 )
             except Exception:
                 return "", None
@@ -12787,7 +12963,8 @@ class ResearchAgentRuntime:
             except Exception:
                 neural_cache_ready = False
         use_fast_path = not target.is_file() or (
-            not embedding_only
+            requested_profile != "precision"
+            and not embedding_only
             and target.stat().st_size < _NEURAL_LIBRARY_MIN_BYTES
             and not neural_cache_ready
             and not remote_embedding_selected
@@ -12810,7 +12987,14 @@ class ResearchAgentRuntime:
             or selected_embedding_model
             or "auto"
         )
-        selector_key = f"{embedding_selector}|{reranker_selector}"
+        # Credential rotation must not reuse an adapter that still holds the
+        # previous key. This fingerprint stays only in the in-process cache key.
+        credential_selector = ":".join(
+            hashlib.sha256(str(getattr(adapter, "api_key", "")).encode("utf-8")).hexdigest()[:16]
+            for adapter in (remote_embedding, remote_reranker)
+            if getattr(adapter, "api_key", "")
+        )
+        selector_key = f"{embedding_selector}|{reranker_selector}|{credential_selector}"
         stack_kind = f"{stack_base}:{selector_key}"
         preparation_key = self._local_evidence_preparation_key(target, requested_profile)
         with self._local_evidence_prepare_lock:
@@ -12988,7 +13172,7 @@ class ResearchAgentRuntime:
                 raise ValueError("指定的演示模型不存在或已停用")
             if str(provider.get("kind", "")) == "local":
                 raise ValueError("内置检索引擎不能用于生成演示文稿")
-            api_key = "scansci-managed-gateway" if str(provider.get("auth_mode", "")) == "managed" else get_provider_api_key(self.workspace, provider_id)
+            api_key = provider_request_api_key(self.workspace, provider, key_lookup=get_provider_api_key)
             if not api_key:
                 raise ValueError("演示模型尚未配置 API Key")
             return self._wrap_model_client(self._pi_role_chat_client(

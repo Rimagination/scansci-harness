@@ -15,6 +15,7 @@ from typing import Any, Mapping
 
 MODEL_RUNTIME_SCHEMA = "scansci.model-runtime.v1"
 DEFAULT_CONTEXT_WINDOW_TOKENS = 32 * 1024
+MIN_CONTEXT_WINDOW_TOKENS = 16 * 1024
 _MAX_CONTEXT_WINDOW_TOKENS = 4 * 1024 * 1024
 _CONTEXT_WINDOW = re.compile(r"^(?P<value>\d+(?:\.\d+)?)\s*(?P<unit>[kKmM])?$")
 _KNOWN_CAPABILITIES = frozenset({"reasoning", "tool", "vision", "audio", "coding", "embedding", "reranking"})
@@ -45,7 +46,7 @@ def _parsed_context_window(value: object) -> tuple[int, bool]:
     if isinstance(value, bool):
         return DEFAULT_CONTEXT_WINDOW_TOKENS, False
     if isinstance(value, int):
-        if DEFAULT_CONTEXT_WINDOW_TOKENS <= value <= _MAX_CONTEXT_WINDOW_TOKENS:
+        if MIN_CONTEXT_WINDOW_TOKENS <= value <= _MAX_CONTEXT_WINDOW_TOKENS:
             return value, True
         return DEFAULT_CONTEXT_WINDOW_TOKENS, False
     if not isinstance(value, str):
@@ -58,7 +59,7 @@ def _parsed_context_window(value: object) -> tuple[int, bool]:
     parsed = int(number * multiplier)
     if (
         not math.isfinite(number)
-        or parsed < DEFAULT_CONTEXT_WINDOW_TOKENS
+        or parsed < MIN_CONTEXT_WINDOW_TOKENS
         or parsed > _MAX_CONTEXT_WINDOW_TOKENS
     ):
         return DEFAULT_CONTEXT_WINDOW_TOKENS, False
@@ -80,7 +81,18 @@ def _bounded(value: int, minimum: int, maximum: int) -> int:
 
 
 def _budgets(context_window_tokens: int) -> dict[str, int]:
-    window = max(DEFAULT_CONTEXT_WINDOW_TOKENS, int(context_window_tokens))
+    window = max(MIN_CONTEXT_WINDOW_TOKENS, int(context_window_tokens))
+    if window < DEFAULT_CONTEXT_WINDOW_TOKENS:
+        guard = 1024
+        reserve = _bounded(_rounded_down(window // 8), 1024, 32 * 1024)
+        keep_recent = _bounded(_rounded_down(window // 10), 1024, 32 * 1024)
+        return {
+            "provider_input_tokens": window - reserve - guard,
+            "context_guard_tokens": guard,
+            "compaction_reserve_tokens": reserve,
+            "keep_recent_tokens": keep_recent,
+            "max_output_tokens": reserve,
+        }
     guard = _bounded(_rounded_down(window // 32), 1024, 8192)
     reserve = _bounded(_rounded_down(window // 8), 4096, 32 * 1024)
     keep_recent = _bounded(_rounded_down(window // 10), 4096, 32 * 1024)

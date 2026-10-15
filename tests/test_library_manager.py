@@ -109,6 +109,7 @@ else:
         with _library_process_lock(root):
             child = subprocess.run(
                 [sys.executable, "-X", "utf8", "-c", script, str(workspace), str(evidence), str(source)],
+                cwd=Path(__file__).resolve().parents[1] / "src",
                 capture_output=True, text=True, encoding="utf-8", timeout=20,
             )
             assert child.returncode == 0, child.stderr

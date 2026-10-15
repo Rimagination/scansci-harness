@@ -33,7 +33,7 @@ jobs:
           $releasePublicKey = (Get-Content -Raw config/release-gate.json | ConvertFrom-Json).package.release_public_key
           if (-not $releasePublicKey) { throw "config/release-gate.json is missing the Ed25519 release public key." }
           python scripts/verify_update_channel.py `
-            --manifest-url "https://github.com/Rimagination/scansci-pi/releases/latest/download/stable.json" `
+            --manifest-url "https://github.com/Rimagination/scansci-harness/releases/latest/download/stable.json" `
             --expected-version $version `
             --public-key $releasePublicKey `
             --require-component local-transformers `

@@ -329,15 +329,11 @@ export function searchToolCatalog(
 export function initialToolNames(
   registeredNames: Iterable<string>,
   initialNames: Iterable<string>,
-  requiredGroups: Iterable<Iterable<string>>,
   bootstrapNames: Iterable<string>,
 ): string[] {
   const registered = new Set(registeredNames);
   const selected = new Set<string>();
   for (const name of bootstrapNames) if (registered.has(name)) selected.add(name);
   for (const name of initialNames) if (registered.has(name)) selected.add(name);
-  for (const group of requiredGroups) {
-    for (const name of group) if (registered.has(name)) selected.add(name);
-  }
   return [...selected].sort();
 }

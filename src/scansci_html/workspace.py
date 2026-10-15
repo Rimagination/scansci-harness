@@ -617,12 +617,38 @@ def load_workspace_summary(
                 "citations": _count_rows(connection, "citation_records"),
                 "citation_audits": _count_rows(connection, "citation_audits"),
             }
+    for notebook in notebooks:
+        if notebook.get("metadata", {}).get("library_kind") == "translation":
+            notebook["translation_files"] = translation_folder_files(notebook["root_path"])
     return {
         "workspace_path": str(workspace),
         "workspace_directory": workspace_directory,
         "notebooks": notebooks,
         "counts": counts,
     }
+
+
+def translation_folder_files(root_path: str | Path) -> list[dict[str, str]]:
+    """List PDFs linked through a translation folder, including files added outside ScanSci."""
+
+    root = Path(root_path).expanduser().resolve()
+    if not root.is_dir():
+        return []
+    files = []
+    # ponytail: scan on read for modest local libraries; add a persistent file index if this grows to thousands of PDFs.
+    for path in sorted(path for path in root.rglob("*") if path.suffix.lower() == ".pdf"):
+        resolved = path.resolve()
+        if not resolved.is_file() or root not in resolved.parents:
+            continue
+        relative = path.relative_to(root).as_posix()
+        files.append({
+            "id": hashlib.sha256(relative.encode("utf-8")).hexdigest()[:24],
+            "title": path.stem,
+            "path": str(resolved),
+            "relative_path": relative,
+            "type": "PDF",
+        })
+    return files
 
 
 def _initialize_schema(connection: sqlite3.Connection) -> None:

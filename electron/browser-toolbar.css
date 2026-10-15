@@ -1,0 +1,13 @@
+:root { color-scheme: light dark; --canvas: #f5f5f6; --surface: #fff; --ink: #232428; --muted: #8a8b92; --rule: #e4e4e7; --control: #f8f8f9; --accent: #1f7d4e; --radius-sm: 8px; --focus-glow: 0 0 9px color-mix(in srgb, var(--accent) 14%, transparent); }
+* { box-sizing: border-box; }
+html, body { width: 100%; height: 100%; margin: 0; overflow: hidden; font-family: "Segoe UI", "Microsoft YaHei", sans-serif; }
+nav { display: grid; grid-template-columns: 34px 34px 34px minmax(0, 1fr) 34px 34px; gap: 3px; align-items: center; height: 48px; padding: 5px 7px; border-bottom: 1px solid var(--rule); color: var(--ink); background: var(--canvas); }
+button { display: grid; height: 34px; place-items: center; padding: 0; border: 0; border-radius: var(--radius-sm); color: var(--muted); background: transparent; cursor: pointer; }
+button svg { width: 18px; height: 18px; fill: none; stroke: currentColor; stroke-width: 1.7; stroke-linecap: round; stroke-linejoin: round; }
+button:hover { background: var(--control); }
+button:not(:disabled):hover { color: var(--ink); }
+button:disabled { color: var(--muted); cursor: default; }
+button:focus-visible, input:focus-visible { outline: 1px solid var(--accent); outline-offset: 1px; box-shadow: var(--focus-glow); }
+form { min-width: 0; }
+input { width: 100%; height: 34px; padding: 0 10px; border: 1px solid var(--rule); border-radius: var(--radius-sm); color: var(--ink); background: var(--control); font: 12px/1 "Segoe UI", "Microsoft YaHei", sans-serif; }
+input::placeholder { color: var(--muted); }

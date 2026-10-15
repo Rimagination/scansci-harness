@@ -91,6 +91,15 @@ BUILTIN_SKILLS: list[dict[str, Any]] = [
         "source": "ScanSci original",
     },
     {
+        "id": "retain-pdf",
+        "name": "文献翻译",
+        "description": "指导扫描件与科研 PDF 的保留排版翻译、组件检查和译文核对；执行需要已授权的 ScanSci 文档能力。",
+        "path": "builtin:retain-pdf",
+        "enabled": True,
+        "source_type": "builtin",
+        "source": "wxyhgk/retain-pdf · MIT · ScanSci workflow",
+    },
+    {
         "id": "web-access",
         "name": "web-access",
         "description": "通过真实浏览器/CDP 处理搜索、网页抓取、登录态访问与页面交互。",
@@ -318,5 +327,6 @@ def third_party_notices() -> dict[str, str]:
         "Panniantong/Agent-Reach": "MIT License. ScanSci ships a read-only native adaptation of the routing and channel ideas. Source: https://github.com/Panniantong/Agent-Reach",
         "K-Dense-AI/scientific-agent-skills": "MIT License. Source: https://github.com/K-Dense-AI/scientific-agent-skills",
         "Yuan1z0825/nature-skills": "Apache-2.0 License. Source: https://github.com/Yuan1z0825/nature-skills",
+        "wxyhgk/retain-pdf": "MIT License. ScanSci ships an original workflow Skill without the RetainPDF engine. Source: https://github.com/wxyhgk/retain-pdf",
         "OpenAI Zotero plugin": "MIT License. Source: https://github.com/openai/plugins/tree/main/plugins/zotero",
     }

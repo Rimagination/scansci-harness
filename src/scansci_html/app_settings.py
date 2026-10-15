@@ -14,7 +14,10 @@ import os
 from pathlib import Path
 import re
 import tempfile
-from typing import Any
+import threading
+from typing import Any, Callable
+from urllib.parse import urlsplit
+from uuid import uuid4
 
 from .local_model_market import (
     QWEN3_ASR_LEGACY_MODEL_ID,
@@ -32,6 +35,8 @@ from .vector_storage import configure_vector_index_root
 
 _CONFIG_NAME = ".scansci-notebook.json"
 _SERVICE_NAME = "scansci-html-notebook"
+_CREDENTIAL_SCOPE_RE = re.compile(r"[0-9a-f]{32}\Z")
+_CREDENTIAL_SCOPE_LOCK = threading.RLock()
 _SAFE_ID = re.compile(r"[^a-z0-9._-]+")
 _MAX_ITEMS = 128
 _MAX_MCP_TOOL_POLICIES = 64
@@ -245,6 +250,7 @@ _PROVIDER_PRESETS: list[dict[str, Any]] = [
     _provider_preset("gemini", "Google Gemini", category="国际模型", base_url="https://generativelanguage.googleapis.com/v1beta/openai", models=[_model_preset("gemini-3.1-pro-preview", "Gemini 3.1 Pro", group="Gemini", capabilities=["reasoning", "vision", "tool", "coding", "audio"]), _model_preset("gemini-3.5-flash", "Gemini 3.5 Flash", group="Gemini", capabilities=["reasoning", "vision", "tool"]), _model_preset("gemini-embedding-001", "Gemini Embedding", group="Embeddings", capabilities=["embedding"])]),
     _provider_preset("vertex-ai", "Google Vertex AI", category="国际模型", summary="Vertex AI 通常需要网关或企业项目凭据；请粘贴其兼容 API 地址。", models=[_model_preset("gemini-3.1-pro-preview", "Gemini 3.1 Pro", group="Gemini", capabilities=["reasoning", "vision", "tool", "coding"]), _model_preset("text-embedding-005", "Text Embedding", group="Embeddings", capabilities=["embedding"])]),
     _provider_preset("openrouter", "OpenRouter", category="模型聚合", base_url="https://openrouter.ai/api/v1", models=[_model_preset("openai/gpt-5.2", "OpenAI GPT-5.2", group="OpenAI", capabilities=["reasoning", "vision", "tool", "coding"]), _model_preset("google/gemini-3.1-pro-preview", "Gemini 3.1 Pro", group="Google", capabilities=["reasoning", "vision", "tool"]), _model_preset("deepseek/deepseek-r1", "DeepSeek R1", group="DeepSeek", capabilities=["reasoning", "coding"])]),
+    _provider_preset("l0veyou", "l0veyou", category="模型聚合", base_url="https://l0veyou.com/v1", summary="公益站 OpenAI 兼容 API；免费额度和模型由站点调整，密钥需由用户自行创建。", models=[_model_preset("openai/gpt-6-luna", "GPT-6 Luna", group="l0veyou", capabilities=["reasoning"]), _model_preset("deepseek/deepseek-v4.1-flash", "DeepSeek V4.1 Flash", group="l0veyou", capabilities=["reasoning"]), _model_preset("muse-spark-1.3", "Muse Spark 1.3", group="l0veyou", capabilities=["reasoning"])]),
     _provider_preset(_OPENCODE_GO_PROVIDER_ID, "OpenCode Go", category="订阅模型", base_url=_OPENCODE_GO_BASE_URL, api_surface="auto", summary="OpenCode Go 订阅接口；在 OpenCode Zen 开通套餐后粘贴 API Key，ScanSci 会按模型自动选择接口。", models=_OPENCODE_GO_MODEL_PRESETS),
     _provider_preset("nvidia", "NVIDIA NIM", category="国际模型", base_url="https://integrate.api.nvidia.com/v1", models=[_model_preset("meta/llama-3.3-70b-instruct", "Llama 3.3 70B Instruct", group="Meta", capabilities=["reasoning", "tool", "coding"]), _model_preset("nvidia/llama-3.2-nv-embedqa-1b-v2", "NV-EmbedQA", group="Embeddings", capabilities=["embedding"])]),
     _provider_preset(_DEEPSEEK_PROVIDER_ID, "DeepSeek", category="国内直连", base_url="https://api.deepseek.com", models=_DEEPSEEK_MODEL_PRESETS),
@@ -307,10 +313,30 @@ _LOCAL_MODEL_PRESETS: list[dict[str, Any]] = [
         "base_url": "http://127.0.0.1:11434/v1",
         "model_id": "qwen3.5:4b",
         "context_window": "32K",
-        "capabilities": ["reasoning", "tool", "coding"],
+        "capabilities": ["reasoning", "tool", "coding", "vision"],
         # Qwen3.5 is an optional user-managed Ollama model.  It is enabled
         # after the user selects it or an existing workspace explicitly opts
         # into the route; ScanSci never pulls it implicitly.
+        "enabled": False,
+    },
+    {
+        "id": "ollama-qwen3.5-9b",
+        "name": "Ollama · Qwen3.5 9B",
+        "runtime": "ollama",
+        "base_url": "http://127.0.0.1:11434/v1",
+        "model_id": "qwen3.5:9b",
+        "context_window": "16K",
+        "capabilities": ["reasoning", "tool", "coding", "vision"],
+        "enabled": False,
+    },
+    {
+        "id": "ollama-qwen3.5-2b",
+        "name": "Ollama · Qwen3.5 2B（轻量）",
+        "runtime": "ollama",
+        "base_url": "http://127.0.0.1:11434/v1",
+        "model_id": "qwen3.5:2b",
+        "context_window": "16K",
+        "capabilities": ["reasoning", "tool", "coding", "vision"],
         "enabled": False,
     },
     {
@@ -338,6 +364,14 @@ _LOCAL_MODEL_PRESETS: list[dict[str, Any]] = [
         "model_id": "",
         "enabled": False,
     },
+    {
+        "id": "strata",
+        "name": "Strata",
+        "runtime": "strata",
+        "base_url": "http://127.0.0.1:8080/v1",
+        "model_id": "",
+        "enabled": False,
+    },
 ]
 
 
@@ -347,6 +381,7 @@ class SettingsError(ValueError):
 
 _DEFAULT_SETTINGS: dict[str, Any] = {
     "schema_version": 2,
+    "credential_scope_id": "",
     "active_model": {"provider_id": _MANAGED_PROVIDER_ID, "model_id": _DEFAULT_CHAT_MODEL_ID},
     "providers": [
         {
@@ -459,7 +494,13 @@ def local_model_presets() -> list[dict[str, Any]]:
     return deepcopy(_LOCAL_MODEL_PRESETS)
 
 
-def ensure_local_model_preset(workspace: str | Path, preset_id: str) -> dict[str, Any]:
+def ensure_local_model_preset(
+    workspace: str | Path,
+    preset_id: str,
+    *,
+    make_primary: bool = False,
+    base_url: str = "",
+) -> dict[str, Any]:
     """Persist one approved local-model preset after an explicit install.
 
     Model downloads are deliberately separate from settings: a user can browse
@@ -475,19 +516,30 @@ def ensure_local_model_preset(workspace: str | Path, preset_id: str) -> dict[str
     settings = _normalize_settings(_read_raw_settings(workspace))
     rows = list(settings.get("local_models", []) or [])
     existing = next((item for item in rows if str(item.get("id", "")) == wanted), None)
+    endpoint = f"{str(base_url).rstrip('/')}/v1" if base_url else ""
+    if endpoint and preset.get("runtime") != "ollama":
+        raise SettingsError("只有 Ollama 预设可以指定运行时地址")
     if existing is None:
-        rows.append(deepcopy(preset))
+        rows.append({**deepcopy(preset), "enabled": True, **({"base_url": endpoint} if endpoint else {})})
     else:
         # Keep a user's custom endpoint/name, but make the installed model
         # routable again if a previous setup left the preset disabled.
         existing["model_id"] = str(preset.get("model_id", "") or existing.get("model_id", ""))
         existing["runtime"] = str(preset.get("runtime", existing.get("runtime", "")))
-        existing["base_url"] = str(existing.get("base_url") or preset.get("base_url", ""))
+        existing["base_url"] = endpoint or str(existing.get("base_url") or preset.get("base_url", ""))
         existing["capabilities"] = list(preset.get("capabilities", existing.get("capabilities", [])) or [])
         existing["enabled"] = True
     settings["local_models"] = rows
     if wanted == "qwen3-asr-0.6b" and not str(settings.get("model_roles", {}).get("audio", "")):
         settings.setdefault("model_roles", {})["audio"] = f"local:{wanted}"
+    if make_primary:
+        if preset.get("runtime") != "ollama" or "tool" not in preset.get("capabilities", []):
+            raise SettingsError("该本地模型不能设为默认助手")
+        provider_id = f"local-runtime-{_safe_id(wanted, fallback='model')}"
+        model_id = str(preset["model_id"])
+        settings["active_model"] = {"provider_id": provider_id, "model_id": model_id}
+        reference = f"provider:{provider_id}:{model_id}"
+        settings["model_roles"].update({role: reference for role in ("reasoning", "writing", "slides")})
     return save_settings(workspace, settings)
 
 
@@ -541,7 +593,7 @@ def _read_raw_settings_file(workspace: str | Path) -> dict[str, Any]:
     return payload
 
 
-def load_settings(workspace: str | Path) -> dict[str, Any]:
+def load_settings(workspace: str | Path, *, include_secret_status: bool = True) -> dict[str, Any]:
     """Load a safe public configuration and redact all provider credentials."""
 
     path = settings_path(workspace)
@@ -553,23 +605,217 @@ def load_settings(workspace: str | Path) -> dict[str, Any]:
         # unusable after a migration. Preserve it and start from defaults.
         _quarantine_settings_file(path)
         normalized = _normalize_settings({})
+    if not include_secret_status:
+        return normalized
+    normalized = _ensure_credential_scope(workspace, normalized, create=False)
     return _with_secret_status(normalized, workspace)
 
 
 def save_settings(workspace: str | Path, payload: object) -> dict[str, Any]:
     """Validate and atomically persist public settings (never provider keys)."""
 
+    previous = _normalize_settings(_read_raw_settings_file(workspace))
     normalized = _normalize_settings(payload)
+    if _strata_in_use(normalized) and not _verified_strata_model(normalized):
+        raise SettingsError("Strata 地址或模型尚未通过 Agent 验证；请在运行时页面验证后切换")
+    previous_providers = {provider["id"]: provider for provider in previous["providers"]}
+    next_providers = {provider["id"]: provider for provider in normalized["providers"]}
+    changed_prior_ids = {
+        provider_id
+        for provider_id, prior in previous_providers.items()
+        if provider_id not in next_providers
+        or (
+            str(prior["base_url"]).strip().rstrip("/"), prior["kind"], prior.get("auth_mode")
+        ) != (
+            str(next_providers[provider_id]["base_url"]).strip().rstrip("/"),
+            next_providers[provider_id]["kind"],
+            next_providers[provider_id].get("auth_mode"),
+        )
+    }
+    added_ids = set(next_providers) - set(previous_providers)
+    for provider in normalized["providers"]:
+        if provider["id"] in changed_prior_ids or provider["id"] in added_ids:
+            provider["remote_rag_allowed"] = False
+    _ensure_credential_scope(workspace, previous, create=bool(changed_prior_ids or added_ids))
+    if changed_prior_ids or added_ids:
+        try:
+            scope = _credential_scope_id(_read_raw_settings_file(workspace))
+            if changed_prior_ids and not scope:
+                raise SettingsError("更改 API 地址前无法确认凭据归属")
+            if scope:
+                import keyring
+
+                for provider_id in changed_prior_ids | added_ids:
+                    scoped_key = f"model-provider:v2:{scope}:{provider_id}"
+                    marker = _provider_scoped_endpoint_marker(scope, provider_id)
+                    if _get_saved_secret(keyring, scoped_key) and not _get_saved_secret(keyring, marker):
+                        # A re-added provider has no trustworthy prior endpoint.
+                        old_endpoint = _provider_endpoint_digest(workspace, provider_id) if provider_id in changed_prior_ids else "unbound"
+                        keyring.set_password(_SERVICE_NAME, marker, old_endpoint)
+                        if _get_saved_secret(keyring, marker) != old_endpoint:
+                            raise SettingsError("无法固定已有密钥的 API 地址")
+        except Exception as exc:
+            raise SettingsError(f"更改 API 地址前无法检查系统凭据：{exc}") from exc
+    # The browser can update public settings, but cannot select a keyring scope.
+    normalized["credential_scope_id"] = _credential_scope_id(_read_raw_settings_file(workspace))
+    _write_settings(workspace, normalized)
+    return _with_secret_status(normalized, workspace)
+
+
+def remote_retrieval_granted(
+    workspace: str | Path,
+    provider_id: str,
+    role: str,
+    model_id: str,
+    base_url: str,
+) -> bool:
+    """Check the persisted consent immediately before sending retrieval text."""
+
+    if role not in {"embedding", "reranking"}:
+        return False
+    raw = _read_raw_settings_file(workspace)
+    if not isinstance(raw, dict):
+        return False
+    roles = raw.get("model_roles")
+    if not isinstance(roles, dict) or roles.get(role) != f"provider:{provider_id}:{model_id}":
+        return False
+    providers = raw.get("providers")
+    if not isinstance(providers, list):
+        return False
+    return any(
+        isinstance(provider, dict)
+        and provider.get("id") == provider_id
+        and provider.get("enabled", True) is True
+        and provider.get("remote_rag_allowed") is True
+        and str(provider.get("base_url", "")).strip().rstrip("/") == base_url.strip().rstrip("/")
+        for provider in providers
+    )
+
+
+def _write_settings(workspace: str | Path, normalized: dict[str, Any]) -> None:
     path = settings_path(workspace)
     path.parent.mkdir(parents=True, exist_ok=True)
     serialized = json.dumps(normalized, ensure_ascii=False, indent=2, sort_keys=True) + "\n"
-    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary = path.with_name(f"{path.name}.{uuid4().hex}.tmp")
     try:
         temporary.write_text(serialized, encoding="utf-8")
         os.replace(temporary, path)
     except OSError as exc:
+        try:
+            temporary.unlink(missing_ok=True)
+        except OSError:
+            pass
         raise SettingsError(f"无法保存本地设置：{exc}") from exc
-    return _with_secret_status(normalized, workspace)
+
+
+def _credential_scope_id(settings: object) -> str:
+    value = str(settings.get("credential_scope_id", "") or "") if isinstance(settings, dict) else ""
+    return value if _CREDENTIAL_SCOPE_RE.fullmatch(value) else ""
+
+
+def _ensure_credential_scope(
+    workspace: str | Path,
+    settings: dict[str, Any],
+    *,
+    create: bool,
+    keyring_module: Any | None = None,
+) -> dict[str, Any]:
+    """Move all existing workspace credentials to a stable, path-independent ID."""
+
+    with _CREDENTIAL_SCOPE_LOCK:
+        current_scope = _credential_scope_id(_read_raw_settings_file(workspace))
+        return _ensure_credential_scope_unlocked(
+            workspace,
+            {**settings, "credential_scope_id": current_scope},
+            create=create,
+            keyring_module=keyring_module,
+        )
+
+
+def _ensure_credential_scope_unlocked(
+    workspace: str | Path,
+    settings: dict[str, Any],
+    *,
+    create: bool,
+    keyring_module: Any | None = None,
+) -> dict[str, Any]:
+    if _credential_scope_id(settings):
+        return settings
+    try:
+        if keyring_module is None:
+            import keyring as keyring_module
+        legacy: list[tuple[str, str]] = []
+        for provider in settings["providers"]:
+            if provider["kind"] == "local" or provider.get("auth_mode") == "managed":
+                continue
+            provider_id = str(provider["id"])
+            value = keyring_module.get_password(_SERVICE_NAME, _legacy_provider_secret_name(workspace, provider_id))
+            if value:
+                legacy.append((f"model-provider:{provider_id}", str(value)))
+        for service_id in ("ocr", "mineru"):
+            value = keyring_module.get_password(_SERVICE_NAME, _legacy_document_service_secret_name(workspace, service_id))
+            if value:
+                legacy.append((f"document-service:{service_id}", str(value)))
+        notion = keyring_module.get_password(_SERVICE_NAME, _legacy_notion_secret_name(workspace))
+        if notion:
+            legacy.append(("notion-integration", str(notion)))
+        if not create and not legacy:
+            return settings
+        scope = uuid4().hex
+        for identity, value in legacy:
+            category, _, item_id = identity.partition(":")
+            username = f"{category}:v2:{scope}{f':{item_id}' if item_id else ''}"
+            if category == "model-provider":
+                account_username = _provider_account_secret_name(workspace, item_id)
+                account_key = keyring_module.get_password(_SERVICE_NAME, account_username)
+                deleted = keyring_module.get_password(_SERVICE_NAME, _provider_account_deleted_name(workspace, item_id))
+                if not deleted and account_key == value:
+                    continue
+                if not deleted and not account_key:
+                    username = account_username
+                else:
+                    marker = _provider_scoped_endpoint_marker(scope, item_id)
+                    endpoint_digest = _provider_endpoint_digest(workspace, item_id)
+                    keyring_module.set_password(_SERVICE_NAME, marker, endpoint_digest)
+                    if keyring_module.get_password(_SERVICE_NAME, marker) != endpoint_digest:
+                        raise SettingsError("工作区凭据地址校验失败")
+            keyring_module.set_password(_SERVICE_NAME, username, value)
+            if keyring_module.get_password(_SERVICE_NAME, username) != value:
+                raise SettingsError("系统凭据迁移后校验失败")
+        updated = {**settings, "credential_scope_id": scope}
+        _write_settings(workspace, updated)
+        for identity, _ in legacy:
+            category, _, item_id = identity.partition(":")
+            old_username = (
+                _legacy_provider_secret_name(workspace, item_id)
+                if category == "model-provider"
+                else _legacy_document_service_secret_name(workspace, item_id)
+                if category == "document-service"
+                else _legacy_notion_secret_name(workspace)
+            )
+            try:
+                keyring_module.delete_password(_SERVICE_NAME, old_username)
+            except Exception:
+                # The new entry is verified and active; an unavailable delete
+                # must not make the migrated credential unusable.
+                pass
+        return updated
+    except Exception as exc:
+        if create:
+            raise SettingsError(f"无法迁移系统凭据：{exc}") from exc
+        return settings
+
+
+def _get_saved_secret(keyring_module: Any, username: str) -> str:
+    return str(keyring_module.get_password(_SERVICE_NAME, username) or "")
+
+
+def _delete_saved_secret(keyring_module: Any, *usernames: str) -> None:
+    for username in dict.fromkeys(usernames):
+        if keyring_module.get_password(_SERVICE_NAME, username):
+            keyring_module.delete_password(_SERVICE_NAME, username)
+        if keyring_module.get_password(_SERVICE_NAME, username):
+            raise SettingsError("系统凭据删除后仍可读取")
 
 
 def configure_managed_glm_4_7_flash(workspace: str | Path) -> dict[str, Any]:
@@ -619,8 +865,8 @@ def set_provider_api_key(workspace: str | Path, provider_id: str, value: str) ->
         raise SettingsError("本地证据引擎不需要 API Key")
     if provider.get("auth_mode") == "managed":
         raise SettingsError("ScanSci 托管模型不接受本机 API Key")
-    _, environment_name = _provider_environment_api_key(provider_id)
-    if environment_name:
+    environment_value, environment_name = _provider_environment_api_key(provider_id, workspace=workspace)
+    if environment_value:
         raise SettingsError(
             f"环境变量 {environment_name} 已提供该服务商 API Key；请先清除环境变量后再通过设置页保存或移除本机凭据"
         )
@@ -628,14 +874,21 @@ def set_provider_api_key(workspace: str | Path, provider_id: str, value: str) ->
     try:
         import keyring
 
-        username = _provider_secret_name(workspace, provider_id)
+        settings = _ensure_credential_scope(workspace, settings, create=True, keyring_module=keyring)
+        username = _provider_account_secret_name(workspace, provider_id)
+        deleted_username = _provider_account_deleted_name(workspace, provider_id)
         if secret:
             keyring.set_password(_SERVICE_NAME, username, secret)
-        else:
+            if keyring.get_password(_SERVICE_NAME, username) != secret:
+                raise SettingsError("系统凭据保存后校验失败")
+            _delete_saved_secret(keyring, deleted_username)
             try:
-                keyring.delete_password(_SERVICE_NAME, username)
+                _delete_saved_secret(keyring, _provider_secret_name(workspace, provider_id), _legacy_provider_secret_name(workspace, provider_id))
             except Exception:
                 pass
+        else:
+            keyring.set_password(_SERVICE_NAME, deleted_username, "1")
+            _delete_saved_secret(keyring, username, _provider_secret_name(workspace, provider_id), _legacy_provider_secret_name(workspace, provider_id))
     except Exception as exc:  # pragma: no cover - desktop keyring differs by OS
         raise SettingsError(f"无法访问系统凭据管理器：{exc}") from exc
     return _with_secret_status(settings, workspace)
@@ -644,20 +897,38 @@ def set_provider_api_key(workspace: str | Path, provider_id: str, value: str) ->
 def get_provider_api_key(workspace: str | Path, provider_id: str) -> str:
     """Resolve one provider key for a request without exposing it to settings.
 
-    Resolution is performed per call so a launch environment override follows
-    the DeepSeek Harness-style credential reference semantics.  The existing
-    workspace-scoped keyring entry remains the fallback for desktop use.
+    Resolution is performed per call. A saved provider key is shared by this
+    OS account only when the provider ID and API endpoint match.
     """
 
-    environment_value, _ = _provider_environment_api_key(provider_id)
+    environment_value, _ = _provider_environment_api_key(provider_id, workspace=workspace)
     if environment_value:
         return environment_value
     try:
         import keyring
 
-        return str(keyring.get_password(_SERVICE_NAME, _provider_secret_name(workspace, provider_id)) or "").strip()
+        _ensure_credential_scope(workspace, _normalize_settings(_read_raw_settings_file(workspace)), create=False, keyring_module=keyring)
+        return _provider_saved_key(keyring, workspace, provider_id).strip()
     except Exception:
         return ""
+
+
+def provider_request_api_key(
+    workspace: str | Path,
+    provider: dict[str, Any],
+    *,
+    key_lookup: Callable[[str | Path, str], str] = get_provider_api_key,
+) -> str:
+    """Return a request credential while keeping keyless local routes usable."""
+
+    mode = str(provider.get("auth_mode", "")).strip().lower()
+    if provider.get("runtime") == "strata" and not _verified_strata_model(load_settings(workspace, include_secret_status=False), provider):
+        raise SettingsError("Strata 当前地址或模型未通过 Agent 验证")
+    if mode == "managed":
+        return "scansci-managed-gateway"
+    if mode == "local" or str(provider.get("kind", "")).strip().lower() == "local":
+        return "local"
+    return key_lookup(workspace, str(provider.get("id", "")))
 
 
 def set_document_service_api_key(workspace: str | Path, service_id: str, value: str) -> dict[str, Any]:
@@ -674,14 +945,12 @@ def set_document_service_api_key(workspace: str | Path, service_id: str, value: 
     try:
         import keyring
 
+        settings = _ensure_credential_scope(workspace, settings, create=True, keyring_module=keyring)
         username = _document_service_secret_name(workspace, service)
         if secret:
             keyring.set_password(_SERVICE_NAME, username, secret)
         else:
-            try:
-                keyring.delete_password(_SERVICE_NAME, username)
-            except Exception:
-                pass
+            _delete_saved_secret(keyring, username, _legacy_document_service_secret_name(workspace, service))
     except Exception as exc:  # pragma: no cover - desktop keyring differs by OS
         raise SettingsError(f"无法访问系统凭据管理器：{exc}") from exc
     return _with_secret_status(settings, workspace)
@@ -693,7 +962,9 @@ def get_document_service_api_key(workspace: str | Path, service_id: str) -> str:
     try:
         import keyring
 
-        return str(keyring.get_password(_SERVICE_NAME, _document_service_secret_name(workspace, _document_service_id(service_id))) or "")
+        _ensure_credential_scope(workspace, _normalize_settings(_read_raw_settings_file(workspace)), create=False, keyring_module=keyring)
+        service = _document_service_id(service_id)
+        return _get_saved_secret(keyring, _document_service_secret_name(workspace, service))
     except Exception:
         return ""
 
@@ -705,14 +976,12 @@ def set_notion_api_token(workspace: str | Path, value: str) -> dict[str, Any]:
     try:
         import keyring
 
+        _ensure_credential_scope(workspace, _normalize_settings(_read_raw_settings_file(workspace)), create=True, keyring_module=keyring)
         username = _notion_secret_name(workspace)
         if secret:
             keyring.set_password(_SERVICE_NAME, username, secret)
         else:
-            try:
-                keyring.delete_password(_SERVICE_NAME, username)
-            except Exception:
-                pass
+            _delete_saved_secret(keyring, username, _legacy_notion_secret_name(workspace))
     except Exception as exc:  # pragma: no cover - desktop keyring differs by OS
         raise SettingsError(f"无法访问系统凭据管理器：{exc}") from exc
     return load_settings(workspace)
@@ -724,7 +993,8 @@ def get_notion_api_token(workspace: str | Path) -> str:
     try:
         import keyring
 
-        return str(keyring.get_password(_SERVICE_NAME, _notion_secret_name(workspace)) or "")
+        _ensure_credential_scope(workspace, _normalize_settings(_read_raw_settings_file(workspace)), create=False, keyring_module=keyring)
+        return _get_saved_secret(keyring, _notion_secret_name(workspace))
     except Exception:
         return ""
 
@@ -792,6 +1062,13 @@ def _normalize_settings(payload: object) -> dict[str, Any]:
         if audio_model:
             model_roles["audio"] = f"local:{audio_model['id']}"
     for role, reference in list(model_roles.items()):
+        if reference.startswith("provider:local-runtime-"):
+            if not any(
+                reference == f"provider:{provider['id']}:{model['id']}"
+                for provider in providers for model in provider.get("models", [])
+            ):
+                model_roles[role] = ""
+                continue
         prefix = f"provider:{_MANAGED_PROVIDER_ID}:"
         if reference.startswith(prefix) and reference.removeprefix(prefix) not in _managed_production_model_ids():
             model_roles[role] = f"{prefix}{_DEFAULT_CHAT_MODEL_ID}"
@@ -800,6 +1077,7 @@ def _normalize_settings(payload: object) -> dict[str, Any]:
             model_roles[role] = f"{deepseek_prefix}{_DEEPSEEK_FLASH_MODEL_ID}"
     return {
         "schema_version": 2,
+        "credential_scope_id": _credential_scope_id(payload),
         "active_model": {"provider_id": provider["id"], "model_id": model_id},
         "providers": providers,
         "local_models": local_models,
@@ -814,6 +1092,26 @@ def _normalize_settings(payload: object) -> dict[str, Any]:
     }
 
 
+def _verified_strata_model(settings: dict[str, Any], provider: dict[str, Any] | None = None) -> bool:
+    local = next((item for item in settings.get("local_models", []) if item.get("id") == "strata" and item.get("runtime") == "strata"), None)
+    if not local or not local.get("enabled"):
+        return False
+    base_url = str(local.get("base_url", "")).strip().rstrip("/")
+    model_id = str(local.get("model_id", "")).strip()
+    if provider and (
+        str(provider.get("base_url", "")).strip().rstrip("/") != base_url
+        or not any(str(model.get("id", "")) == model_id for model in provider.get("models", []))
+    ):
+        return False
+    return bool(model_id and _is_strata_loopback_url(base_url) and local.get("agent_verified_for") == f"{base_url}\n{model_id}")
+
+
+def _strata_in_use(settings: dict[str, Any]) -> bool:
+    if settings.get("active_model", {}).get("provider_id") == "local-runtime-strata":
+        return True
+    return any(str(reference).startswith("provider:local-runtime-strata:") for reference in settings.get("model_roles", {}).values())
+
+
 def _normalize_local_models(value: object) -> list[dict[str, Any]]:
     source = value if isinstance(value, list) else []
     rows: list[dict[str, Any]] = []
@@ -823,7 +1121,7 @@ def _normalize_local_models(value: object) -> list[dict[str, Any]]:
             continue
         identifier = _unique_id(_safe_id(item.get("id"), fallback=f"local-model-{index + 1}"), used)
         runtime = _text(item.get("runtime"), fallback="openai-compatible", limit=40).lower()
-        if runtime not in {"builtin", "ollama", "lm-studio", "llama.cpp", "openai-compatible", "local-huggingface"}:
+        if runtime not in {"builtin", "ollama", "lm-studio", "llama.cpp", "strata", "openai-compatible", "local-huggingface"}:
             runtime = "openai-compatible"
         if identifier == "builtin-evidence" and runtime == "builtin":
             name = "离线基础检索（非模型）"
@@ -857,6 +1155,7 @@ def _normalize_local_models(value: object) -> list[dict[str, Any]]:
                 "runtime_compatible": runtime_compatible,
                 "runtime_backend": _text(item.get("runtime_backend"), limit=80),
                 "runtime_message": _text(item.get("runtime_message"), limit=500),
+                "agent_verified_for": _text(item.get("agent_verified_for"), limit=700) if runtime == "strata" else "",
             }
         )
     return rows or deepcopy(_DEFAULT_SETTINGS["local_models"])
@@ -888,7 +1187,11 @@ def _with_discovered_local_models(local_models: list[dict[str, Any]]) -> list[di
         if not model_id or model_id in known:
             continue
         identifier = _safe_id(f"{kind}-{model_id}", fallback=f"local-{kind}")
-        if any(str(row.get("id", "")) == identifier for row in rows):
+        existing = next((row for row in rows if str(row.get("id", "")) == identifier), None)
+        if existing is not None:
+            if existing.get("runtime") == "local-huggingface" and not existing.get("model_id"):
+                existing["model_id"] = model_id
+                known.add(model_id)
             continue
         rows.append(
             {
@@ -926,6 +1229,8 @@ def _with_local_runtime_providers(providers: list[dict[str, Any]], local_models:
         base_url = str(local.get("base_url", "")).strip()
         if runtime in {"builtin", "local-huggingface"} or not local.get("enabled") or not model_id or not base_url:
             continue
+        if runtime == "strata" and not _is_strata_loopback_url(base_url):
+            continue
         provider_id = f"local-runtime-{_safe_id(local.get('id'), fallback='model')}"
         capabilities = _normalize_capabilities(local.get("capabilities"), fallback=model_id)
         rows.append(
@@ -956,6 +1261,18 @@ def _with_local_runtime_providers(providers: list[dict[str, Any]], local_models:
             }
         )
     return rows
+
+
+def _is_strata_loopback_url(value: str) -> bool:
+    try:
+        endpoint = urlsplit(str(value or "").strip().rstrip("/"))
+        return (
+            endpoint.scheme == "http" and endpoint.hostname in {"127.0.0.1", "::1"}
+            and endpoint.port is not None and endpoint.path == "/v1"
+            and not (endpoint.username or endpoint.password or endpoint.query or endpoint.fragment)
+        )
+    except ValueError:
+        return False
 
 
 def with_discovered_local_runtime_models(
@@ -1027,6 +1344,7 @@ def with_discovered_local_runtime_models(
                     "runtime_compatible": True,
                     "runtime_backend": runtime,
                     "runtime_message": "",
+                    "discovered": runtime == "strata",
                 }
             )
             known.add(key)
@@ -1421,6 +1739,7 @@ def _normalize_providers(value: object) -> list[dict[str, Any]]:
                 ),
                 "responses_enabled": bool(item.get("responses_enabled", False)),
                 "enabled": bool(item.get("enabled", True)),
+                "remote_rag_allowed": item.get("remote_rag_allowed") is True,
                 "logo": _text(item.get("logo"), fallback=identifier, limit=80),
                 "category": _text(item.get("category"), fallback="自定义提供商", limit=48),
                 "summary": _text(item.get("summary"), limit=280),
@@ -1650,6 +1969,7 @@ def _normalize_models(value: object, *, fallback: str) -> list[dict[str, Any]]:
             "group": _text(item.get("group"), fallback="默认模型", limit=80),
             "context_window": _text(item.get("context_window"), fallback="", limit=40),
             "capabilities": _normalize_capabilities(item.get("capabilities"), fallback=identifier),
+            "show_in_composer": item.get("show_in_composer") is not False,
             "readiness": _text(item.get("readiness"), fallback="production", limit=24)
             if _text(item.get("readiness"), fallback="production", limit=24) in {"production", "standby"}
             else "production",
@@ -1672,6 +1992,7 @@ def _normalize_models(value: object, *, fallback: str) -> list[dict[str, Any]]:
         "group": "ScanSci" if fallback == "evidence-retrieval" else "默认模型",
         "context_window": "本地" if fallback == "evidence-retrieval" else "",
         "capabilities": ["embedding", "reranking"] if fallback == "evidence-retrieval" else ["reasoning"],
+        "show_in_composer": True,
     }]
 
 
@@ -1900,6 +2221,7 @@ def _with_builtin_plugins(records: list[dict[str, Any]]) -> list[dict[str, Any]]
 
 def _with_secret_status(settings: dict[str, Any], workspace: str | Path) -> dict[str, Any]:
     public = deepcopy(settings)
+    public.pop("credential_scope_id", None)
     public["plugins"] = enrich_builtin_plugins(list(public.get("plugins", []) or []))
     public["notion_api_token_configured"] = notion_api_token_configured(workspace)
     public["workspace_profile"] = _workspace_profile(workspace)
@@ -1914,7 +2236,7 @@ def _with_secret_status(settings: dict[str, Any], workspace: str | Path) -> dict
             provider["api_key_env"] = ""
         else:
             source, environment_name = _provider_credential_status(workspace, provider["id"])
-            provider["api_key_configured"] = source != "missing"
+            provider["api_key_configured"] = source in {"environment", "keyring"}
             provider["api_key_source"] = source
             provider["api_key_env"] = environment_name or _provider_api_key_env(provider["id"])
     document_processing = public["document_processing"]
@@ -1934,29 +2256,42 @@ def _workspace_profile(workspace: str | Path) -> str:
 
 
 def _has_provider_api_key(workspace: str | Path, provider_id: str) -> bool:
-    return _provider_credential_status(workspace, provider_id)[0] != "missing"
+    return _provider_credential_status(workspace, provider_id)[0] in {"environment", "keyring"}
 
 
 def _provider_credential_status(workspace: str | Path, provider_id: str) -> tuple[str, str]:
-    environment_value, environment_name = _provider_environment_api_key(provider_id)
+    environment_value, environment_name = _provider_environment_api_key(provider_id, workspace=workspace)
     if environment_value:
         return "environment", environment_name
     try:
         import keyring
 
-        if keyring.get_password(_SERVICE_NAME, _provider_secret_name(workspace, provider_id)):
+        if _provider_saved_key(keyring, workspace, provider_id):
             return "keyring", ""
     except Exception:
         pass
+    if environment_name:
+        return "endpoint_mismatch", environment_name
     return "missing", ""
 
 
-def _provider_environment_api_key(provider_id: str) -> tuple[str, str]:
+def _provider_environment_api_key(provider_id: str, *, workspace: str | Path | None = None) -> tuple[str, str]:
     for environment_name in _provider_api_key_envs(provider_id):
         value = str(os.environ.get(environment_name) or "").strip()
         if value:
+            if workspace is not None and not _provider_environment_endpoint_allowed(workspace, provider_id):
+                return "", environment_name
             return value, environment_name
     return "", ""
+
+
+def _provider_environment_endpoint_allowed(workspace: str | Path, provider_id: str) -> bool:
+    preset = next((item for item in _PROVIDER_PRESETS if item["id"] == provider_id), None)
+    if preset is None:
+        return True
+    shipped_endpoint = str(preset.get("base_url", "") or "").strip().rstrip("/")
+    shipped_digest = hashlib.sha256(shipped_endpoint.encode("utf-8")).hexdigest()[:16]
+    return _provider_endpoint_digest(workspace, provider_id) == shipped_digest
 
 
 def _provider_api_key_env(provider_id: str) -> str:
@@ -1976,6 +2311,72 @@ def _provider_api_key_envs(provider_id: str) -> tuple[str, ...]:
 
 
 def _provider_secret_name(workspace: str | Path, provider_id: str) -> str:
+    scope = _credential_scope_id(_read_raw_settings_file(workspace))
+    if scope:
+        return f"model-provider:v2:{scope}:{provider_id}"
+    return _legacy_provider_secret_name(workspace, provider_id)
+
+
+def _provider_account_secret_name(workspace: str | Path, provider_id: str) -> str:
+    return f"model-provider:v3:{provider_id}:{_provider_endpoint_digest(workspace, provider_id)}"
+
+
+def _provider_account_deleted_name(workspace: str | Path, provider_id: str) -> str:
+    return f"model-provider:v3-deleted:{provider_id}:{_provider_endpoint_digest(workspace, provider_id)}"
+
+
+def _provider_scoped_endpoint_marker(scope: str, provider_id: str) -> str:
+    return f"model-provider:v2-endpoint:{scope}:{provider_id}"
+
+
+def _provider_endpoint_digest(workspace: str | Path, provider_id: str) -> str:
+    raw = _read_raw_settings_file(workspace)
+    configured = raw.get("providers") if isinstance(raw.get("providers"), list) else []
+    provider = next((item for item in configured if isinstance(item, dict) and item.get("id") == provider_id), None)
+    if provider is None:
+        provider = next((item for item in _PROVIDER_PRESETS if item["id"] == provider_id), {})
+    endpoint = str(provider.get("base_url", "") or "").strip().rstrip("/")
+    return hashlib.sha256(endpoint.encode("utf-8")).hexdigest()[:16]
+
+
+def _provider_saved_key(keyring_module: Any, workspace: str | Path, provider_id: str) -> str:
+    username = _provider_account_secret_name(workspace, provider_id)
+    if keyring_module.get_password(_SERVICE_NAME, _provider_account_deleted_name(workspace, provider_id)):
+        return ""
+    account_key = _get_saved_secret(keyring_module, username)
+    scope = _credential_scope_id(_read_raw_settings_file(workspace))
+    if not scope:
+        return account_key
+    scoped_username = f"model-provider:v2:{scope}:{provider_id}"
+    scoped_key = _get_saved_secret(keyring_module, scoped_username)
+    if not scoped_key:
+        return account_key
+    marker = _provider_scoped_endpoint_marker(scope, provider_id)
+    endpoint_digest = _provider_endpoint_digest(workspace, provider_id)
+    bound_endpoint = _get_saved_secret(keyring_module, marker)
+    if bound_endpoint and bound_endpoint != endpoint_digest:
+        return account_key
+    try:
+        if not bound_endpoint:
+            keyring_module.set_password(_SERVICE_NAME, marker, endpoint_digest)
+            if _get_saved_secret(keyring_module, marker) != endpoint_digest:
+                return account_key
+        if account_key and account_key != scoped_key:
+            return scoped_key
+        if not account_key:
+            keyring_module.set_password(_SERVICE_NAME, username, scoped_key)
+            if _get_saved_secret(keyring_module, username) != scoped_key:
+                return ""
+        try:
+            _delete_saved_secret(keyring_module, scoped_username)
+        except Exception:
+            pass
+        return scoped_key
+    except Exception:
+        return account_key
+
+
+def _legacy_provider_secret_name(workspace: str | Path, provider_id: str) -> str:
     digest = hashlib.sha256(str(Path(workspace).resolve()).encode("utf-8")).hexdigest()[:16]
     return f"model-provider:{digest}:{provider_id}"
 
@@ -1988,11 +2389,25 @@ def _document_service_id(value: object) -> str:
 
 
 def _document_service_secret_name(workspace: str | Path, service_id: str) -> str:
+    scope = _credential_scope_id(_read_raw_settings_file(workspace))
+    if scope:
+        return f"document-service:v2:{scope}:{service_id}"
+    return _legacy_document_service_secret_name(workspace, service_id)
+
+
+def _legacy_document_service_secret_name(workspace: str | Path, service_id: str) -> str:
     digest = hashlib.sha256(str(Path(workspace).resolve()).encode("utf-8")).hexdigest()[:16]
     return f"document-service:{digest}:{service_id}"
 
 
 def _notion_secret_name(workspace: str | Path) -> str:
+    scope = _credential_scope_id(_read_raw_settings_file(workspace))
+    if scope:
+        return f"notion-integration:v2:{scope}"
+    return _legacy_notion_secret_name(workspace)
+
+
+def _legacy_notion_secret_name(workspace: str | Path) -> str:
     digest = hashlib.sha256(str(Path(workspace).resolve()).encode("utf-8")).hexdigest()[:16]
     return f"notion-integration:{digest}"
 
@@ -2001,7 +2416,7 @@ def _has_document_service_api_key(workspace: str | Path, service_id: str) -> boo
     try:
         import keyring
 
-        return bool(keyring.get_password(_SERVICE_NAME, _document_service_secret_name(workspace, service_id)))
+        return bool(_get_saved_secret(keyring, _document_service_secret_name(workspace, service_id)))
     except Exception:
         return False
 

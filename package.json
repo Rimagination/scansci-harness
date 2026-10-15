@@ -3,8 +3,12 @@
   "private": true,
   "version": "0.4.2",
   "description": "Evidence-first ScanSci Harness desktop workbench with Pi as the agent runtime.",
+  "main": "electron/main.cjs",
   "scripts": {
     "build:pi-runtime": "esbuild pi-runtime/src/main.ts --bundle --platform=node --format=esm --target=node22 --banner:js=\"import { createRequire as __scansciCreateRequire } from 'node:module'; const require = __scansciCreateRequire(import.meta.url);\" --outfile=pi-runtime/dist/main.mjs",
+    "desktop:electron": "electron .",
+    "test:electron": "node --test tests/electron/*.test.cjs",
+    "package:electron": "electron-builder --win --x64 --dir --config electron-builder.json",
     "vendor": "python scripts/vendor_web_assets.py",
     "render:slide-plan": "node scripts/render_slide_plan.mjs"
   },
@@ -21,6 +25,8 @@
     "@earendil-works/pi-telemetry": "0.84.3"
   },
   "devDependencies": {
+    "electron": "44.3.0",
+    "electron-builder": "26.15.5",
     "esbuild": "0.28.1"
   }
 }

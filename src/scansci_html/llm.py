@@ -11,6 +11,7 @@ from urllib.parse import urlparse
 
 from pydantic import ValidationError
 import requests
+from urllib3.exceptions import ReadTimeoutError
 
 from .model_transport import (
     ANTHROPIC_MESSAGES,
@@ -23,6 +24,7 @@ from .model_transport import (
     select_api_surface,
     stream_model_events,
 )
+from .ollama_runtime import chat_thinking_parameters, is_local_ollama_url, warm_ollama_chat_model
 from .qa.schemas import AnswerPayloadSchema, ClaimVerificationPayloadSchema
 
 
@@ -58,6 +60,25 @@ def _is_loopback_endpoint(base_url: str) -> bool:
     except ValueError:
         return False
     return hostname in {"127.0.0.1", "localhost", "::1"}
+
+
+def _is_stream_read_timeout(error: BaseException) -> bool:
+    """Requests wraps an SSE read timeout in ConnectionError after HTTP 200."""
+
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        if id(current) in seen:
+            continue
+        seen.add(id(current))
+        if isinstance(current, (requests.Timeout, ReadTimeoutError)):
+            return True
+        pending.extend(
+            item for item in (*current.args, current.__cause__, current.__context__)
+            if isinstance(item, BaseException)
+        )
+    return False
 
 
 def _stream_request_gate(rate_key: str) -> Lock:
@@ -464,8 +485,7 @@ class OpenAICompatibleChatJsonClient:
                 else 0.2
             ),
         }
-        if self.thinking_mode:
-            request_body["thinking"] = {"type": self.thinking_mode}
+        request_body.update(chat_thinking_parameters(self.base_url, self.model, self.thinking_mode))
         # Review synthesis already validates every paragraph and has a
         # grounded evidence fallback. Retrying malformed section JSON here,
         # and then retrying the same section again at the workflow layer,
@@ -825,7 +845,7 @@ def complete_chat_text(
     session: Any | None = None,
     thinking_mode: str | None = None,
     include_usage: bool = False,
-    max_tokens: int = 8192,
+    max_tokens: int | None = 8192,
     temperature: float = 0.4,
     max_input_tokens: int = _DEFAULT_PROVIDER_INPUT_TOKENS,
     max_requests: int = _MAX_LOGICAL_REQUESTS,
@@ -885,7 +905,16 @@ def complete_chat_text(
     request_limit = max(1, min(_MAX_LOGICAL_REQUESTS, int(max_requests)))
 
     name = (provider or "").strip().lower()
-    if use_litellm and not provider_headers and session is None and _litellm_enabled() and name in {"openai-compatible", "openai", "local", "anthropic-compatible", "anthropic"}:
+    local_qwen = "reasoning_effort" in chat_thinking_parameters(base_url, model, thinking_mode)
+    if (
+        use_litellm
+        and not local_qwen
+        and not provider_headers
+        and session is None
+        and _litellm_enabled()
+        and name in {"openai-compatible", "openai", "local", "anthropic-compatible", "anthropic"}
+        and (max_tokens is not None or name not in {"anthropic-compatible", "anthropic"})
+    ):
         return _litellm_complete_chat(
             name,
             base_url=base_url,
@@ -906,12 +935,12 @@ def complete_chat_text(
             request_body: dict[str, Any] = {
                 "model": model,
                 "messages": messages,
-                "max_tokens": max(64, int(max_tokens)),
                 "temperature": float(temperature),
                 "stream": False,
             }
-            if thinking_mode in {"enabled", "disabled"}:
-                request_body["thinking"] = {"type": thinking_mode}
+            if max_tokens is not None:
+                request_body["max_tokens"] = max(64, int(max_tokens))
+            request_body.update(chat_thinking_parameters(base_url, model, thinking_mode))
             response = None
             for retry_index in range(request_limit):
                 try:
@@ -957,7 +986,7 @@ def complete_chat_text(
                     },
                     provider_headers,
                 ),
-                json={"model": model, "max_tokens": max(64, int(max_tokens)), "system": system, "messages": conversation},
+                json={"model": model, "max_tokens": max(64, int(max_tokens if max_tokens is not None else 8192)), "system": system, "messages": conversation},
                 timeout=timeout,
             )
             response.raise_for_status()
@@ -1003,7 +1032,7 @@ def stream_chat_text(
     timeout: float = 90.0,
     session: Any | None = None,
     thinking_mode: str | None = None,
-    max_tokens: int = 8192,
+    max_tokens: int | None = 8192,
     max_continuations: int = 3,
     temperature: float = 0.4,
     max_input_tokens: int = _DEFAULT_PROVIDER_INPUT_TOKENS,
@@ -1042,51 +1071,87 @@ def stream_chat_text(
         responses_enabled=responses_enabled,
     )
     if selected_surface != CHAT_COMPLETIONS:
-        usage: dict[str, int] = {}
-        for event in stream_model_events(
-            ModelRequest(
-                provider_kind=provider,
-                provider_id=provider_id,
-                base_url=base_url,
-                api_key=api_key,
-                model=model,
+        continuation_messages = [dict(item) for item in messages]
+        complete_text = ""
+        total_usage: dict[str, int] = {}
+        response_id = ""
+        finish_reason = ""
+        incomplete = False
+        for attempt in range(max(0, int(max_continuations)) + 1):
+            usage: dict[str, int] = {}
+            attempt_text = ""
+            finish_reason = "incomplete"
+            for event in stream_model_events(
+                ModelRequest(
+                    provider_kind=provider,
+                    provider_id=provider_id,
+                    base_url=base_url,
+                    api_key=api_key,
+                    model=model,
+                    messages=continuation_messages,
+                    api_surface=selected_surface,
+                    responses_enabled=responses_enabled,
+                    timeout=timeout,
+                    max_tokens=max_tokens,
+                    temperature=temperature,
+                    thinking_mode=thinking_mode,
+                    previous_response_id=previous_response_id,
+                    response_format=response_format,
+                    max_requests=max_requests,
+                    session=session,
+                    provider_session_id=provider_session_id,
+                )
+            ):
+                event_type = str(event.get("type", ""))
+                if event_type == "text_delta":
+                    fragment = str(event.get("content", ""))
+                    attempt_text += fragment
+                    yield {"type": "delta", "content": fragment}
+                elif event_type == "reasoning_delta":
+                    yield {"type": "reasoning", "content": str(event.get("content", ""))}
+                elif event_type == "retry":
+                    yield {"type": "retry", **dict(event)}
+                elif event_type == "usage":
+                    usage = dict(event.get("usage", {}) or {})
+                elif event_type == "completed":
+                    finish_reason = str(event.get("finish_reason", "stop"))
+                    response_id = str(event.get("response_id", ""))
+                elif event_type == "error":
+                    raise RuntimeError(str(event.get("error", "Model stream failed")))
+            complete_text += attempt_text
+            total_usage = _merge_chat_usage(total_usage, usage)
+            incomplete = finish_reason == "incomplete" or _response_needs_continuation(
+                finish_reason=finish_reason,
+                attempt_text=attempt_text,
+                complete_text=complete_text,
                 messages=messages,
-                api_surface=selected_surface,
-                responses_enabled=responses_enabled,
-                timeout=timeout,
-                max_tokens=max_tokens,
-                temperature=temperature,
-                thinking_mode=thinking_mode,
-                previous_response_id=previous_response_id,
-                response_format=response_format,
-                max_requests=max_requests,
-                session=session,
-                provider_session_id=provider_session_id,
             )
-        ):
-            event_type = str(event.get("type", ""))
-            if event_type == "text_delta":
-                yield {"type": "delta", "content": str(event.get("content", ""))}
-            elif event_type == "reasoning_delta":
-                yield {"type": "reasoning", "content": str(event.get("content", ""))}
-            elif event_type == "retry":
-                yield {"type": "retry", **dict(event)}
-            elif event_type == "usage":
-                usage = dict(event.get("usage", {}) or {})
-            elif event_type == "completed":
-                yield {
-                    "type": "done",
-                    "usage": usage,
-                    "finish_reason": str(event.get("finish_reason", "stop")),
-                    "truncated": False,
-                    "response_id": str(event.get("response_id", "")),
-                }
-            elif event_type == "error":
-                raise RuntimeError(str(event.get("error", "Model stream failed")))
+            if not incomplete or finish_reason == "incomplete" or attempt >= max_continuations or not attempt_text or response_format:
+                break
+            yield {"type": "continuation", "attempt": attempt + 1}
+            continuation_messages = [
+                *messages,
+                {"role": "assistant", "content": _continuation_context(complete_text, messages)},
+                {"role": "user", "content": "请从断点直接继续，避免重复已有内容，并完成答案。"},
+            ]
+        yield {
+            "type": "done",
+            "usage": total_usage,
+            "finish_reason": finish_reason,
+            "truncated": incomplete,
+            "response_id": response_id,
+        }
         return
     _ensure_provider_input_budget(messages, max_input_tokens=max_input_tokens)
     request_limit = max(1, min(_STREAM_LOGICAL_REQUESTS, int(max_requests)))
     local_endpoint = _is_loopback_endpoint(base_url)
+    ollama_endpoint = (
+        (provider_id == "local-runtime-ollama" or provider_id.startswith("local-runtime-ollama-"))
+        and is_local_ollama_url(base_url)
+    )
+    if ollama_endpoint:
+        # A cold local model has separate load and prompt-processing phases.
+        timeout = max(float(timeout), 120.0)
     managed_endpoint = (
         str(provider_id or "").strip().casefold() == "scansci-managed"
         or "scansci-glm-gateway.932196440.workers.dev" in str(base_url or "").casefold()
@@ -1094,7 +1159,7 @@ def stream_chat_text(
     # A local runtime can briefly answer with HTTP 500 while its worker is
     # starting or releasing a previous generation.  Keep the caller's logical
     # request budget intact, while allowing one transport retry for that case.
-    if local_endpoint:
+    if local_endpoint and not ollama_endpoint:
         transport_request_limit = max(request_limit, 2)
     elif managed_endpoint:
         # The managed gateway has its own minute limiter.  Keep one original
@@ -1105,7 +1170,16 @@ def stream_chat_text(
         transport_request_limit = request_limit
 
     name = (provider or "").strip().lower()
-    if not provider_headers and session is None and _litellm_enabled() and name in {"openai-compatible", "openai", "local", "anthropic-compatible", "anthropic"}:
+    local_qwen = "reasoning_effort" in chat_thinking_parameters(base_url, model, thinking_mode)
+    if (
+        not local_qwen
+        and not ollama_endpoint
+        and not provider_headers
+        and session is None
+        and _litellm_enabled()
+        and name in {"openai-compatible", "openai", "local", "anthropic-compatible", "anthropic"}
+        and (max_tokens is not None or name not in {"anthropic-compatible", "anthropic"})
+    ):
         yield from _litellm_stream_chat(
             name,
             base_url=base_url,
@@ -1146,6 +1220,9 @@ def stream_chat_text(
     if name not in {"openai-compatible", "openai", "local"}:
         raise ValueError(f"Unsupported chat provider: {provider}")
 
+    if ollama_endpoint:
+        yield from warm_ollama_chat_model(base_url, model)
+
     client = session or requests.Session()
     rate_key = _stream_rate_key(provider, base_url)
     request_gate = _stream_request_gate(rate_key)
@@ -1163,16 +1240,17 @@ def stream_chat_text(
         request_body: dict[str, Any] = {
             "model": model,
             "messages": continuation_messages,
-            "max_tokens": max(64, int(max_tokens)),
             "temperature": float(temperature),
             "stream": True,
             "stream_options": {"include_usage": True},
         }
-        if thinking_mode in {"enabled", "disabled"}:
-            request_body["thinking"] = {"type": thinking_mode}
+        if max_tokens is not None:
+            request_body["max_tokens"] = max(64, int(max_tokens))
+        request_body.update(chat_thinking_parameters(base_url, model, thinking_mode))
 
         response: Any | None = None
         attempt_text = ""
+        attempt_reasoning = False
         attempt_usage: dict[str, int] = {}
         finish_reason = ""
         try:
@@ -1214,12 +1292,13 @@ def stream_chat_text(
                     break
                 except requests.RequestException as error:
                     status = getattr(getattr(error, "response", None), "status_code", None)
+                    ollama_timeout = ollama_endpoint and _is_stream_read_timeout(error)
                     # A network/TLS disconnect has no HTTP status.  It is
                     # safe to retry once because no model text was received;
                     # do not make users manually recover from a stale desktop
                     # keep-alive connection.
                     retryable = (
-                        status is None
+                        (status is None and not ollama_timeout)
                         or status in {429, 502, 503, 504}
                         or (local_endpoint and status == 500)
                     )
@@ -1238,7 +1317,16 @@ def stream_chat_text(
                         if response is not None:
                             response.close()
                             response = None
-                        raise _model_transport_exception(error, prefix="模型流式响应暂时不可用") from error
+                        prefix = (
+                            f"Ollama 模型 {model} 在 {int(timeout)} 秒内未返回数据"
+                            if ollama_timeout
+                            else "模型流式响应暂时不可用"
+                        )
+                        raise _model_transport_exception(
+                            error,
+                            prefix=prefix,
+                            local_timeout=ollama_timeout,
+                        ) from error
                     if response is not None:
                         response.close()
                         response = None
@@ -1281,6 +1369,9 @@ def stream_chat_text(
                         temperature=temperature,
                         max_input_tokens=max_input_tokens,
                         max_requests=1,
+                        provider_id=provider_id,
+                        responses_enabled=responses_enabled,
+                        provider_session_id=provider_session_id,
                     )
                     return
                 raise RuntimeError("The model service did not return a streaming response")
@@ -1317,6 +1408,10 @@ def stream_chat_text(
                 delta = choice.get("delta")
                 if not isinstance(delta, dict):
                     continue
+                reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                if isinstance(reasoning, str) and reasoning:
+                    attempt_reasoning = True
+                    yield {"type": "reasoning", "content": reasoning}
                 content = delta.get("content", "")
                 if isinstance(content, list):
                     content = "".join(str(item.get("text", "")) for item in content if isinstance(item, dict))
@@ -1325,10 +1420,14 @@ def stream_chat_text(
                     attempt_text += fragment
                     yield {"type": "delta", "content": fragment}
         except requests.RequestException as error:
+            ollama_timeout = ollama_endpoint and _is_stream_read_timeout(error)
             # Reading an SSE stream can fail after HTTP 200 (for example, a
             # proxy closes an idle keep-alive connection).  If it fails before
             # the first delta, restart the full request once on a fresh session.
-            if not attempt_text and not complete_text and request_limit > 1:
+            if (
+                not attempt_text and not attempt_reasoning and not complete_text and request_limit > 1
+                and not ollama_timeout
+            ):
                 yield {
                     "type": "retry",
                     "reason": "temporary_upstream_error",
@@ -1351,9 +1450,21 @@ def stream_chat_text(
                     temperature=temperature,
                     max_input_tokens=max_input_tokens,
                     max_requests=1,
+                    provider_id=provider_id,
+                    responses_enabled=responses_enabled,
+                    provider_session_id=provider_session_id,
                 )
                 return
-            raise _model_transport_exception(error, prefix="模型流式响应暂时不可用") from error
+            prefix = (
+                f"Ollama 模型 {model} 在 {int(timeout)} 秒内未返回数据"
+                if ollama_timeout
+                else "模型流式响应暂时不可用"
+            )
+            raise _model_transport_exception(
+                error,
+                prefix=prefix,
+                local_timeout=ollama_timeout,
+            ) from error
         finally:
             if response is not None:
                 response.close()
@@ -1376,9 +1487,7 @@ def stream_chat_text(
             {
                 "role": "user",
                 "content": (
-                    "先检查上文是否已满足用户的全部章节与格式要求；若已满足，"
-                    "不要重复或扩展正文，只输出用户要求的结束标记并立即停止。"
-                    "若仍缺内容，请从断点直接继续，不要重复已有内容，不要写‘继续’等过渡语，"
+                    "请从断点直接继续，不要重复已有内容，不要写‘继续’等过渡语，"
                     "并务必收束成一个完整答案。"
                     + _completion_marker_reminder(messages)
                 ),
@@ -1478,7 +1587,7 @@ def _litellm_kwargs(
     messages: list[dict[str, Any]],
     timeout: float,
     thinking_mode: str | None,
-    max_tokens: int = 8192,
+    max_tokens: int | None = 8192,
     temperature: float = 0.4,
     max_requests: int = _MAX_LOGICAL_REQUESTS,
 ) -> dict[str, Any]:
@@ -1489,12 +1598,12 @@ def _litellm_kwargs(
         "messages": messages,
         "timeout": timeout,
         "temperature": float(temperature),
-        "max_tokens": max(64, int(max_tokens)),
         "drop_params": True,
         "max_retries": max(0, min(_MAX_LOGICAL_REQUESTS, int(max_requests)) - 1),
     }
-    if thinking_mode in {"enabled", "disabled"}:
-        payload["thinking"] = {"type": thinking_mode}
+    if max_tokens is not None:
+        payload["max_tokens"] = max(64, int(max_tokens))
+    payload.update(chat_thinking_parameters(base_url, model, thinking_mode))
     return payload
 
 
@@ -1508,7 +1617,7 @@ def _litellm_complete_chat(
     timeout: float,
     thinking_mode: str | None,
     include_usage: bool,
-    max_tokens: int = 8192,
+    max_tokens: int | None = 8192,
     temperature: float = 0.4,
     max_requests: int = _MAX_LOGICAL_REQUESTS,
 ) -> str | tuple[str, dict[str, int]]:
@@ -1553,7 +1662,7 @@ def _litellm_stream_chat(
     messages: list[dict[str, Any]],
     timeout: float,
     thinking_mode: str | None,
-    max_tokens: int = 8192,
+    max_tokens: int | None = 8192,
     max_continuations: int = 3,
     temperature: float = 0.4,
     max_requests: int = _MAX_LOGICAL_REQUESTS,
@@ -1595,6 +1704,9 @@ def _litellm_stream_chat(
                 if choice.get("finish_reason"):
                     finish_reason = str(choice.get("finish_reason"))
                 delta = dict(choice.get("delta", {}) or {})
+                reasoning = delta.get("reasoning_content") or delta.get("reasoning")
+                if isinstance(reasoning, str) and reasoning:
+                    yield {"type": "reasoning", "content": reasoning}
                 content = delta.get("content", "")
                 if isinstance(content, list):
                     content = "".join(str(item.get("text", "")) for item in content if isinstance(item, dict))
@@ -1620,9 +1732,7 @@ def _litellm_stream_chat(
                 {
                     "role": "user",
                     "content": (
-                        "先检查上文是否已满足用户的全部章节与格式要求；若已满足，"
-                        "不要重复或扩展正文，只输出用户要求的结束标记并立即停止。"
-                        "若仍缺内容，请从断点直接继续，不重复已有内容，并完成答案。"
+                        "请从断点直接继续，不重复已有内容，并完成答案。"
                         + _completion_marker_reminder(messages)
                     ),
                 },
@@ -1651,12 +1761,28 @@ def _response_needs_continuation(
     marker = _requested_completion_marker(messages)
     if marker and not complete_text.rstrip().endswith(marker):
         return True
+    user_text = next(
+        (
+            str(item.get("content", ""))
+            for item in reversed(messages)
+            if str(item.get("role", "")).lower() == "user"
+        ),
+        "",
+    ).casefold()
+    if (
+        re.search(r"html|网页", user_text)
+        and re.search(r"完整|可运行|单文件|游戏|complete|standalone|single.file|game", user_text)
+        and re.search(r"<html(?:\s|>)", complete_text, re.IGNORECASE)
+        and not re.search(r"</html\s*>", complete_text, re.IGNORECASE)
+    ):
+        # ponytail: Tag presence catches cut-off standalone pages; validate a saved artifact with a parser when HTML export exists.
+        return True
     value = attempt_text.rstrip()
     if not value:
         return False
-    if value.endswith(("#", "**", "```", "：", ":", "，", ",", "（", "(")):
+    if value.endswith(("#", "**", "：", ":", "，", ",", "（", "(")):
         return True
-    return value.count("```") % 2 == 1
+    return complete_text.count("```") % 2 == 1
 
 
 def _continuation_context(complete_text: str, messages: list[dict[str, Any]]) -> str:
@@ -1672,10 +1798,13 @@ def _continuation_context(complete_text: str, messages: list[dict[str, Any]]) ->
 
 
 def _requested_completion_marker(messages: list[dict[str, Any]]) -> str:
-    user_text = "\n".join(
-        str(item.get("content", ""))
-        for item in messages
-        if str(item.get("role", "")).lower() == "user"
+    user_text = next(
+        (
+            str(item.get("content", ""))
+            for item in reversed(messages)
+            if str(item.get("role", "")).lower() == "user"
+        ),
+        "",
     )
     if not any(signal in user_text.lower() for signal in ("最后", "末尾", "结尾", "last line", "end with")):
         return ""
@@ -1705,7 +1834,9 @@ def _public_model_error(error: BaseException, *, prefix: str) -> str:
         details = payload.get("error") if isinstance(payload, dict) else None
         detail = details.get("message") if isinstance(details, dict) else ""
         if detail:
-            return f"{prefix}锛圚TTP {status}锛夛細{str(detail)[:1000]}"
+            if "model runner has unexpectedly stopped" in str(detail).lower():
+                return "本地模型运行中断。请检查 Ollama，或换用较小模型后重试。"
+            return f"{prefix}（HTTP {status}）：{str(detail)[:1000]}"
     normalized = str(error).lower()
     provider_code = _provider_error_code(error)
     request_id = _provider_request_id(error)
@@ -1733,7 +1864,7 @@ def _public_model_error(error: BaseException, *, prefix: str) -> str:
     return f"{prefix}（HTTP {status}），请稍后重试。" if status else f"{prefix}，请稍后重试。"
 
 
-def _model_transport_exception(error: BaseException, *, prefix: str) -> RuntimeError:
+def _model_transport_exception(error: BaseException, *, prefix: str, local_timeout: bool = False) -> RuntimeError:
     """Keep transient transport failures recoverable across the harness boundary."""
 
     response = getattr(error, "response", None)
@@ -1758,7 +1889,9 @@ def _model_transport_exception(error: BaseException, *, prefix: str) -> RuntimeE
             for marker in ("temporarily unavailable", "timed out", "timeout", "connection")
         )
     )
-    if status == 429 or provider_code in {"rate_limit_exceeded", "upstream_rate_limited"}:
+    if local_timeout:
+        failure_code = "local_model_timeout"
+    elif status == 429 or provider_code in {"rate_limit_exceeded", "upstream_rate_limited"}:
         failure_code = provider_code or "provider_rate_limited"
     elif provider_code:
         failure_code = provider_code
@@ -1776,7 +1909,7 @@ def _model_transport_exception(error: BaseException, *, prefix: str) -> RuntimeE
     except (TypeError, ValueError):
         retry_after = 0.0
     actions = [
-        {"id": "retry", "label": "自动重试", "kind": "retry"},
+        {"id": "retry", "label": "重试" if local_timeout else "自动重试", "kind": "retry"},
         {"id": "branch", "label": "保留现场并分支", "kind": "branch"},
     ]
     failure: dict[str, Any] = {

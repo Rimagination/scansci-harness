@@ -75,8 +75,12 @@ def test_runtime_component_omits_new_state_flag_for_legacy_sidecar_cli(
     component = LocalRuntimeComponent(root=tmp_path / "installed", manifest_url="")
     monkeypatch.setattr(component, "executable", lambda: executable)
 
-    health_values = iter(("", "Qwen/Test"))
-    monkeypatch.setattr(component, "_health_model", lambda _url: next(health_values, "Qwen/Test"))
+    health_values = iter((None, {"model": "Qwen/Test", "_legacy_health": True}))
+    monkeypatch.setattr(
+        component,
+        "_health_snapshot",
+        lambda _url: next(health_values, {"model": "Qwen/Test", "_legacy_health": True}),
+    )
     probe = {}
 
     def fake_run(command, **_kwargs):

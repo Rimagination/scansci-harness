@@ -392,7 +392,7 @@ def test_evidence_answer_keeps_product_owned_retrieval_but_routes_generation_thr
     monkeypatch.setattr(research_agent_module, "answer_question", fake_answer_question)
 
     result = ResearchAgentRuntime(workspace=workspace, evidence_db=evidence_db).answer_sync(
-        {"question": "What did the field study report?", "task_mode": "evidence"}
+        {"question": "What did the field study report?", "task_mode": "evidence", "retrieval_quality": "balanced"}
     )
 
     assert observed["question"] == "What did the field study report?"

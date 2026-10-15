@@ -18,6 +18,8 @@ from typing import Any
 
 import requests
 
+from .ollama_runtime import chat_thinking_parameters
+
 from .agent_events import (
     COMPLETED,
     ERROR,
@@ -97,7 +99,7 @@ class ModelRequest:
     api_surface: str = CHAT_COMPLETIONS
     responses_enabled: bool = False
     timeout: float = 90.0
-    max_tokens: int = 8192
+    max_tokens: int | None = 8192
     temperature: float | None = 0.4
     thinking_mode: str | None = None
     reasoning_effort: str | None = None
@@ -415,16 +417,16 @@ def _chat_body(request: ModelRequest) -> dict[str, Any]:
     body: dict[str, Any] = {
         "model": request.model,
         "messages": request.messages,
-        "max_tokens": max(64, int(request.max_tokens)),
         "stream": False,
     }
+    if request.max_tokens is not None:
+        body["max_tokens"] = max(64, int(request.max_tokens))
     # OpenAI reasoning models commonly reject temperature alongside a
     # reasoning budget.  Omitting it is safer than relying on provider-side
     # parameter dropping, which would otherwise be a silent capability change.
     if request.temperature is not None and not request.reasoning_effort and request.thinking_mode != "enabled":
         body["temperature"] = float(request.temperature)
-    if request.thinking_mode in {"enabled", "disabled"}:
-        body["thinking"] = {"type": request.thinking_mode}
+    body.update(chat_thinking_parameters(request.base_url, request.model, request.thinking_mode))
     return body
 
 
@@ -442,7 +444,7 @@ def _responses_body(request: ModelRequest, *, stream: bool = False) -> dict[str,
         body["reasoning"] = {"effort": "medium"}
     if request.temperature is not None and not request.reasoning_effort and request.thinking_mode != "enabled":
         body["temperature"] = float(request.temperature)
-    if request.max_tokens:
+    if request.max_tokens is not None:
         body["max_output_tokens"] = max(64, int(request.max_tokens))
     if request.response_format:
         response_format = dict(request.response_format)
@@ -455,10 +457,12 @@ def _responses_body(request: ModelRequest, *, stream: bool = False) -> dict[str,
     return body
 
 
-def _anthropic_body(request: ModelRequest) -> dict[str, Any]:
+def _anthropic_body(request: ModelRequest, *, stream: bool = False) -> dict[str, Any]:
     system = "\n\n".join(str(item.get("content", "")) for item in request.messages if item.get("role") == "system")
     conversation = [item for item in request.messages if item.get("role") in {"user", "assistant"}]
-    body: dict[str, Any] = {"model": request.model, "max_tokens": max(64, int(request.max_tokens)), "messages": conversation}
+    body: dict[str, Any] = {"model": request.model, "max_tokens": max(64, int(request.max_tokens if request.max_tokens is not None else 8192)), "messages": conversation}
+    if stream:
+        body["stream"] = True
     if system:
         body["system"] = system
     return body
@@ -603,12 +607,13 @@ def _stream_chat_events(request: ModelRequest) -> Iterator[dict[str, Any]]:
 
 
 def _stream_responses_events(request: ModelRequest, *, surface: str) -> Iterator[dict[str, Any]]:
-    body = _anthropic_body(request) if surface == ANTHROPIC_MESSAGES else _responses_body(request, stream=True)
+    body = _anthropic_body(request, stream=True) if surface == ANTHROPIC_MESSAGES else _responses_body(request, stream=True)
     stream_response, records = _request_with_retry(request, surface=surface, body=body, stream=True)
     if records is None:
         return
     usage: dict[str, int] = {}
     response_id = ""
+    finish_reason = "stop"
     try:
         for payload in records:
             event_type = str(payload.get("type", ""))
@@ -624,11 +629,14 @@ def _stream_responses_events(request: ModelRequest, *, surface: str) -> Iterator
                         yield make_event(TOOL_CALL, run_id=request.run_id, request_id=request.request_id, item=dict(item))
                 elif event_type == "response.function_call_arguments.delta":
                     yield make_event(TOOL_CALL, run_id=request.run_id, request_id=request.request_id, call_id=str(payload.get("item_id", "")), arguments_delta=str(payload.get("delta", "")))
-                elif event_type in {"response.completed", "response.done"}:
+                elif event_type in {"response.completed", "response.done", "response.incomplete"}:
                     response_payload = payload.get("response") if isinstance(payload.get("response"), Mapping) else payload
                     usage = normalize_usage(response_payload.get("usage") if isinstance(response_payload, Mapping) else {})
+                    details = response_payload.get("incomplete_details") if isinstance(response_payload, Mapping) else None
+                    reason = str(details.get("reason", "") if isinstance(details, Mapping) else "")
+                    finish_reason = "length" if reason == "max_output_tokens" else "incomplete" if event_type == "response.incomplete" else "stop"
                     yield make_event(USAGE, run_id=request.run_id, request_id=request.request_id, usage=usage)
-                    yield make_event(COMPLETED, run_id=request.run_id, request_id=request.request_id, response_id=response_id, finish_reason="stop")
+                    yield make_event(COMPLETED, run_id=request.run_id, request_id=request.request_id, response_id=response_id, finish_reason=finish_reason)
                 elif event_type in {"response.failed", "error"}:
                     message = payload.get("error", payload.get("message", "Responses request failed"))
                     yield make_event(ERROR, run_id=request.run_id, request_id=request.request_id, error=str(message)[:500])
@@ -641,11 +649,16 @@ def _stream_responses_events(request: ModelRequest, *, surface: str) -> Iterator
                     delta = payload.get("delta")
                     if isinstance(delta, Mapping) and delta.get("type") == "text_delta":
                         yield make_event(TEXT_DELTA, run_id=request.run_id, request_id=request.request_id, content=str(delta.get("text", "")))
+                    elif isinstance(delta, Mapping) and delta.get("type") == "thinking_delta":
+                        yield make_event(REASONING_DELTA, run_id=request.run_id, request_id=request.request_id, content=str(delta.get("thinking", "")))
                 elif event_type == "message_delta":
                     usage = normalize_usage(payload.get("usage")) or usage
+                    delta = payload.get("delta")
+                    if isinstance(delta, Mapping) and delta.get("stop_reason"):
+                        finish_reason = "length" if delta["stop_reason"] == "max_tokens" else str(delta["stop_reason"])
                 elif event_type == "message_stop":
                     yield make_event(USAGE, run_id=request.run_id, request_id=request.request_id, usage=usage)
-                    yield make_event(COMPLETED, run_id=request.run_id, request_id=request.request_id, response_id=response_id, finish_reason="stop")
+                    yield make_event(COMPLETED, run_id=request.run_id, request_id=request.request_id, response_id=response_id, finish_reason=finish_reason)
     finally:
         close = getattr(stream_response, "close", None)
         if callable(close):
@@ -673,7 +686,7 @@ def stream_model_events(request: ModelRequest) -> Iterator[dict[str, Any]]:
             visible_output = False
             try:
                 for event in _stream_responses_events(request, surface=surface):
-                    if event.get("type") == TEXT_DELTA and str(event.get("content", "")):
+                    if event.get("type") in {TEXT_DELTA, REASONING_DELTA} and str(event.get("content", "")):
                         visible_output = True
                     yield event
                 return

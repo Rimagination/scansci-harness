@@ -39,7 +39,8 @@ def test_openai_compatible_embedding_provider_uses_configured_endpoint():
             return {"data": [{"embedding": [1.0, 0.0]}, {"embedding": [0.0, 1.0]}]}
 
     class FakeSession:
-        def post(self, url, *, headers, json, timeout):
+        def post(self, url, *, headers, json, timeout, allow_redirects):
+            assert allow_redirects is False
             calls.append((url, headers, json, timeout))
             return FakeResponse()
 
@@ -122,7 +123,8 @@ def test_siliconflow_embedding_provider_uses_remote_dimensions_and_cache_identit
             return {"data": [{"embedding": [1.0, 0.0]}]}
 
     class FakeSession:
-        def post(self, url, *, headers, json, timeout):
+        def post(self, url, *, headers, json, timeout, allow_redirects):
+            assert allow_redirects is False
             calls.append((url, headers, json, timeout))
             return FakeResponse()
 
@@ -145,6 +147,77 @@ def test_siliconflow_embedding_provider_uses_remote_dimensions_and_cache_identit
     }
 
 
+def test_remote_retrieval_adapters_stop_sending_after_authorization_is_revoked():
+    allowed = True
+    sent = []
+
+    def check_authorization():
+        if not allowed:
+            raise PermissionError("revoked")
+
+    class FakeResponse:
+        def __init__(self, body):
+            self.body = body
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.body
+
+    class FakeSession:
+        def post(self, url, **_kwargs):
+            assert _kwargs["allow_redirects"] is False
+            sent.append(url)
+            return FakeResponse(
+                {"data": [{"embedding": [1.0, 0.0]}]}
+                if url.endswith("/embeddings")
+                else {"results": [{"index": 0, "relevance_score": 0.9}]}
+            )
+
+    session = FakeSession()
+    embedding = SiliconFlowEmbeddingProvider(api_key="secret", dimensions=2, session=session, authorization_check=check_authorization)
+    reranker = SiliconFlowReranker(api_key="secret", session=session, authorization_check=check_authorization)
+    assert embedding.embed_texts(["paper excerpt"]) == [[1.0, 0.0]]
+    assert reranker.rerank("question", [{"evidence_id": "one", "text": "paper excerpt"}])[0]["siliconflow_score"] == 0.9
+    assert len(sent) == 2
+
+    allowed = False
+    with pytest.raises(PermissionError, match="revoked"):
+        embedding.embed_texts(["second excerpt"])
+    assert "siliconflow-fallback" in reranker.rerank("question", [{"evidence_id": "one", "text": "second excerpt"}])[0]["routes"]
+    assert len(sent) == 2
+
+
+def test_remote_retrieval_refuses_redirects_without_sending_text_to_destination():
+    calls = []
+
+    class RedirectResponse:
+        status_code = 307
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            raise AssertionError("redirect body must not be used")
+
+    class RedirectSession:
+        def post(self, url, *, allow_redirects, **_kwargs):
+            assert allow_redirects is False
+            calls.append(url)
+            return RedirectResponse()
+
+    embedding = SiliconFlowEmbeddingProvider(api_key="secret", dimensions=2, session=RedirectSession())
+    reranker = SiliconFlowReranker(api_key="secret", session=RedirectSession())
+    with pytest.raises(RuntimeError, match="redirected"):
+        embedding.embed_texts(["private passage"])
+    ranked = reranker.rerank("question", [{"evidence_id": "one", "text": "private passage"}])
+
+    assert "siliconflow-fallback" in ranked[0]["routes"]
+    assert len(calls) == 2
+    assert all(url.startswith("https://api.siliconflow.cn/v1/") for url in calls)
+
+
 def test_siliconflow_embedding_provider_keeps_native_dimensions_for_bge():
     calls = []
 
@@ -156,7 +229,8 @@ def test_siliconflow_embedding_provider_keeps_native_dimensions_for_bge():
             return {"data": [{"embedding": [1.0, 0.0]}]}
 
     class FakeSession:
-        def post(self, url, *, headers, json, timeout):
+        def post(self, url, *, headers, json, timeout, allow_redirects):
+            assert allow_redirects is False
             calls.append(json)
             return FakeResponse()
 
@@ -444,7 +518,8 @@ def test_siliconflow_reranker_uses_rerank_api_and_keeps_tags_in_documents():
             }
 
     class FakeSession:
-        def post(self, url, *, headers, json, timeout):
+        def post(self, url, *, headers, json, timeout, allow_redirects):
+            assert allow_redirects is False
             calls.append((url, headers, json, timeout))
             return FakeResponse()
 
@@ -527,7 +602,8 @@ def test_siliconflow_qwen3_reranker_sends_instruction_when_configured():
             return {"results": [{"index": 0, "relevance_score": 0.9}]}
 
     class FakeSession:
-        def post(self, url, *, headers, json, timeout):
+        def post(self, url, *, headers, json, timeout, allow_redirects):
+            assert allow_redirects is False
             calls.append((url, headers, json, timeout))
             return FakeResponse()
 

@@ -1,0 +1,21 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta http-equiv="Content-Security-Policy" content="default-src 'none'; script-src 'self'; style-src 'self'">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <link rel="stylesheet" href="browser-toolbar.css">
+  <title>ScanSci 浏览器</title>
+</head>
+<body>
+  <nav aria-label="内置浏览器">
+    <button id="back" type="button" aria-label="后退" title="后退"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m11 6-6 6 6 6M5.5 12h13"/></svg></button>
+    <button id="forward" type="button" aria-label="前进" title="前进"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m13 6 6 6-6 6M18.5 12h-13"/></svg></button>
+    <button id="reload" type="button" aria-label="刷新" title="刷新"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M19 8.5A7.5 7.5 0 1 0 19.5 14M19.5 4.5v4.8h-4.8"/></svg></button>
+    <form id="address-form"><input id="address" type="text" inputmode="url" autocomplete="off" spellcheck="false" aria-label="网页地址" placeholder="输入网址或 DOI 链接"></form>
+    <button id="expand" type="button" aria-label="展开浏览器" title="展开浏览器"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="M8 4H4v4M16 4h4v4M20 16v4h-4M4 16v4h4"/></svg></button>
+    <button id="close" type="button" aria-label="收起浏览器" title="收起浏览器"><svg viewBox="0 0 24 24" aria-hidden="true" focusable="false"><path d="m7 7 10 10M17 7 7 17"/></svg></button>
+  </nav>
+  <script src="browser-toolbar.js"></script>
+</body>
+</html>

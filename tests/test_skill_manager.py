@@ -73,6 +73,26 @@ def test_typesafe_is_packaged_as_builtin_skill(tmp_path: Path):
     assert "ScanSci Harness" in loaded["content"]
 
 
+def test_retain_pdf_is_packaged_as_bounded_builtin_skill(tmp_path: Path):
+    records = {record["id"]: record for record in default_skill_records()}
+    assert records["retain-pdf"]["path"] == "builtin:retain-pdf"
+    assert records["retain-pdf"]["name"] == "文献翻译"
+
+    rows = {item["id"]: item for item in installed_skills(tmp_path / "workspace.sqlite")}
+    retain_pdf = rows["retain-pdf"]
+    assert retain_pdf["builtin"] is True
+    assert retain_pdf["available"] is True
+
+    from scansci_html.agent_skill_tools import ProgressiveSkillRuntime
+
+    runtime = ProgressiveSkillRuntime(tmp_path / "workspace.sqlite")
+    assert any(item["id"] == "retain-pdf" for item in runtime.search_skills("文献翻译")["skills"])
+    loaded = runtime.load_skill("retain-pdf", provenance="explicit")
+    assert loaded["source"] == "builtin:retain-pdf"
+    assert "不能假装已经生成译文" in loaded["content"]
+    assert "不能自行切换到其他远程服务" in loaded["content"]
+
+
 def test_research_skill_bundle_is_packaged_and_available(tmp_path: Path):
     expected = {
         "scientific-brainstorming",
