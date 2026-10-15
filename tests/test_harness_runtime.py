@@ -275,7 +275,8 @@ def test_frontend_release_verifier_rejects_serialized_parallel_streams() -> None
 
     verifier._fake_chat_stream = serialized_stream
 
-    with pytest.raises(AssertionError, match="overlap"):
+    # The serialized stream can trip the earlier queue check before the overlap check.
+    with pytest.raises(AssertionError, match="overlap|FIFO order"):
         verifier.verify()
 
 

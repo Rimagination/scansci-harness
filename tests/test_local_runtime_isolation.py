@@ -164,7 +164,7 @@ while True:
         if not chunk:
             break
         request_body += chunk
-    if request.startswith(b'GET /health'):
+    if not request.startswith(b'POST '):
         payload = json.dumps({
             'status': 'ok',
             'model': args.worker_model_id,
