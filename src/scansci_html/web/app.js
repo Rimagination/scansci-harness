@@ -13306,7 +13306,7 @@ function updateStatusCopy(update = state.update || {}) {
   if (status === "installing") return "正在下载并校验更新包…";
   if (status === "restarting") return "更新已准备好，正在重启 ScanSci…";
   if (update.available) return `发现新版本 v${update.latest_version || "—"}，已在右上角提示。`;
-  if (status === "error") return "暂时无法连接更新服务，可稍后再试。";
+  if (status === "error") return update.error === "missing_release_public_key" ? update.message : "暂时无法连接更新服务，可稍后再试。";
   if (update.checked_at) return "当前已是最新版本。";
   return "尚未检查更新。";
 }

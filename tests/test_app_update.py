@@ -43,6 +43,24 @@ def test_packaged_update_service_uses_the_public_channel_when_environment_is_emp
     assert service.manifest_url == app_update.DEFAULT_UPDATE_MANIFEST_URL
 
 
+@pytest.mark.parametrize("manifest_url", ["https://downloads.example.test/stable.json", "file:///unsigned/stable.json"])
+def test_unsigned_packaged_build_does_not_read_update_manifest(tmp_path: Path, monkeypatch, manifest_url: str) -> None:
+    monkeypatch.setattr(sys, "frozen", True, raising=False)
+    monkeypatch.setattr(app_update, "urlopen", lambda *_args, **_kwargs: pytest.fail("manifest was requested"))
+
+    status = AppUpdateService(
+        manifest_url=manifest_url,
+        current_version="0.4.2",
+        updates_root=tmp_path,
+        release_public_key="",
+    ).check()
+
+    assert status["state"] == "error"
+    assert status["error"] == "missing_release_public_key"
+    assert status["can_install"] is False
+    assert "手动下载" in status["message"]
+
+
 def test_update_service_uses_channel_and_trust_key_embedded_in_build_info(tmp_path: Path, monkeypatch) -> None:
     monkeypatch.delenv("SCANSCI_UPDATE_MANIFEST_URL", raising=False)
     monkeypatch.delenv("SCANSCI_RELEASE_PUBLIC_KEY", raising=False)
@@ -219,6 +237,7 @@ def test_install_prefers_differential_update_from_cached_current_package(
         manifest_url=manifest.as_uri(),
         current_version=current_version,
         updates_root=updates_root,
+        release_public_key="local-update-test-key",
     )
     service.check()
     result = service.install()

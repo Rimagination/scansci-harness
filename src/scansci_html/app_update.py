@@ -103,6 +103,14 @@ class AppUpdateService:
         if not self.manifest_url:
             self._status = self._current_status(checked=True)
             return self.status()
+        if getattr(sys, "frozen", False) and not self.release_public_key:
+            self._status = {
+                **self._current_status(checked=True),
+                "state": "error",
+                "message": "此安装包缺少更新签名公钥；请从官方 Release 手动下载新版本。",
+                "error": "missing_release_public_key",
+            }
+            return self.status()
         try:
             self._manifest_allows_local_files = urlparse(self.manifest_url).scheme.casefold() == "file"
             manifest = self._read_manifest(self.manifest_url)
